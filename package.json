@@ -1,0 +1,36 @@
+{
+  "name": "@nexa/ai-driven-development-discord-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI Driven Development Discord community app, Agent Dock, and bot safety registry",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev:worker": "wrangler dev",
+    "dev:gateway": "tsx src/gateway/index.ts",
+    "build": "npm run build:worker && npm run build:gateway",
+    "build:worker": "wrangler deploy --dry-run --outdir dist/worker",
+    "build:gateway": "esbuild src/gateway/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/gateway/index.js --packages=external",
+    "start:gateway": "node dist/gateway/index.js",
+    "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.gateway.json --noEmit",
+    "test": "vitest run",
+    "commands:register": "node scripts/register-commands.mjs",
+    "deploy:worker": "wrangler deploy"
+  },
+  "dependencies": {
+    "discord-interactions": "4.4.0",
+    "discord.js": "14.27.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260819.1",
+    "@types/node": "26.4.1",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2",
+    "vitest": "5.0.0",
+    "wrangler": "4.126.0"
+  }
+}

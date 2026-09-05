@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "1",
+  "id": "example-code-reviewer",
+  "name": "Example Code Reviewer",
+  "description": "Reviews code snippets only when a user explicitly mentions the agent in an opted-in thread.",
+  "installationMode": "agent_dock",
+  "endpoint": "https://agent.example.com/discord/events",
+  "triggers": [
+    "direct_mention",
+    "opted_in_thread"
+  ],
+  "actions": [
+    "reply",
+    "add_reaction"
+  ],
+  "requestedPermissions": [],
+  "privilegedIntents": [],
+  "data": {
+    "storesMessageContent": false,
+    "retentionDays": 0,
+    "modelProviders": [
+      "example-provider"
+    ],
+    "trainingWithDiscordData": false
+  },
+  "limits": {
+    "requestsPerMinute": 10,
+    "maxContextMessages": 10,
+    "maxOutputChars": 1900
+  },
+  "contact": {
+    "developer": "Example Developer",
+    "supportUrl": "https://agent.example.com/support"
+  }
+}

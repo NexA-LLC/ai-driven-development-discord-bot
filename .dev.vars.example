@@ -1,0 +1,13 @@
+# Cloudflare Worker local secrets. Copy to .dev.vars.
+DISCORD_PUBLIC_KEY=
+DISCORD_BOT_TOKEN=
+INTERNAL_SHARED_SECRET=
+
+# Optional OpenAI-compatible Chat Completions endpoint
+AI_API_URL=
+AI_API_KEY=
+AI_MODEL=
+
+# Optional. Shown only in the explicit /pitch flow.
+PITCHEEE_URL=
+COMMUNITY_NAME=AI Driven Development
