@@ -268,21 +268,45 @@ async function generateReply(
     headers.authorization = `Bearer ${llmApiKey}`;
   }
 
-  const response = await fetch(llmApiUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: llmModel || undefined,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: input },
-      ],
-      temperature: 0.4,
-      max_tokens: 900,
-    }),
-    signal: AbortSignal.timeout(llmTimeoutMs),
+  const body = JSON.stringify({
+    model: llmModel || undefined,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: input },
+    ],
+    temperature: 0.4,
+    max_tokens: 900,
   });
 
+  // The in-house LLM host occasionally drops off the LAN for a few seconds
+  // (EHOSTUNREACH); retry transient failures before giving up on the order.
+  const delaysMs = [0, 2_000, 6_000];
+  let response: Response | undefined;
+  let lastError: unknown;
+  for (const delay of delaysMs) {
+    if (delay > 0) {
+      await sleep(delay);
+    }
+    try {
+      response = await fetch(llmApiUrl, {
+        method: "POST",
+        headers,
+        body,
+        signal: AbortSignal.timeout(llmTimeoutMs),
+      });
+      if (response.ok || response.status < 500) {
+        break;
+      }
+      lastError = new Error(`LLM API returned ${response.status}`);
+    } catch (error) {
+      lastError = error;
+      console.warn("LLM request failed, retrying", error);
+    }
+  }
+
+  if (!response) {
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
   if (!response.ok) {
     throw new Error(`LLM API returned ${response.status}`);
   }
