@@ -141,6 +141,10 @@ export default {
       return handleInternalRegisterCommands(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/internal/profile") {
+      return handleInternalProfile(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/internal/ai-test") {
       return handleInternalAiTest(request, env);
     }
@@ -830,6 +834,96 @@ async function handleInternalRegisterCommands(
     scope: guildId ? `guild:${guildId}` : "global",
     commands: registered.map((command) => command.name),
   });
+}
+
+/**
+ * Update the bot's own presentation (avatar, application icon, guild nickname)
+ * using the bot token that lives in Worker secrets, so no token is needed on
+ * a developer machine.
+ */
+async function handleInternalProfile(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: {
+    avatarDataUrl?: unknown;
+    iconDataUrl?: unknown;
+    nick?: unknown;
+    guildId?: unknown;
+  };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const isDataUrl = (value: unknown): value is string =>
+    typeof value === "string" &&
+    /^data:image\/(png|jpeg|gif|webp);base64,/.test(value);
+  const headers = {
+    authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+    "content-type": "application/json",
+  };
+  const results: Record<string, { status: number; detail?: string }> = {};
+
+  if (isDataUrl(body.avatarDataUrl)) {
+    const response = await fetch("https://discord.com/api/v10/users/@me", {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ avatar: body.avatarDataUrl }),
+    });
+    results.avatar = {
+      status: response.status,
+      ...(response.ok ? {} : { detail: (await response.text()).slice(0, 300) }),
+    };
+  }
+
+  if (isDataUrl(body.iconDataUrl)) {
+    const response = await fetch(
+      "https://discord.com/api/v10/applications/@me",
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ icon: body.iconDataUrl }),
+      },
+    );
+    results.icon = {
+      status: response.status,
+      ...(response.ok ? {} : { detail: (await response.text()).slice(0, 300) }),
+    };
+  }
+
+  if (
+    typeof body.nick === "string" &&
+    typeof body.guildId === "string" &&
+    /^\d{10,25}$/.test(body.guildId)
+  ) {
+    const response = await fetch(
+      `https://discord.com/api/v10/guilds/${body.guildId}/members/@me`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ nick: body.nick.slice(0, 32) }),
+      },
+    );
+    results.nick = {
+      status: response.status,
+      ...(response.ok ? {} : { detail: (await response.text()).slice(0, 300) }),
+    };
+  }
+
+  return json({ ok: true, results });
 }
 
 async function handleInternalAiTest(
