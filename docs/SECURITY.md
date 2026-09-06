@@ -132,3 +132,19 @@ Use Cloudflare secrets for Worker production and a secret manager or protected e
 - **P3**: noisy but non-malicious behavior.
 
 P0/P1 should disable the integration immediately. P2 normally starts with Quarantine unless evidence shows deliberate abuse.
+
+## 公開リポジトリで扱う値
+
+このリポジトリは public です。次の値はコミットして構いません（公開情報）。
+
+- Discord Application ID、Discord Public Key（署名検証用の公開鍵）
+- Cloudflare D1 の database_id、Worker の名前と workers.dev の URL
+- コマンド定義、Passport の評価ルール
+
+次の値は絶対にコミットしません。`.env` / `.dev.vars` は `.gitignore` 済みで、本番値は `wrangler secret` と常駐ホストの環境変数にだけ置きます。
+
+- `DISCORD_BOT_TOKEN`、`INTERNAL_SHARED_SECRET`、`AI_API_KEY` / `LLM_API_KEY`
+- 社内 LLM のホスト名や IP（`.env.example` はプレースホルダーのままにする）
+- 運営チャンネル ID など、公開すると標的になりやすい運用値
+
+CI では gitleaks で履歴と差分を走査し、GitHub の Push Protection を有効にしています。

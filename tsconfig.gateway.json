@@ -5,6 +5,7 @@
     "types": ["node"]
   },
   "include": [
-    "src/gateway/**/*.ts"
+    "src/gateway/**/*.ts",
+    "src/shared/**/*.ts"
   ]
 }

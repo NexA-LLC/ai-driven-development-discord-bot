@@ -1,9 +1,11 @@
-# AI Driven Development Discord Bot
+# AI Driven Development Discord Bot「スー」
 
-AI Driven DevelopmentコミュニティのためのDiscord App / Bot基盤です。
+AI駆動開発コミュニティ（Discord）のための Discord App / Bot 基盤です。Bot の人格は KyaraFlip のキャラクター「スー（Su Myat Thiri）」で、Discord サーバーを「深夜のコンビニ」に見立てて動きます。人格の正本は KyaraFlip 側のドキュメントにあり、Bot への投影は `src/shared/persona.ts` です。
 
-> **Status — 2026-09-06:** TypeScript実装、migration、CIまでは成立しています。**Cloudflare/D1への本番・staging deploy、Discord Applicationへの接続、test Guild E2Eはまだ未完了**です。  
-> 正確な現在地: [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md)
+皆で作る Bot です。Issue / PR 歓迎。改善の議論は DecisionGarden「スーの秘密日記」に残します。
+
+> **Status — 2026-09-06:** Worker と D1 は本番に deploy 済み、Discord Application「スー」は AI駆動開発サーバーにインストール済みで、slash command も登録済みです。**Gateway の常駐（社内LLMでの回答）と test channel での E2E はこれから**です。  
+> 現在地の詳細: [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md)
 
 目的はNexAを広告することではなく、参加者の「聞きたい・作りたい・見せたい・自分のAgentを試したい」を、その場で一段前へ進めることです。NexA製品や外部サービスは、明示的な目的がある場面だけ能力として接続します。
 
@@ -69,14 +71,16 @@ AI Driven DevelopmentコミュニティのためのDiscord App / Bot基盤です
 - no raw message table
 - CI: typecheck / test / build
 
+### Live (2026-09-06)
+
+- Cloudflare Worker + D1（本番）、migration 0001/0002 適用済み
+- Discord Application「スー」: Interactions endpoint 検証済み、AI駆動開発サーバーにインストール済み、guild command 登録済み
+- test channel `#スーのレジ-test`
+
 ### Not yet live
 
-- Cloudflare staging/production resources
-- D1実DB
-- Discord Application secrets/config
-- Worker deploy
-- Gateway常駐
-- test Guild E2E
+- Gateway常駐（社内LLMでの回答、mention、Warden）
+- test channel E2E（/ask の往復）
 - Agent review UI
 - Agent Dock dispatch
 - Quarantine/revoke
@@ -89,15 +93,17 @@ AI Driven DevelopmentコミュニティのためのDiscord App / Bot基盤です
 Discord
 ├─ Interaction
 │    └─ Cloudflare Worker /interactions
-│          ├─ Community AI
-│          ├─ Agent registry
-│          └─ D1 control plane
+│          ├─ D1: policy / registry / audit metadata / ai_jobs (注文キュー)
+│          └─ AI_PROVIDER=gateway: /ask, /pitch を ai_jobs に積む（既定）
+│             AI_PROVIDER=worker : OpenAI互換APIを Worker から直接呼ぶ
 │
-└─ Gateway Events
+└─ Gateway events (guild-installed bot, 社内ネットワークで常駐)
      └─ Node Gateway process
-          ├─ mention response -> Worker /internal/ask
-          ├─ metadata event -> Worker /internal/events
-          └─ Bot Warden -> operator alert
+          ├─ /internal/jobs/claim で注文を取り、社内LLM (OpenAI互換) で回答
+          │    └─ Discord interaction webhook で follow-up
+          ├─ mention response -> 社内LLM で直接回答
+          ├─ safe event metadata -> Worker /internal/events
+          └─ Bot Warden -> moderator alert（自動BANなし）
 
 Third-party Agent
 └─ HTTPS endpoint + agent-manifest.json
@@ -130,29 +136,33 @@ npx wrangler d1 migrations apply ai-driven-development-discord --local
 npm run dev:worker
 ```
 
+### Worker secrets
+
+```bash
+npx wrangler secret put DISCORD_PUBLIC_KEY
+npx wrangler secret put DISCORD_BOT_TOKEN
+npx wrangler secret put INTERNAL_SHARED_SECRET
+npx wrangler secret put AI_API_KEY       # AIを使う場合のみ
+```
+
+既定（`AI_PROVIDER=gateway`）では Worker は LLM を呼びません。/ask と /pitch は D1 の `ai_jobs` に積まれ、Gateway が社内 LLM で答えます。Worker から直接 OpenAI 互換 API を呼びたい場合だけ `AI_PROVIDER=worker` にし、`AI_API_URL` / `AI_MODEL` を vars、`AI_API_KEY` を secret に入れます。
+
 ### Command registration
 
 ```bash
-DISCORD_APPLICATION_ID=... \
-DISCORD_BOT_TOKEN=... \
-DISCORD_GUILD_ID=... \
 npm run commands:register
 ```
 
-`DISCORD_GUILD_ID`を外すとglobal command登録です。最初はtest Guild限定で検証します。
+登録は Worker の `/internal/register-commands` 経由で行うので、開発機に Bot トークンは不要です。`.env` の `WORKER_INTERNAL_URL` と `INTERNAL_SHARED_SECRET` を使い、`DISCORD_GUILD_ID` があればそのGuildだけに（即時反映）、なければグローバルに登録します。コマンド定義は `src/shared/commands.ts` です。
 
 ### Gateway
 
 ```bash
-DISCORD_BOT_TOKEN=... \
-WORKER_INTERNAL_URL=http://127.0.0.1:8787 \
-INTERNAL_SHARED_SECRET=... \
-MONITORED_CHANNEL_IDS=123,456 \
-WARDEN_ALERT_CHANNEL_ID=789 \
+cp .env.example .env   # DISCORD_BOT_TOKEN, WORKER_INTERNAL_URL, INTERNAL_SHARED_SECRET, LLM_API_URL などを記入
 npm run dev:gateway
 ```
 
-GatewayはDiscordへoutbound接続するため、通常は受信用ポート公開やCloudflare経由のWebSocket relayは不要です。
+Gateway は Discord へ外向き WebSocket 接続し、Worker の注文キューを `JOB_POLL_SECONDS` ごとに取りに行き、`LLM_API_URL`（OpenAI 互換 Chat Completions。社内の LM Studio など）で回答します。受信用ポートの公開は不要で、社内ネットワークの常駐機で動かせます。`LLM_API_URL` が空のときは /ask の注文はキューに残ったままになります。
 
 ## Safe defaults
 
@@ -211,6 +221,12 @@ staging D1
 
 実行順と依存関係は[`todos.jsonl`](todos.jsonl)を正本にします。
 
+## 人格と改善の記録
+
+- 人格の正本: KyaraFlip リポジトリ `docs/concept/characters/thiri.md`
+- Live Card: https://kyaraflip.com/api/public/artifacts/398db834-8191-4f02-92d1-2432ea940488
+- 改善の議論: DecisionGarden「スーの秘密日記」（team で編集、埋め込みで公開）
+
 ## License
 
-Private repository. Copyright © NexA LLC.
+MIT License. Copyright © 2026 NexA LLC and contributors. See [LICENSE](LICENSE).

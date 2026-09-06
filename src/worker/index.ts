@@ -3,18 +3,47 @@ import {
   evaluateAgentManifest,
   type AgentPassport,
 } from "../shared/agent-manifest.js";
+import { discordCommands } from "../shared/commands.js";
+import {
+  ABOUT_TEXT,
+  buildSystemPrompt,
+  detectLanguage,
+  type AskMode,
+} from "../shared/persona.js";
 
 interface Env {
   DB: D1Database;
   DISCORD_PUBLIC_KEY: string;
   DISCORD_BOT_TOKEN: string;
+  DISCORD_APPLICATION_ID?: string;
   INTERNAL_SHARED_SECRET: string;
+  /**
+   * "gateway": queue /ask and /pitch for the Gateway process, which runs the
+   *   in-house LLM and answers through the interaction webhook (default).
+   * "worker": call an OpenAI-compatible Chat Completions API from the Worker.
+   */
+  AI_PROVIDER?: string;
   AI_API_URL?: string;
   AI_API_KEY?: string;
   AI_MODEL?: string;
   PITCHEEE_URL?: string;
   COMMUNITY_NAME?: string;
 }
+
+interface AiJobRow {
+  id: string;
+  mode: AskMode;
+  input: string | null;
+  language: string;
+  application_id: string;
+  interaction_token: string;
+  ephemeral: number;
+  guild_id: string | null;
+  requester_user_id: string | null;
+}
+
+const JOB_TTL_SECONDS = 14 * 60; // Discord interaction tokens live 15 minutes.
+const JOB_CLAIM_LIMIT = 5;
 
 interface DiscordOption {
   name: string;
@@ -103,6 +132,24 @@ export default {
       return handleInternalAgentSubmission(request, env);
     }
 
+    if (
+      request.method === "POST" &&
+      url.pathname === "/internal/register-commands"
+    ) {
+      return handleInternalRegisterCommands(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/jobs/claim") {
+      return handleInternalJobsClaim(request, env);
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/internal/jobs/complete"
+    ) {
+      return handleInternalJobsComplete(request, env);
+    }
+
     return json({ error: "not_found" }, 404);
   },
 };
@@ -150,10 +197,7 @@ async function handleDiscordInteraction(
         return interactionMessage("`prompt` が必要です。", true);
       }
 
-      context.waitUntil(
-        generateAndFollowUp(interaction, env, "ask", prompt, !isPublic),
-      );
-      return deferInteraction(!isPublic);
+      return startAiJob(interaction, env, context, "ask", prompt, !isPublic);
     }
 
     case "pitch": {
@@ -164,10 +208,7 @@ async function handleDiscordInteraction(
         return interactionMessage("`idea` が必要です。", true);
       }
 
-      context.waitUntil(
-        generateAndFollowUp(interaction, env, "pitch", idea, !isPublic),
-      );
-      return deferInteraction(!isPublic);
+      return startAiJob(interaction, env, context, "pitch", idea, !isPublic);
     }
 
     case "agents":
@@ -176,18 +217,8 @@ async function handleDiscordInteraction(
     case "agent-submit":
       return handleAgentSubmitCommand(interaction, env);
 
-    case "about": {
-      const community = env.COMMUNITY_NAME || "AI Driven Development";
-      return interactionMessage(
-        [
-          `**${community} Community AI**`,
-          "質問、設計、15秒ピッチ、外部Agent申請を扱います。",
-          "会話本文はデフォルトでは保存せず、外部公開やサービス連携は明示操作後だけ行います。",
-          "基盤の実装・運用支援: NexA",
-        ].join("\n"),
-        true,
-      );
-    }
+    case "about":
+      return interactionMessage(ABOUT_TEXT, true);
 
     default:
       return interactionMessage("未知のコマンドです。", true);
@@ -502,25 +533,9 @@ async function callAi(
     return fallbackResponse(mode, input, env.PITCHEEE_URL);
   }
 
-  const pitcheeeInstruction = env.PITCHEEE_URL
-    ? `Pitcheee is an optional publication route at ${env.PITCHEEE_URL}. Mention it only when the user explicitly wants to publish, show a project, or recruit collaborators.`
-    : "No external publication route is configured.";
-
-  const systemPrompt =
-    mode === "pitch"
-      ? [
-          "You create a concise Japanese 15-second pitch.",
-          "Return: title, one short pitch, and one concrete next action.",
-          "Do not claim that anything was published.",
-          pitcheeeInstruction,
-        ].join(" ")
-      : [
-          "You are the neutral AI member of an AI Driven Development community.",
-          "Answer the request directly, produce something usable, and end with at most three concrete next actions.",
-          "Do not advertise NexA. Do not claim external execution unless it actually happened.",
-          "Be honest about constraints and permissions.",
-          pitcheeeInstruction,
-        ].join(" ");
+  const systemPrompt = buildSystemPrompt(mode, detectLanguage(input), {
+    pitcheeeUrl: env.PITCHEEE_URL,
+  });
 
   const response = await fetch(env.AI_API_URL, {
     method: "POST",
@@ -534,7 +549,7 @@ async function callAi(
         { role: "system", content: systemPrompt },
         { role: "user", content: input },
       ],
-      temperature: 0.3,
+      temperature: 0.4,
       max_tokens: 900,
     }),
   });
@@ -662,6 +677,212 @@ function isSafeManifestUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+async function startAiJob(
+  interaction: DiscordInteraction,
+  env: Env,
+  context: ExecutionContext,
+  mode: AskMode,
+  input: string,
+  ephemeral: boolean,
+): Promise<Response> {
+  const provider = (env.AI_PROVIDER ?? "gateway").trim().toLowerCase();
+
+  if (provider === "worker") {
+    context.waitUntil(
+      generateAndFollowUp(interaction, env, mode, input, ephemeral),
+    );
+    return deferInteraction(ephemeral);
+  }
+
+  const id = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + JOB_TTL_SECONDS * 1_000).toISOString();
+  const requesterUserId =
+    interaction.member?.user?.id ?? interaction.user?.id ?? null;
+
+  await env.DB.prepare(
+    `INSERT INTO ai_jobs
+      (id, mode, input, language, application_id, interaction_token,
+       ephemeral, guild_id, requester_user_id, status, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+  )
+    .bind(
+      id,
+      mode,
+      input,
+      detectLanguage(input),
+      interaction.application_id,
+      interaction.token,
+      ephemeral ? 1 : 0,
+      interaction.guild_id ?? null,
+      requesterUserId,
+      expiresAt,
+    )
+    .run();
+
+  return deferInteraction(ephemeral);
+}
+
+async function handleInternalRegisterCommands(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: { guildId?: unknown };
+  try {
+    body = rawBody ? (JSON.parse(rawBody) as typeof body) : {};
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const applicationId = env.DISCORD_APPLICATION_ID?.trim();
+  if (!applicationId) {
+    return json({ error: "DISCORD_APPLICATION_ID_is_not_configured" }, 500);
+  }
+
+  const guildId =
+    typeof body.guildId === "string" && /^\d{10,25}$/.test(body.guildId)
+      ? body.guildId
+      : null;
+
+  const endpoint = guildId
+    ? `https://discord.com/api/v10/applications/${applicationId}/guilds/${guildId}/commands`
+    : `https://discord.com/api/v10/applications/${applicationId}/commands`;
+
+  const response = await fetch(endpoint, {
+    method: "PUT",
+    headers: {
+      authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(discordCommands),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    return json(
+      {
+        error: "discord_rejected_commands",
+        status: response.status,
+        detail: responseText.slice(0, 1_000),
+      },
+      502,
+    );
+  }
+
+  const registered = JSON.parse(responseText) as Array<{ name: string }>;
+  return json({
+    ok: true,
+    scope: guildId ? `guild:${guildId}` : "global",
+    commands: registered.map((command) => command.name),
+  });
+}
+
+async function handleInternalJobsClaim(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  const now = new Date().toISOString();
+
+  // Expire stale orders first so their prompt text does not linger.
+  await env.DB.prepare(
+    `UPDATE ai_jobs
+        SET status = 'expired', input = NULL, completed_at = ?
+      WHERE status IN ('pending', 'claimed') AND expires_at < ?`,
+  )
+    .bind(now, now)
+    .run();
+
+  const pending = await env.DB.prepare(
+    `SELECT id, mode, input, language, application_id, interaction_token,
+            ephemeral, guild_id, requester_user_id
+       FROM ai_jobs
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT ?`,
+  )
+    .bind(JOB_CLAIM_LIMIT)
+    .all<AiJobRow>();
+
+  const claimed: AiJobRow[] = [];
+  for (const job of pending.results) {
+    const result = await env.DB.prepare(
+      `UPDATE ai_jobs SET status = 'claimed', claimed_at = ?
+        WHERE id = ? AND status = 'pending'`,
+    )
+      .bind(now, job.id)
+      .run();
+    if ((result.meta.changes ?? 0) > 0) {
+      claimed.push(job);
+    }
+  }
+
+  return json({ jobs: claimed });
+}
+
+async function handleInternalJobsComplete(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: { id?: unknown; ok?: unknown; error?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  if (typeof body.id !== "string") {
+    return json({ error: "id_is_required" }, 400);
+  }
+
+  const succeeded = body.ok !== false;
+  await env.DB.prepare(
+    `UPDATE ai_jobs
+        SET status = ?, input = NULL, completed_at = ?, error = ?
+      WHERE id = ? AND status = 'claimed'`,
+  )
+    .bind(
+      succeeded ? "done" : "failed",
+      new Date().toISOString(),
+      succeeded ? null : truncate(String(body.error ?? "unknown"), 500),
+      body.id,
+    )
+    .run();
+
+  return json({ ok: true });
 }
 
 async function verifyInternalRequest(

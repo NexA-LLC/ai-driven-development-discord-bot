@@ -9,6 +9,8 @@
   },
   "vars": {
     "COMMUNITY_NAME": "AI Driven Development",
+    "DISCORD_APPLICATION_ID": "1546091192444260442",
+    "AI_PROVIDER": "gateway",
     "AI_API_URL": "",
     "AI_MODEL": "",
     "PITCHEEE_URL": ""
@@ -17,7 +19,7 @@
     {
       "binding": "DB",
       "database_name": "ai-driven-development-discord",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "4a96b6b2-265b-472d-8ddd-220bf390f9bd",
       "migrations_dir": "migrations"
     }
   ]

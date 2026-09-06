@@ -5,10 +5,23 @@ import {
   GatewayIntentBits,
   type Message,
 } from "discord.js";
+import {
+  buildSystemPrompt,
+  detectLanguage,
+  type AskMode,
+} from "../shared/persona.js";
 
-interface AskResponse {
-  text: string;
+interface AiJob {
+  id: string;
+  mode: AskMode;
+  input: string | null;
+  language: string;
+  application_id: string;
+  interaction_token: string;
+  ephemeral: number;
 }
+
+const EPHEMERAL_FLAG = 1 << 6;
 
 interface RateState {
   timestamps: number[];
@@ -39,6 +52,14 @@ const wardenMaxMessages = readPositiveInteger("WARDEN_MAX_MESSAGES", 5);
 const wardenCooldownMs =
   readPositiveInteger("WARDEN_COOLDOWN_SECONDS", 300) * 1_000;
 
+// In-house LLM (OpenAI-compatible Chat Completions, e.g. LM Studio on the LAN).
+const llmApiUrl = process.env.LLM_API_URL?.trim() || "";
+const llmModel = process.env.LLM_MODEL?.trim() || "";
+const llmApiKey = process.env.LLM_API_KEY?.trim() || "";
+const llmTimeoutMs = readPositiveInteger("LLM_TIMEOUT_SECONDS", 120) * 1_000;
+const jobPollMs = readPositiveInteger("JOB_POLL_SECONDS", 3) * 1_000;
+const pitcheeeUrl = process.env.PITCHEEE_URL?.trim() || undefined;
+
 if (passiveObserve && monitoredChannelIds.size === 0) {
   throw new Error(
     "PASSIVE_OBSERVE=true requires a non-empty MONITORED_CHANNEL_IDS allowlist",
@@ -55,8 +76,15 @@ const botRateState = new Map<string, RateState>();
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(
-    `Gateway ready as ${readyClient.user.tag}; passiveObserve=${passiveObserve}; monitoredChannels=${monitoredChannelIds.size}`,
+    `Gateway ready as ${readyClient.user.tag}; passiveObserve=${passiveObserve}; monitoredChannels=${monitoredChannelIds.size}; llm=${llmApiUrl ? llmModel || "(model unset)" : "disabled"}`,
   );
+  if (llmApiUrl) {
+    void pollJobsForever();
+  } else {
+    console.warn(
+      "LLM_API_URL is not set; /ask and /pitch orders will stay in the queue",
+    );
+  }
 });
 
 client.on(Events.MessageCreate, async (message) => {
@@ -104,27 +132,155 @@ async function onMessage(message: Message): Promise<void> {
     return;
   }
 
-  const prompt = message.content
-    .replace(new RegExp(`<@!?${botUser.id}>`, "g"), "")
-    .trim();
+  const prompt =
+    message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim() ||
+    "この店で何ができますか？";
 
-  const response = await postSigned<AskResponse>("/internal/ask", {
-    prompt: prompt || "このコミュニティAIで何ができますか？",
-    source: {
-      guildId: message.guildId,
-      channelId: message.channelId,
-      messageId: message.id,
-      actorId: message.author.id,
-    },
-  });
+  let text: string;
+  try {
+    text = await generateReply("ask", prompt);
+  } catch (error) {
+    console.error("mention reply failed", error);
+    text =
+      "すみません、今、答えが作れませんでした。少し時間を置いて、もう一度お願いします。";
+  }
 
   await message.reply({
-    content: truncate(response.text, 1_900),
+    content: truncate(text, 1_900),
     allowedMentions: {
       parse: [],
       repliedUser: false,
     },
   });
+}
+
+async function pollJobsForever(): Promise<void> {
+  for (;;) {
+    try {
+      const { jobs } = await postSigned<{ jobs: AiJob[] }>(
+        "/internal/jobs/claim",
+        {},
+      );
+      for (const job of jobs) {
+        await processJob(job);
+      }
+    } catch (error) {
+      console.error("job poll failed", error);
+    }
+    await sleep(jobPollMs);
+  }
+}
+
+async function processJob(job: AiJob): Promise<void> {
+  let text: string;
+  let ok = true;
+  let errorMessage: string | undefined;
+
+  try {
+    if (!job.input) {
+      throw new Error("job has no input");
+    }
+    text = await generateReply(job.mode, job.input);
+  } catch (error) {
+    ok = false;
+    errorMessage = error instanceof Error ? error.message : String(error);
+    console.error(`job ${job.id} failed`, error);
+    text =
+      "すみません、今、答えが作れませんでした。内容は外に出していません。少し時間を置いて、もう一度お願いします。";
+  }
+
+  try {
+    await sendInteractionFollowUp(job, truncate(text, 1_900));
+  } catch (error) {
+    ok = false;
+    errorMessage = error instanceof Error ? error.message : String(error);
+    console.error(`job ${job.id} follow-up failed`, error);
+  }
+
+  await postSigned("/internal/jobs/complete", {
+    id: job.id,
+    ok,
+    error: errorMessage,
+  });
+}
+
+async function generateReply(mode: AskMode, input: string): Promise<string> {
+  if (!llmApiUrl) {
+    throw new Error("LLM_API_URL is not configured");
+  }
+
+  const systemPrompt = buildSystemPrompt(mode, detectLanguage(input), {
+    pitcheeeUrl,
+  });
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+  if (llmApiKey) {
+    headers.authorization = `Bearer ${llmApiKey}`;
+  }
+
+  const response = await fetch(llmApiUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: llmModel || undefined,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: input },
+      ],
+      temperature: 0.4,
+      max_tokens: 900,
+    }),
+    signal: AbortSignal.timeout(llmTimeoutMs),
+  });
+
+  if (!response.ok) {
+    throw new Error(`LLM API returned ${response.status}`);
+  }
+
+  const body = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const text = body.choices?.[0]?.message?.content;
+  if (!text || text.trim().length === 0) {
+    throw new Error("LLM API returned no text");
+  }
+
+  return stripReasoning(text).trim();
+}
+
+/** Some local models echo their reasoning in <think>…</think>; never show it. */
+function stripReasoning(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "");
+}
+
+async function sendInteractionFollowUp(
+  job: AiJob,
+  content: string,
+): Promise<void> {
+  const response = await fetch(
+    `https://discord.com/api/v10/webhooks/${job.application_id}/${job.interaction_token}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        content,
+        flags: job.ephemeral ? EPHEMERAL_FLAG : 0,
+        allowed_mentions: { parse: [] },
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Discord follow-up returned ${response.status}: ${(await response.text()).slice(0, 300)}`,
+    );
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function observeExternalBotRate(message: Message): Promise<void> {
