@@ -13,6 +13,7 @@ import {
 
 interface Env {
   DB: D1Database;
+  AI?: Ai;
   DISCORD_PUBLIC_KEY: string;
   DISCORD_BOT_TOKEN: string;
   DISCORD_APPLICATION_ID?: string;
@@ -20,6 +21,7 @@ interface Env {
   /**
    * "gateway": queue /ask and /pitch for the Gateway process, which runs the
    *   in-house LLM and answers through the interaction webhook (default).
+   * "workers-ai": answer from the Worker with the Cloudflare Workers AI binding.
    * "worker": call an OpenAI-compatible Chat Completions API from the Worker.
    */
   AI_PROVIDER?: string;
@@ -137,6 +139,10 @@ export default {
       url.pathname === "/internal/register-commands"
     ) {
       return handleInternalRegisterCommands(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/ai-test") {
+      return handleInternalAiTest(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/internal/jobs/claim") {
@@ -529,13 +535,43 @@ async function callAi(
   mode: "ask" | "pitch",
   input: string,
 ): Promise<string> {
-  if (!env.AI_API_URL || !env.AI_API_KEY || !env.AI_MODEL) {
-    return fallbackResponse(mode, input, env.PITCHEEE_URL);
-  }
-
   const systemPrompt = buildSystemPrompt(mode, detectLanguage(input), {
     pitcheeeUrl: env.PITCHEEE_URL,
   });
+
+  const provider = (env.AI_PROVIDER ?? "gateway").trim().toLowerCase();
+  if (provider === "workers-ai") {
+    if (!env.AI) {
+      return fallbackResponse(mode, input, env.PITCHEEE_URL);
+    }
+    const model = (env.AI_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast") as Parameters<
+      Ai["run"]
+    >[0];
+    const result = (await env.AI.run(model, {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: input },
+      ],
+      max_tokens: 900,
+      temperature: 0.4,
+    } as never)) as {
+      response?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const raw =
+      result.response ?? result.choices?.[0]?.message?.content ?? "";
+    const text = stripReasoning(raw).trim();
+    if (!text) {
+      throw new Error(
+        `Workers AI returned no text: ${JSON.stringify(result).slice(0, 400)}`,
+      );
+    }
+    return text;
+  }
+
+  if (!env.AI_API_URL || !env.AI_API_KEY || !env.AI_MODEL) {
+    return fallbackResponse(mode, input, env.PITCHEEE_URL);
+  }
 
   const response = await fetch(env.AI_API_URL, {
     method: "POST",
@@ -568,7 +604,14 @@ async function callAi(
     throw new Error("AI API returned no text");
   }
 
-  return text.trim();
+  return stripReasoning(text).trim();
+}
+
+/** Some models echo their reasoning in <think>…</think>; never show it. */
+function stripReasoning(text: string): string {
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .replace(/<\/?think>/g, "");
 }
 
 function fallbackResponse(
@@ -689,7 +732,7 @@ async function startAiJob(
 ): Promise<Response> {
   const provider = (env.AI_PROVIDER ?? "gateway").trim().toLowerCase();
 
-  if (provider === "worker") {
+  if (provider === "worker" || provider === "workers-ai") {
     context.waitUntil(
       generateAndFollowUp(interaction, env, mode, input, ephemeral),
     );
@@ -787,6 +830,54 @@ async function handleInternalRegisterCommands(
     scope: guildId ? `guild:${guildId}` : "global",
     commands: registered.map((command) => command.name),
   });
+}
+
+async function handleInternalAiTest(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: { mode?: unknown; input?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  if (typeof body.input !== "string" || body.input.trim().length === 0) {
+    return json({ error: "input_is_required" }, 400);
+  }
+
+  const mode: AskMode = body.mode === "pitch" ? "pitch" : "ask";
+  const startedAt = Date.now();
+  try {
+    const text = await callAi(env, mode, body.input);
+    return json({
+      provider: (env.AI_PROVIDER ?? "gateway").trim().toLowerCase(),
+      model: env.AI_MODEL || null,
+      durationMs: Date.now() - startedAt,
+      text,
+    });
+  } catch (error) {
+    return json(
+      {
+        error: "ai_failed",
+        detail: error instanceof Error ? error.message : String(error),
+        durationMs: Date.now() - startedAt,
+      },
+      502,
+    );
+  }
 }
 
 async function handleInternalJobsClaim(
