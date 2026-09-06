@@ -279,8 +279,8 @@ async function generateReply(
   });
 
   // The in-house LLM host occasionally drops off the LAN for a few seconds
-  // (EHOSTUNREACH); retry transient failures before giving up on the order.
-  const delaysMs = [0, 2_000, 6_000];
+  // (EHOSTUNREACH); retry up to five times before giving up on the order (the interaction token lives 15 minutes).
+  const delaysMs = [0, 2_000, 5_000, 10_000, 20_000];
   let response: Response | undefined;
   let lastError: unknown;
   for (const delay of delaysMs) {
