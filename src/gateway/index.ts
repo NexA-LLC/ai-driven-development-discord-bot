@@ -219,8 +219,6 @@ async function pollJobsForever(): Promise<void> {
 
 async function processJob(job: AiJob): Promise<void> {
   let text: string;
-  let ok = true;
-  let errorMessage: string | undefined;
 
   try {
     if (!job.input) {
@@ -228,26 +226,32 @@ async function processJob(job: AiJob): Promise<void> {
     }
     text = await generateReply(job.mode, job.input);
   } catch (error) {
-    ok = false;
-    errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`job ${job.id} failed`, error);
-    text =
-      "すみません、今、答えが作れませんでした。内容は外に出していません。少し時間を置いて、もう一度お願いします。";
+    // Hand the order back: the Worker answers with its fallback model
+    // (Workers AI) or apologises itself, so the customer always hears back.
+    console.error(`job ${job.id} failed; handing back to the Worker`, error);
+    await postSigned("/internal/jobs/complete", {
+      id: job.id,
+      ok: false,
+      answered: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
   }
 
   try {
     await sendInteractionFollowUp(job, truncate(text, 1_900));
   } catch (error) {
-    ok = false;
-    errorMessage = error instanceof Error ? error.message : String(error);
     console.error(`job ${job.id} follow-up failed`, error);
+    await postSigned("/internal/jobs/complete", {
+      id: job.id,
+      ok: false,
+      answered: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
   }
 
-  await postSigned("/internal/jobs/complete", {
-    id: job.id,
-    ok,
-    error: errorMessage,
-  });
+  await postSigned("/internal/jobs/complete", { id: job.id, ok: true });
 }
 
 async function generateReply(

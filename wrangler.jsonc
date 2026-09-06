@@ -10,7 +10,7 @@
   "vars": {
     "COMMUNITY_NAME": "AI Driven Development",
     "DISCORD_APPLICATION_ID": "1546091192444260442",
-    "AI_PROVIDER": "workers-ai",
+    "AI_PROVIDER": "gateway",
     "AI_API_URL": "",
     "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "PITCHEEE_URL": ""

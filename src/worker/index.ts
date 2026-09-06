@@ -539,12 +539,15 @@ async function callAi(
   env: Env,
   mode: "ask" | "pitch",
   input: string,
+  providerOverride?: string,
 ): Promise<string> {
   const systemPrompt = buildSystemPrompt(mode, detectLanguage(input), {
     pitcheeeUrl: env.PITCHEEE_URL,
   });
 
-  const provider = (env.AI_PROVIDER ?? "gateway").trim().toLowerCase();
+  const provider = (providerOverride ?? env.AI_PROVIDER ?? "gateway")
+    .trim()
+    .toLowerCase();
   if (provider === "workers-ai") {
     if (!env.AI) {
       return fallbackResponse(mode, input, env.PITCHEEE_URL);
@@ -1053,7 +1056,12 @@ async function handleInternalJobsComplete(
     return json({ error: "invalid_internal_signature" }, 401);
   }
 
-  let body: { id?: unknown; ok?: unknown; error?: unknown };
+  let body: {
+    id?: unknown;
+    ok?: unknown;
+    answered?: unknown;
+    error?: unknown;
+  };
   try {
     body = JSON.parse(rawBody) as typeof body;
   } catch {
@@ -1064,7 +1072,52 @@ async function handleInternalJobsComplete(
     return json({ error: "id_is_required" }, 400);
   }
 
-  const succeeded = body.ok !== false;
+  let succeeded = body.ok !== false;
+  let errorText = succeeded ? null : truncate(String(body.error ?? "unknown"), 500);
+  let fallback: "workers-ai" | "apology" | null = null;
+
+  // The Gateway could not answer (LLM host down, etc.). Answer from here with
+  // Workers AI so the customer still hears back, or at least apologise.
+  if (!succeeded && body.answered === false) {
+    const job = await env.DB.prepare(
+      `SELECT id, mode, input, language, application_id, interaction_token,
+              ephemeral, guild_id, requester_user_id
+         FROM ai_jobs WHERE id = ? AND status = 'claimed'`,
+    )
+      .bind(body.id)
+      .first<AiJobRow>();
+
+    if (job) {
+      const interaction: DiscordInteraction = {
+        id: job.id,
+        application_id: job.application_id,
+        type: InteractionType.APPLICATION_COMMAND,
+        token: job.interaction_token,
+      };
+      let text: string | null = null;
+      if (env.AI && job.input) {
+        try {
+          text = await callAi(env, job.mode, job.input, "workers-ai");
+          fallback = "workers-ai";
+          succeeded = true;
+          errorText = truncate(`gateway: ${String(body.error ?? "unknown")}; answered by workers-ai`, 500);
+        } catch (error) {
+          console.error("workers-ai fallback failed", error);
+        }
+      }
+      if (!text) {
+        text =
+          "すみません、今、答えが作れませんでした。内容は外に出していません。少し時間を置いて、もう一度お願いします。";
+        fallback = "apology";
+      }
+      try {
+        await sendFollowUp(interaction, truncate(text, 1_900), job.ephemeral === 1);
+      } catch (error) {
+        console.error("fallback follow-up failed", error);
+      }
+    }
+  }
+
   await env.DB.prepare(
     `UPDATE ai_jobs
         SET status = ?, input = NULL, completed_at = ?, error = ?
@@ -1073,12 +1126,12 @@ async function handleInternalJobsComplete(
     .bind(
       succeeded ? "done" : "failed",
       new Date().toISOString(),
-      succeeded ? null : truncate(String(body.error ?? "unknown"), 500),
+      errorText,
       body.id,
     )
     .run();
 
-  return json({ ok: true });
+  return json({ ok: true, fallback });
 }
 
 async function verifyInternalRequest(
