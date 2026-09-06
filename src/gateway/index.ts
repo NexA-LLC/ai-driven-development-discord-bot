@@ -140,6 +140,12 @@ async function onMessage(message: Message): Promise<void> {
     return;
   }
 
+  if (process.env.GATEWAY_DEBUG === "1") {
+    console.log(
+      `[msg] channel=${message.channelId} author=${message.author.id} bot=${message.author.bot} mentionsMe=${client.user ? message.mentions.has(client.user) : "?"} contentLen=${message.content.length}`,
+    );
+  }
+
   const inMonitoredChannel = monitoredChannelIds.has(message.channelId);
 
   if (message.author.bot) {
