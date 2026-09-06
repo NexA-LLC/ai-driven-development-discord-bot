@@ -60,6 +60,8 @@ Third-party Agent
 
 ## セットアップ
 
+以下はローカル開発向けです。実サーバーで動かすまでの手順は [`docs/DEPLOY.md`](docs/DEPLOY.md) にまとめています。
+
 ### 1. Install
 
 ```bash

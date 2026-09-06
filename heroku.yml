@@ -1,0 +1,8 @@
+build:
+  docker:
+    worker: Dockerfile.gateway
+run:
+  # Gateway は Discord へ外向き WebSocket 接続するだけで、受信ポートを bind しません。
+  # そのため web ではなく worker プロセスとして起動します。
+  # web にすると $PORT を listen せず R10 (Boot timeout) で落ちます。
+  worker: node dist/gateway/index.js
