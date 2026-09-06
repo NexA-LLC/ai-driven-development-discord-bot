@@ -16,6 +16,7 @@
     "start:gateway": "node dist/gateway/index.js",
     "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.gateway.json --noEmit",
     "test": "vitest run",
+    "todos:validate": "node scripts/validate-todos.mjs",
     "commands:register": "node scripts/register-commands.mjs",
     "deploy:worker": "wrangler deploy"
   },
