@@ -268,7 +268,7 @@ async function generateReply(
     headers.authorization = `Bearer ${llmApiKey}`;
   }
 
-  const body = JSON.stringify({
+  const requestBody = JSON.stringify({
     model: llmModel || undefined,
     messages: [
       { role: "system", content: systemPrompt },
@@ -291,7 +291,7 @@ async function generateReply(
       response = await fetch(llmApiUrl, {
         method: "POST",
         headers,
-        body,
+        body: requestBody,
         signal: AbortSignal.timeout(llmTimeoutMs),
       });
       if (response.ok || response.status < 500) {
