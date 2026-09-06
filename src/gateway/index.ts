@@ -9,6 +9,7 @@ import {
   buildSystemPrompt,
   detectLanguage,
   type AskMode,
+  type SuEvent,
 } from "../shared/persona.js";
 
 interface AiJob {
@@ -66,9 +67,15 @@ if (passiveObserve && monitoredChannelIds.size === 0) {
   );
 }
 
+const welcomeChannelId = process.env.WELCOME_CHANNEL_ID?.trim() || "";
+
 const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
 if (enableMessageContentIntent) {
   intents.push(GatewayIntentBits.MessageContent);
+}
+if (welcomeChannelId) {
+  // Needs "Server Members Intent" enabled in the Developer Portal.
+  intents.push(GatewayIntentBits.GuildMembers);
 }
 
 const client = new Client({ intents });
@@ -84,6 +91,39 @@ client.once(Events.ClientReady, (readyClient) => {
     console.warn(
       "LLM_API_URL is not set; /ask and /pitch orders will stay in the queue",
     );
+  }
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  if (!welcomeChannelId || member.user.bot) {
+    return;
+  }
+  try {
+    const name = member.displayName || member.user.username;
+    const text = await generateReply(
+      "welcome",
+      `新しいお客さんの名前: ${name}`,
+      detectLanguage(name) === "ja" ? "ja" : "en",
+    );
+    const channel = await client.channels.fetch(welcomeChannelId);
+    const sendable = channel as
+      | {
+          send?: (options: {
+            content: string;
+            allowedMentions: { users: string[] };
+          }) => Promise<unknown>;
+        }
+      | null;
+    if (typeof sendable?.send !== "function") {
+      console.warn("WELCOME_CHANNEL_ID is not sendable");
+      return;
+    }
+    await sendable.send({
+      content: `<@${member.id}> ${truncate(text, 1_800)}`,
+      allowedMentions: { users: [member.id] },
+    });
+  } catch (error) {
+    console.error("welcome failed", error);
   }
 });
 
@@ -138,7 +178,7 @@ async function onMessage(message: Message): Promise<void> {
 
   let text: string;
   try {
-    text = await generateReply("ask", prompt);
+    text = await generateReply("mention", prompt);
   } catch (error) {
     console.error("mention reply failed", error);
     text =
@@ -204,14 +244,16 @@ async function processJob(job: AiJob): Promise<void> {
   });
 }
 
-async function generateReply(mode: AskMode, input: string): Promise<string> {
+async function generateReply(
+  event: SuEvent,
+  input: string,
+  language = detectLanguage(input),
+): Promise<string> {
   if (!llmApiUrl) {
     throw new Error("LLM_API_URL is not configured");
   }
 
-  const systemPrompt = buildSystemPrompt(mode, detectLanguage(input), {
-    pitcheeeUrl,
-  });
+  const systemPrompt = buildSystemPrompt(event, language, { pitcheeeUrl });
 
   const headers: Record<string, string> = {
     "content-type": "application/json",

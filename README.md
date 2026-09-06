@@ -1,6 +1,6 @@
 # AI Driven Development Discord Bot「スー」
 
-AI駆動開発コミュニティ（Discord）のための Discord App / Bot 基盤です。Bot の人格は KyaraFlip のキャラクター「スー（Su Myat Thiri）」で、Discord サーバーを「深夜のコンビニ」に見立てて動きます。人格の正本は KyaraFlip 側のドキュメントにあり、Bot への投影は `src/shared/persona.ts` です。
+AI駆動開発コミュニティ（Discord）のための Discord App / Bot 基盤です。Bot の人格は KyaraFlip のキャラクター「スー（Su Myat Thiri）」で、Discord サーバーを「深夜のコンビニ」に見立てて動きます。人格の正本は [`docs/character/su.md`](docs/character/su.md)、Bot への投影（プロンプト）は `src/shared/persona.ts` です。挙動は if 文ではなくプロンプトで管理します。
 
 皆で作る Bot です。Issue / PR 歓迎。改善の議論は DecisionGarden「スーの秘密日記」に残します。
 
@@ -223,7 +223,7 @@ staging D1
 
 ## 人格と改善の記録
 
-- 人格の正本: KyaraFlip リポジトリ `docs/concept/characters/thiri.md`
+- 人格の正本: [`docs/character/su.md`](docs/character/su.md)
 - Live Card: https://kyaraflip.com/api/public/artifacts/398db834-8191-4f02-92d1-2432ea940488
 - 改善の議論: DecisionGarden「スーの秘密日記」（team で編集、埋め込みで公開）
 
