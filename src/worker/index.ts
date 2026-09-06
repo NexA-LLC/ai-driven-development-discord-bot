@@ -6,6 +6,7 @@ import {
 import { discordCommands } from "../shared/commands.js";
 import {
   ABOUT_TEXT,
+  APP_DESCRIPTION,
   buildSystemPrompt,
   detectLanguage,
   type AskMode,
@@ -861,6 +862,7 @@ async function handleInternalProfile(
     iconDataUrl?: unknown;
     nick?: unknown;
     guildId?: unknown;
+    description?: unknown;
   };
   try {
     body = JSON.parse(rawBody) as typeof body;
@@ -889,16 +891,25 @@ async function handleInternalProfile(
     };
   }
 
+  const appPatch: Record<string, string> = {};
   if (isDataUrl(body.iconDataUrl)) {
+    appPatch.icon = body.iconDataUrl;
+  }
+  if (body.description === true) {
+    appPatch.description = APP_DESCRIPTION;
+  } else if (typeof body.description === "string") {
+    appPatch.description = body.description.slice(0, 400);
+  }
+  if (Object.keys(appPatch).length > 0) {
     const response = await fetch(
       "https://discord.com/api/v10/applications/@me",
       {
         method: "PATCH",
         headers,
-        body: JSON.stringify({ icon: body.iconDataUrl }),
+        body: JSON.stringify(appPatch),
       },
     );
-    results.icon = {
+    results.application = {
       status: response.status,
       ...(response.ok ? {} : { detail: (await response.text()).slice(0, 300) }),
     };
