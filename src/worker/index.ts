@@ -1534,7 +1534,10 @@ async function runImprovementDigest(env: Env, hours = 24): Promise<void> {
       await mcpCall(dg.url, dg.token, "save_memory_node", {
         gardenId: dg.gardenId,
         sourceKey: `su-digest:${dateJst}`,
+        source: "ai-driven-development-discord-bot/worker improvement digest",
         kind: "knowledge",
+        state: "active",
+        visibility: "garden",
         title: `スー 日次ダイジェスト ${dateJst}`,
         body: [
           statsLine,
