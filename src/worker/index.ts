@@ -31,6 +31,11 @@ interface Env {
   AI_MODEL?: string;
   PITCHEEE_URL?: string;
   COMMUNITY_NAME?: string;
+  /** Discord channel for operator notifications (店長室). */
+  OPS_CHANNEL_ID?: string;
+  /** Fine-grained GitHub token (issues:write on this repo) for incident issues. */
+  GITHUB_TOKEN?: string;
+  GITHUB_REPO?: string;
 }
 
 interface AiJobRow {
@@ -140,6 +145,29 @@ export default {
       url.pathname === "/internal/register-commands"
     ) {
       return handleInternalRegisterCommands(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/incidents") {
+      return handleInternalIncident(request, env);
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/internal/incidents/pending"
+    ) {
+      return handleInternalIncidentsPending(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/incidents/ack") {
+      return handleInternalIncidentsAck(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/reply-logs") {
+      return handleInternalReplyLog(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/feedback") {
+      return handleInternalFeedback(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/internal/profile") {
@@ -840,6 +868,319 @@ async function handleInternalRegisterCommands(
   });
 }
 
+
+type IncidentSeverity = "info" | "warning" | "error" | "critical";
+
+interface IncidentInput {
+  kind: string;
+  severity: IncidentSeverity;
+  source: string;
+  summary: string;
+  detail?: string | undefined;
+  dedupeKey?: string | undefined;
+}
+
+const INCIDENT_DEDUPE_WINDOW_MS = 60 * 60 * 1_000;
+const INCIDENT_ISSUE_THRESHOLD = 3;
+const INCIDENT_RENOTIFY_COUNTS = new Set([1, 3, 10, 50]);
+
+/**
+ * Record an incident, folding repeats of the same dedupeKey within the window
+ * into one row. Notifies the operator channel on the 1st/3rd/10th/50th
+ * occurrence and opens a GitHub issue (for Repo Deck) at the 3rd.
+ */
+async function recordIncident(
+  env: Env,
+  input: IncidentInput,
+): Promise<{ id: string; count: number; issueUrl: string | null }> {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const dedupeKey = input.dedupeKey ?? `${input.source}:${input.kind}`;
+  const detail = input.detail ? truncate(input.detail, 1_500) : null;
+  const summary = truncate(input.summary, 300);
+
+  const existing = await env.DB.prepare(
+    `SELECT id, count, last_seen_at, issue_url FROM incidents
+      WHERE dedupe_key = ? AND status = 'open'
+      ORDER BY last_seen_at DESC LIMIT 1`,
+  )
+    .bind(dedupeKey)
+    .first<{ id: string; count: number; last_seen_at: string; issue_url: string | null }>();
+
+  let id: string;
+  let count: number;
+  let issueUrl: string | null = null;
+
+  if (
+    existing &&
+    now.getTime() - new Date(existing.last_seen_at).getTime() < INCIDENT_DEDUPE_WINDOW_MS
+  ) {
+    id = existing.id;
+    count = existing.count + 1;
+    issueUrl = existing.issue_url;
+    await env.DB.prepare(
+      `UPDATE incidents SET count = ?, last_seen_at = ?, detail = ?, severity = ?, relayed_at = NULL
+        WHERE id = ?`,
+    )
+      .bind(count, nowIso, detail, input.severity, id)
+      .run();
+  } else {
+    id = crypto.randomUUID();
+    count = 1;
+    await env.DB.prepare(
+      `INSERT INTO incidents (id, dedupe_key, kind, severity, source, summary, detail, count, first_seen_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    )
+      .bind(id, dedupeKey, input.kind, input.severity, input.source, summary, detail, nowIso, nowIso)
+      .run();
+  }
+
+  if (!issueUrl && count >= INCIDENT_ISSUE_THRESHOLD && env.GITHUB_TOKEN) {
+    issueUrl = await openIncidentIssue(env, {
+      ...input,
+      id,
+      dedupeKey,
+      count,
+      summary,
+      detail: detail ?? undefined,
+    });
+    if (issueUrl) {
+      await env.DB.prepare(`UPDATE incidents SET issue_url = ? WHERE id = ?`).bind(issueUrl, id).run();
+    }
+  }
+
+  if (INCIDENT_RENOTIFY_COUNTS.has(count) && env.OPS_CHANNEL_ID) {
+    const notified = await notifyOps(
+      env,
+      formatIncidentForOps({ ...input, summary, detail: detail ?? undefined }, count, issueUrl),
+    );
+    if (notified) {
+      await env.DB.prepare(`UPDATE incidents SET notified_ops_at = ? WHERE id = ?`).bind(nowIso, id).run();
+    }
+  }
+
+  return { id, count, issueUrl };
+}
+
+function formatIncidentForOps(
+  input: IncidentInput,
+  count: number,
+  issueUrl: string | null,
+): string {
+  const badge = { info: "ℹ️", warning: "⚠️", error: "🔴", critical: "🚨" }[input.severity];
+  const lines = [
+    `${badge} **店長さん、報告です** — ${input.summary}`,
+    `種別: \`${input.kind}\` / 発生元: ${input.source} / 回数: ${count}`,
+  ];
+  if (input.detail) {
+    lines.push(`\`\`\`\n${truncate(input.detail, 600)}\n\`\`\``);
+  }
+  if (issueUrl) {
+    lines.push(`Repo Deck 向け Issue: ${issueUrl}`);
+  }
+  lines.push("私では直せないので、見てもらえますか。");
+  return lines.join("\n");
+}
+
+async function notifyOps(env: Env, content: string): Promise<boolean> {
+  if (!env.OPS_CHANNEL_ID) {
+    return false;
+  }
+  const response = await fetch(
+    `https://discord.com/api/v10/channels/${env.OPS_CHANNEL_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ content: truncate(content, 1_900), allowed_mentions: { parse: [] } }),
+    },
+  );
+  if (!response.ok) {
+    console.error("ops notify failed", response.status, (await response.text()).slice(0, 200));
+  }
+  return response.ok;
+}
+
+async function openIncidentIssue(
+  env: Env,
+  incident: IncidentInput & { id: string; dedupeKey: string; count: number },
+): Promise<string | null> {
+  const repo = env.GITHUB_REPO || "NexA-LLC/ai-driven-development-discord-bot";
+  const title = `[incident] ${incident.summary}`.slice(0, 200);
+  const body = [
+    `スー（Discord Bot）が同じ障害を ${incident.count} 回検知しました。Repo Deck / 運営で調査・修正をお願いします。`,
+    "",
+    `- kind: \`${incident.kind}\``,
+    `- severity: \`${incident.severity}\``,
+    `- source: \`${incident.source}\``,
+    `- dedupeKey: \`${incident.dedupeKey}\``,
+    `- incident id: \`${incident.id}\``,
+    "",
+    "## 最新の詳細",
+    "```",
+    incident.detail ?? "(no detail)",
+    "```",
+    "",
+    "## 期待する作業",
+    "1. 原因の切り分け（Gateway / LLM ホスト / Discord / Worker）",
+    "2. 再発防止の実装（再試行、フォールバック、監視、設定）",
+    "3. 直したら `incidents` の該当行を resolved にする（`/internal/incidents/ack` は relay 用、resolve は手動）",
+    "",
+    "_opened automatically by the Worker incident loop_",
+  ].join("\n");
+
+  const response = await fetch(`https://api.github.com/repos/${repo}/issues`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.GITHUB_TOKEN ?? ""}`,
+      accept: "application/vnd.github+json",
+      "content-type": "application/json",
+      "user-agent": "su-discord-bot-incident-loop",
+    },
+    body: JSON.stringify({ title, body, labels: ["incident", "su"] }),
+  });
+  if (!response.ok) {
+    console.error("github issue failed", response.status, (await response.text()).slice(0, 300));
+    return null;
+  }
+  const issue = (await response.json()) as { html_url?: string };
+  return issue.html_url ?? null;
+}
+
+async function handleInternalIncident(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: Partial<IncidentInput>;
+  try {
+    body = JSON.parse(rawBody) as Partial<IncidentInput>;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (typeof body.kind !== "string" || typeof body.summary !== "string") {
+    return json({ error: "kind_and_summary_are_required" }, 400);
+  }
+  const severity: IncidentSeverity = (["info", "warning", "error", "critical"] as const).includes(
+    body.severity as IncidentSeverity,
+  )
+    ? (body.severity as IncidentSeverity)
+    : "warning";
+  const result = await recordIncident(env, {
+    kind: body.kind,
+    severity,
+    source: typeof body.source === "string" ? body.source : "gateway",
+    summary: body.summary,
+    detail: typeof body.detail === "string" ? body.detail : undefined,
+    dedupeKey: typeof body.dedupeKey === "string" ? body.dedupeKey : undefined,
+  });
+  return json({ ok: true, ...result });
+}
+
+async function handleInternalIncidentsPending(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  const rows = await env.DB.prepare(
+    `SELECT id, dedupe_key, kind, severity, source, summary, detail, count,
+            first_seen_at, last_seen_at, issue_url
+       FROM incidents
+      WHERE relayed_at IS NULL
+      ORDER BY last_seen_at ASC
+      LIMIT 20`,
+  ).all();
+  return json({ incidents: rows.results });
+}
+
+async function handleInternalIncidentsAck(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: { ids?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  const ids = Array.isArray(body.ids) ? body.ids.filter((v): v is string => typeof v === "string").slice(0, 50) : [];
+  const now = new Date().toISOString();
+  for (const id of ids) {
+    await env.DB.prepare(`UPDATE incidents SET relayed_at = ? WHERE id = ?`).bind(now, id).run();
+  }
+  return json({ ok: true, acked: ids.length });
+}
+
+async function handleInternalReplyLog(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO reply_logs (id, event, guild_id, channel_id, message_id, requester_user_id,
+                             provider, model, latency_ms, ok, reply_text)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      str(body.event) ?? "unknown",
+      str(body.guildId),
+      str(body.channelId),
+      str(body.messageId),
+      str(body.requesterUserId),
+      str(body.provider),
+      str(body.model),
+      typeof body.latencyMs === "number" ? Math.round(body.latencyMs) : null,
+      body.ok === false ? 0 : 1,
+      str(body.replyText) ? truncate(str(body.replyText) as string, 4_000) : null,
+    )
+    .run();
+  return json({ ok: true, id });
+}
+
+async function handleInternalFeedback(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  const kind = body.kind === "reaction" || body.kind === "command" ? body.kind : "reply";
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO feedback_logs (id, kind, guild_id, channel_id, message_id, in_reply_to_message_id, user_id, content)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      kind,
+      str(body.guildId),
+      str(body.channelId),
+      str(body.messageId),
+      str(body.inReplyToMessageId),
+      str(body.userId),
+      str(body.content) ? truncate(str(body.content) as string, 2_000) : null,
+    )
+    .run();
+  return json({ ok: true, id });
+}
+
 /**
  * Update the bot's own presentation (avatar, application icon, guild nickname)
  * using the bot token that lives in Worker secrets, so no token is needed on
@@ -1104,6 +1445,16 @@ async function handleInternalJobsComplete(
         } catch (error) {
           console.error("workers-ai fallback failed", error);
         }
+        await recordIncident(env, {
+          kind: "gateway_unanswered",
+          severity: fallback ? "warning" : "error",
+          source: "worker",
+          summary: fallback
+            ? "Gateway が答えられず、Workers AI で代替回答しました"
+            : "Gateway も Workers AI も答えられませんでした",
+          detail: String(body.error ?? "unknown"),
+          dedupeKey: `worker:gateway_unanswered`,
+        });
       }
       if (!text) {
         text =

@@ -148,3 +148,14 @@ P0/P1 should disable the integration immediately. P2 normally starts with Quaran
 - 運営チャンネル ID など、公開すると標的になりやすい運用値
 
 CI では gitleaks で履歴と差分を走査し、GitHub の Push Protection を有効にしています。
+
+## 返答ログとフィードバックの保存範囲（2026-09-07）
+
+改善ループのために、次を D1 に保存します。
+
+- スー自身の返答（本文、イベント種別、モデル、所要時間、成否）: `reply_logs`
+- スーの投稿への人の反応: Discord の「返信」で向けられた本文、`#スーの独り言` での発言、スーの投稿へのリアクション、`/feedback` の本文: `feedback_logs`
+- 障害の記録（種別、要約、回数、詳細メッセージ）: `incidents`。会話本文は含めません
+
+保存しないもの（従来どおり）: スーに向けられていない通常の会話本文、`/ask` `/pitch` の入力本文（完了時に消去）。
+運営チャンネル（店長室）への通知と nexa-chat への中継にも会話本文は載せません。
