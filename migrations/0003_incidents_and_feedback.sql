@@ -2,7 +2,8 @@
 -- 205 relay forwards them to nexa-chat; repeated incidents become GitHub
 -- issues for Repo Deck. Detail text is bounded and never contains user
 -- conversation content.
-CREATE TABLE IF NOT EXISTS incidents (
+-- Named su_incidents because 0001 already defines a metadata-only `incidents` table.
+CREATE TABLE IF NOT EXISTS su_incidents (
   id TEXT PRIMARY KEY,
   dedupe_key TEXT NOT NULL,
   kind TEXT NOT NULL,
@@ -22,10 +23,10 @@ CREATE TABLE IF NOT EXISTS incidents (
   resolved_at TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_incidents_dedupe_open
-  ON incidents(dedupe_key, status);
-CREATE INDEX IF NOT EXISTS idx_incidents_relay
-  ON incidents(relayed_at, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_su_incidents_dedupe_open
+  ON su_incidents(dedupe_key, status);
+CREATE INDEX IF NOT EXISTS idx_su_incidents_relay
+  ON su_incidents(relayed_at, last_seen_at);
 
 -- Feedback loop, part 1: what スー said. Her own text is hers to keep.
 CREATE TABLE IF NOT EXISTS reply_logs (

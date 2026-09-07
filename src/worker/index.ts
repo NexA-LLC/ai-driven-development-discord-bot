@@ -900,7 +900,7 @@ async function recordIncident(
   const summary = truncate(input.summary, 300);
 
   const existing = await env.DB.prepare(
-    `SELECT id, count, last_seen_at, issue_url FROM incidents
+    `SELECT id, count, last_seen_at, issue_url FROM su_incidents
       WHERE dedupe_key = ? AND status = 'open'
       ORDER BY last_seen_at DESC LIMIT 1`,
   )
@@ -919,7 +919,7 @@ async function recordIncident(
     count = existing.count + 1;
     issueUrl = existing.issue_url;
     await env.DB.prepare(
-      `UPDATE incidents SET count = ?, last_seen_at = ?, detail = ?, severity = ?, relayed_at = NULL
+      `UPDATE su_incidents SET count = ?, last_seen_at = ?, detail = ?, severity = ?, relayed_at = NULL
         WHERE id = ?`,
     )
       .bind(count, nowIso, detail, input.severity, id)
@@ -928,7 +928,7 @@ async function recordIncident(
     id = crypto.randomUUID();
     count = 1;
     await env.DB.prepare(
-      `INSERT INTO incidents (id, dedupe_key, kind, severity, source, summary, detail, count, first_seen_at, last_seen_at)
+      `INSERT INTO su_incidents (id, dedupe_key, kind, severity, source, summary, detail, count, first_seen_at, last_seen_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
     )
       .bind(id, dedupeKey, input.kind, input.severity, input.source, summary, detail, nowIso, nowIso)
@@ -945,7 +945,7 @@ async function recordIncident(
       detail: detail ?? undefined,
     });
     if (issueUrl) {
-      await env.DB.prepare(`UPDATE incidents SET issue_url = ? WHERE id = ?`).bind(issueUrl, id).run();
+      await env.DB.prepare(`UPDATE su_incidents SET issue_url = ? WHERE id = ?`).bind(issueUrl, id).run();
     }
   }
 
@@ -955,7 +955,7 @@ async function recordIncident(
       formatIncidentForOps({ ...input, summary, detail: detail ?? undefined }, count, issueUrl),
     );
     if (notified) {
-      await env.DB.prepare(`UPDATE incidents SET notified_ops_at = ? WHERE id = ?`).bind(nowIso, id).run();
+      await env.DB.prepare(`UPDATE su_incidents SET notified_ops_at = ? WHERE id = ?`).bind(nowIso, id).run();
     }
   }
 
@@ -1087,7 +1087,7 @@ async function handleInternalIncidentsPending(request: Request, env: Env): Promi
   const rows = await env.DB.prepare(
     `SELECT id, dedupe_key, kind, severity, source, summary, detail, count,
             first_seen_at, last_seen_at, issue_url
-       FROM incidents
+       FROM su_incidents
       WHERE relayed_at IS NULL
       ORDER BY last_seen_at ASC
       LIMIT 20`,
@@ -1109,7 +1109,7 @@ async function handleInternalIncidentsAck(request: Request, env: Env): Promise<R
   const ids = Array.isArray(body.ids) ? body.ids.filter((v): v is string => typeof v === "string").slice(0, 50) : [];
   const now = new Date().toISOString();
   for (const id of ids) {
-    await env.DB.prepare(`UPDATE incidents SET relayed_at = ? WHERE id = ?`).bind(now, id).run();
+    await env.DB.prepare(`UPDATE su_incidents SET relayed_at = ? WHERE id = ?`).bind(now, id).run();
   }
   return json({ ok: true, acked: ids.length });
 }
