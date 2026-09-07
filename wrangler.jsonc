@@ -13,7 +13,9 @@
     "AI_PROVIDER": "gateway",
     "AI_API_URL": "",
     "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "PITCHEEE_URL": ""
+    "PITCHEEE_URL": "",
+    "OPS_CHANNEL_ID": "",
+    "GITHUB_REPO": "NexA-LLC/ai-driven-development-discord-bot"
   },
   "ai": {
     "binding": "AI"

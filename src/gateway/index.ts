@@ -1,9 +1,14 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import {
+  ChannelType,
   Client,
   Events,
   GatewayIntentBits,
+  Partials,
+  PermissionFlagsBits,
   type Message,
+  type TextChannel,
 } from "discord.js";
 import {
   buildSystemPrompt,
@@ -68,8 +73,22 @@ if (passiveObserve && monitoredChannelIds.size === 0) {
 }
 
 const welcomeChannelId = process.env.WELCOME_CHANNEL_ID?.trim() || "";
+// Operator channel (店長室) and musings channel (スーの独り言). Resolved by id,
+// else by name inside the primary guild, else created (needs Manage Channels).
+const primaryGuildId = process.env.DISCORD_GUILD_ID?.trim() || "";
+let opsChannelId = process.env.OPS_CHANNEL_ID?.trim() || "";
+let musingsChannelId = process.env.MUSINGS_CHANNEL_ID?.trim() || "";
+const opsChannelName = process.env.OPS_CHANNEL_NAME?.trim() || "店長室";
+const musingsChannelName = process.env.MUSINGS_CHANNEL_NAME?.trim() || "スーの独り言";
+const musingsHourJst = readPositiveInteger("MUSINGS_HOUR_JST", 23);
+const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
+const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
 
-const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages];
+const intents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildMessageReactions,
+];
 if (enableMessageContentIntent) {
   intents.push(GatewayIntentBits.MessageContent);
 }
@@ -78,19 +97,66 @@ if (welcomeChannelId) {
   intents.push(GatewayIntentBits.GuildMembers);
 }
 
-const client = new Client({ intents });
+const client = new Client({
+  intents,
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
+});
+let inFlight = 0;
+let lastMusingDate = "";
 const botRateState = new Map<string, RateState>();
 
-client.once(Events.ClientReady, (readyClient) => {
+client.once(Events.ClientReady, async (readyClient) => {
   console.log(
     `Gateway ready as ${readyClient.user.tag}; passiveObserve=${passiveObserve}; monitoredChannels=${monitoredChannelIds.size}; llm=${llmApiUrl ? llmModel || "(model unset)" : "disabled"}`,
   );
+  try {
+    await resolveOperatorChannels();
+  } catch (error) {
+    console.error("channel resolution failed", error);
+  }
+  startReadinessServer();
   if (llmApiUrl) {
     void pollJobsForever();
+    void museForever();
   } else {
     console.warn(
       "LLM_API_URL is not set; /ask and /pitch orders will stay in the queue",
     );
+    void reportIncident("llm_not_configured", "error", "LLM_API_URL が未設定で、注文に答えられません");
+  }
+});
+
+client.on(Events.Error, (error) => {
+  console.error("discord client error", error);
+  void reportIncident("discord_client_error", "error", "Discord クライアントでエラー", String(error));
+});
+client.on(Events.ShardDisconnect, (event) => {
+  void reportIncident("discord_disconnected", "warning", "Discord との接続が切れました", `code=${event.code}`);
+});
+client.on(Events.ShardResume, () => {
+  console.log("discord shard resumed");
+});
+
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  try {
+    if (user.bot) {
+      return;
+    }
+    const message = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
+    if (message.author?.id !== client.user?.id) {
+      return; // Only reactions to スー's own messages are feedback.
+    }
+    await postSigned("/internal/feedback", {
+      kind: "reaction",
+      guildId: message.guildId,
+      channelId: message.channelId,
+      messageId: message.id,
+      inReplyToMessageId: message.id,
+      userId: user.id,
+      content: reaction.emoji.name ?? reaction.emoji.id ?? "?",
+    });
+  } catch (error) {
+    console.error("reaction feedback failed", error);
   }
 });
 
@@ -118,12 +184,21 @@ client.on(Events.GuildMemberAdd, async (member) => {
       console.warn("WELCOME_CHANNEL_ID is not sendable");
       return;
     }
-    await sendable.send({
+    const sent = (await sendable.send({
       content: `<@${member.id}> ${truncate(text, 1_800)}`,
       allowedMentions: { users: [member.id] },
+    })) as { id?: string } | undefined;
+    await logReply({
+      event: "welcome",
+      guildId: member.guild.id,
+      channelId: welcomeChannelId,
+      messageId: sent?.id,
+      requesterUserId: member.id,
+      replyText: text,
     });
   } catch (error) {
     console.error("welcome failed", error);
+    await reportIncident("welcome_failed", "warning", "新規参加者への挨拶に失敗", String(error));
   }
 });
 
@@ -170,11 +245,40 @@ async function onMessage(message: Message): Promise<void> {
   }
 
   const botUser = client.user;
-  if (!botUser || !message.mentions.has(botUser)) {
+  if (!botUser) {
     return;
   }
 
-  if (!inMonitoredChannel && !allowMentionsAnywhere) {
+  // Feedback: a human replying to one of スー's messages (Discord reply), or
+  // talking in her musings channel, is stored as feedback (SECURITY.md).
+  const repliedToId = message.reference?.messageId;
+  let repliedToSu = false;
+  if (repliedToId) {
+    try {
+      const referenced = await message.channel.messages.fetch(repliedToId);
+      repliedToSu = referenced.author.id === botUser.id;
+    } catch {
+      repliedToSu = false;
+    }
+  }
+  const inMusings = musingsChannelId !== "" && message.channelId === musingsChannelId;
+  if (repliedToSu || inMusings) {
+    await postSigned("/internal/feedback", {
+      kind: "reply",
+      guildId: message.guildId,
+      channelId: message.channelId,
+      messageId: message.id,
+      inReplyToMessageId: repliedToId ?? null,
+      userId: message.author.id,
+      content: message.content,
+    }).catch((error) => console.error("feedback log failed", error));
+  }
+
+  if (!message.mentions.has(botUser)) {
+    return;
+  }
+
+  if (!inMonitoredChannel && !allowMentionsAnywhere && !inMusings) {
     return;
   }
 
@@ -183,21 +287,208 @@ async function onMessage(message: Message): Promise<void> {
     "この店で何ができますか？";
 
   let text: string;
+  let ok = true;
+  const startedAt = Date.now();
+  inFlight += 1;
   try {
     text = await generateReply("mention", prompt);
   } catch (error) {
+    ok = false;
     console.error("mention reply failed", error);
+    await reportIncident("mention_unanswered", "error", "メンションに答えられませんでした", String(error));
     text =
       "すみません、今、答えが作れませんでした。少し時間を置いて、もう一度お願いします。";
+  } finally {
+    inFlight -= 1;
   }
 
-  await message.reply({
+  const sent = await message.reply({
     content: truncate(text, 1_900),
     allowedMentions: {
       parse: [],
       repliedUser: false,
     },
   });
+  await logReply({
+    event: "mention",
+    guildId: message.guildId,
+    channelId: message.channelId,
+    messageId: sent.id,
+    requesterUserId: message.author.id,
+    latencyMs: Date.now() - startedAt,
+    ok,
+    replyText: text,
+  });
+}
+
+async function resolveOperatorChannels(): Promise<void> {
+  if (!primaryGuildId) {
+    return;
+  }
+  const guild = await client.guilds.fetch(primaryGuildId);
+  const channels = await guild.channels.fetch();
+  const findByName = (name: string) =>
+    channels.find((c) => c?.type === ChannelType.GuildText && c.name === name) as
+      | TextChannel
+      | undefined;
+
+  if (!opsChannelId) {
+    let ops = findByName(opsChannelName);
+    if (!ops) {
+      ops = await guild.channels.create({
+        name: opsChannelName,
+        type: ChannelType.GuildText,
+        topic: "スーからの報告と、店長（運営）向けの通知。自動処罰はしません。",
+        permissionOverwrites: [
+          { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+          { id: client.user!.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
+        ],
+      });
+      console.log(`created ops channel #${opsChannelName} (${ops.id})`);
+    }
+    opsChannelId = ops.id;
+  }
+  if (!musingsChannelId) {
+    let musings = findByName(musingsChannelName);
+    if (!musings) {
+      musings = await guild.channels.create({
+        name: musingsChannelName,
+        type: ChannelType.GuildText,
+        topic: "深夜、客のいない時間のスーの独り言。返事もリアクションも、彼女の材料になります。",
+      });
+      console.log(`created musings channel #${musingsChannelName} (${musings.id})`);
+    }
+    musingsChannelId = musings.id;
+  }
+  console.log(`channels: ops=${opsChannelId} musings=${musingsChannelId}`);
+}
+
+/** nexa.host.update.readiness/v1 on loopback, for the NexA Host runtime. */
+function startReadinessServer(): void {
+  const server = createServer((request, response) => {
+    if (request.url !== "/readiness") {
+      response.writeHead(404).end();
+      return;
+    }
+    const body = {
+      contract: "nexa.host.update.readiness/v1",
+      decision: inFlight > 0 ? "defer" : "ready",
+      reasonCode: inFlight > 0 ? "active_work" : "idle",
+      message: inFlight > 0 ? `${inFlight} replies in progress` : "idle",
+      activeWork: inFlight,
+      retryAfterSeconds: 30,
+      observedAt: new Date().toISOString(),
+    };
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+  });
+  server.on("error", (error) => console.warn("readiness server unavailable", error));
+  server.listen(readinessPort, "127.0.0.1", () =>
+    console.log(`readiness at http://127.0.0.1:${readinessPort}/readiness`),
+  );
+}
+
+/** Once a day around MUSINGS_HOUR_JST, スー posts one musing to her channel. */
+async function museForever(): Promise<void> {
+  for (;;) {
+    try {
+      const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1_000);
+      const today = nowJst.toISOString().slice(0, 10);
+      if (musingsChannelId && nowJst.getUTCHours() === musingsHourJst && lastMusingDate !== today) {
+        lastMusingDate = today;
+        await postMusing();
+      }
+    } catch (error) {
+      console.error("musing failed", error);
+      await reportIncident("musing_failed", "warning", "独り言の投稿に失敗", String(error));
+    }
+    await sleep(5 * 60 * 1_000);
+  }
+}
+
+async function postMusing(): Promise<void> {
+  const channel = await client.channels.fetch(musingsChannelId);
+  const text = channel as TextChannel | null;
+  if (!text || text.type !== ChannelType.GuildText) {
+    return;
+  }
+  // Do not post twice in a day if the process restarted after posting.
+  const recent = await text.messages.fetch({ limit: 5 });
+  const todayJst = new Date(Date.now() + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10);
+  const alreadyToday = recent.some(
+    (m) =>
+      m.author.id === client.user?.id &&
+      new Date(m.createdTimestamp + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10) === todayJst,
+  );
+  if (alreadyToday) {
+    return;
+  }
+  const material = [
+    `今日の日付（JST）: ${todayJst}`,
+    `今日レジで答えた回数（この起動以降）: ${repliesSinceStart}`,
+    `今日うまく答えられなかった回数（この起動以降）: ${failuresSinceStart}`,
+    "店の様子: 深夜、客はいない。",
+  ].join("\n");
+  const startedAt = Date.now();
+  const musing = await generateReply("musing", material, "ja");
+  const sent = await text.send({ content: truncate(musing, 400), allowedMentions: { parse: [] } });
+  await logReply({
+    event: "musing",
+    guildId: text.guildId,
+    channelId: text.id,
+    messageId: sent.id,
+    latencyMs: Date.now() - startedAt,
+    ok: true,
+    replyText: musing,
+  });
+}
+
+let repliesSinceStart = 0;
+let failuresSinceStart = 0;
+
+async function logReply(entry: {
+  event: string;
+  guildId?: string | null | undefined;
+  channelId?: string | null | undefined;
+  messageId?: string | null | undefined;
+  requesterUserId?: string | null | undefined;
+  latencyMs?: number | undefined;
+  ok?: boolean | undefined;
+  replyText?: string | undefined;
+}): Promise<void> {
+  if (entry.ok === false) {
+    failuresSinceStart += 1;
+  } else {
+    repliesSinceStart += 1;
+  }
+  try {
+    await postSigned("/internal/reply-logs", {
+      ...entry,
+      provider: "gateway",
+      model: llmModel || null,
+    });
+  } catch (error) {
+    console.error("reply log failed", error);
+  }
+}
+
+async function reportIncident(
+  kind: string,
+  severity: "info" | "warning" | "error" | "critical",
+  summary: string,
+  detail?: string,
+): Promise<void> {
+  try {
+    await postSigned("/internal/incidents", {
+      kind,
+      severity,
+      source: gatewayHost,
+      summary,
+      detail: detail ? detail.slice(0, 1_500) : undefined,
+      dedupeKey: `${gatewayHost}:${kind}`,
+    });
+  } catch (error) {
+    console.error("incident report failed", error);
+  }
 }
 
 async function pollJobsForever(): Promise<void> {
@@ -219,6 +510,8 @@ async function pollJobsForever(): Promise<void> {
 
 async function processJob(job: AiJob): Promise<void> {
   let text: string;
+  const startedAt = Date.now();
+  inFlight += 1;
 
   try {
     if (!job.input) {
@@ -226,9 +519,17 @@ async function processJob(job: AiJob): Promise<void> {
     }
     text = await generateReply(job.mode, job.input);
   } catch (error) {
+    inFlight -= 1;
     // Hand the order back: the Worker answers with its fallback model
     // (Workers AI) or apologises itself, so the customer always hears back.
     console.error(`job ${job.id} failed; handing back to the Worker`, error);
+    failuresSinceStart += 1;
+    await reportIncident(
+      "llm_unreachable",
+      "error",
+      "社内LLMに届かず、注文をWorkerに戻しました",
+      error instanceof Error ? `${error.message}${(error as { cause?: { code?: string } }).cause?.code ? ` (${(error as { cause?: { code?: string } }).cause?.code})` : ""}` : String(error),
+    );
     await postSigned("/internal/jobs/complete", {
       id: job.id,
       ok: false,
@@ -237,11 +538,13 @@ async function processJob(job: AiJob): Promise<void> {
     });
     return;
   }
+  inFlight -= 1;
 
   try {
     await sendInteractionFollowUp(job, truncate(text, 1_900));
   } catch (error) {
     console.error(`job ${job.id} follow-up failed`, error);
+    await reportIncident("followup_failed", "warning", "Discord への返信送信に失敗", String(error));
     await postSigned("/internal/jobs/complete", {
       id: job.id,
       ok: false,
@@ -251,6 +554,12 @@ async function processJob(job: AiJob): Promise<void> {
     return;
   }
 
+  await logReply({
+    event: job.mode,
+    latencyMs: Date.now() - startedAt,
+    ok: true,
+    replyText: text,
+  });
   await postSigned("/internal/jobs/complete", { id: job.id, ok: true });
 }
 

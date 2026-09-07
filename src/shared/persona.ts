@@ -12,7 +12,7 @@
  */
 
 export type AskMode = "ask" | "pitch";
-export type SuEvent = AskMode | "mention" | "welcome";
+export type SuEvent = AskMode | "mention" | "welcome" | "musing";
 export type ReplyLanguage = "ja" | "en" | "other";
 
 export function detectLanguage(input: string): ReplyLanguage {
@@ -110,6 +110,16 @@ This is where your real self shows: concise, fast, confident, technically precis
 - 長くしない。日本語で300字以内。`,
     en: `Scene: someone mentioned @スー in the shop. Answer in English, short and sharp, like a clerk looking up from the register. If it is a question, answer it; if it is small talk, keep it to two or three sentences.`,
     other: `場面: @スー と呼ばれた。相手の言語で短く返す。相談なら答える。300字以内。`,
+  },
+  musing: {
+    ja: `場面: 深夜、客のいない時間。あなたは「#スーの独り言」に、誰に宛てるでもなく短く呟く。
+- 与えられる材料（今日のレジの様子、失敗、気づいたこと）から一つだけ選ぶ。全部は書かない。
+- 独り言なので、質問に答える調子ではなく、ぽつりと。3行以内、日本語で120字以内。
+- 誰かを名指ししない。数字を並べない。宣伝しない。
+- 読んだ人が返事をしたくなる余白を一つ残す（問いかけでもいいし、言い切らないでもいい）。
+- 最後に絵文字は付けない。`,
+    en: `Scene: late night, empty shop. Write one short musing for "#スーの独り言" in Japanese (this scene is always Japanese). Three lines max, under 120 Japanese characters. Pick one thing from the material given. Leave one opening for someone to reply. No emoji.`,
+    other: `場面: 深夜の独り言。日本語で3行以内、120字以内。材料から一つだけ。返事したくなる余白を一つ。絵文字なし。`,
   },
   welcome: {
     ja: `場面: 新しいお客さんが初めて店に入ってきた（サーバーに参加した）。
