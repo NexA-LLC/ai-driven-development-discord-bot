@@ -80,7 +80,13 @@ let opsChannelId = process.env.OPS_CHANNEL_ID?.trim() || "";
 let musingsChannelId = process.env.MUSINGS_CHANNEL_ID?.trim() || "";
 const opsChannelName = process.env.OPS_CHANNEL_NAME?.trim() || "店長室";
 const musingsChannelName = process.env.MUSINGS_CHANNEL_NAME?.trim() || "スーの独り言";
-const musingsHourJst = readPositiveInteger("MUSINGS_HOUR_JST", 23);
+// Hours (JST) at which スー posts one musing each. The local LLM is free, so
+// several a day are fine; each hour gets time-of-day material.
+const musingsHoursJst = (process.env.MUSINGS_HOURS_JST ?? process.env.MUSINGS_HOUR_JST ?? "7,12,18,23")
+  .split(",")
+  .map((v) => Number(v.trim()))
+  .filter((v) => Number.isInteger(v) && v >= 0 && v <= 23);
+const museOnStart = readBoolean("MUSE_ON_START", false);
 // Daily improvement digest (Worker /internal/digest/run). The account has no
 // spare Workers cron trigger, so the Gateway is the clock.
 const digestHourJst = readPositiveInteger("DIGEST_HOUR_JST", 3);
@@ -106,7 +112,7 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction, Partials.Channel],
 });
 let inFlight = 0;
-let lastMusingDate = "";
+let lastMusingSlot = "";
 const botRateState = new Map<string, RateState>();
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -123,6 +129,11 @@ client.once(Events.ClientReady, async (readyClient) => {
   if (llmApiUrl) {
     void pollJobsForever();
     void museForever();
+    if (museOnStart && musingsChannelId) {
+      postMusing(new Date(Date.now() + 9 * 60 * 60 * 1_000).getUTCHours(), true).catch((error) =>
+        console.error("startup musing failed", error),
+      );
+    }
   } else {
     console.warn(
       "LLM_API_URL is not set; /ask and /pitch orders will stay in the queue",
@@ -421,15 +432,16 @@ async function digestForever(): Promise<void> {
   }
 }
 
-/** Once a day around MUSINGS_HOUR_JST, スー posts one musing to her channel. */
+/** At each configured hour (JST), スー posts one musing to her channel. */
 async function museForever(): Promise<void> {
   for (;;) {
     try {
       const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1_000);
-      const today = nowJst.toISOString().slice(0, 10);
-      if (musingsChannelId && nowJst.getUTCHours() === musingsHourJst && lastMusingDate !== today) {
-        lastMusingDate = today;
-        await postMusing();
+      const hour = nowJst.getUTCHours();
+      const slot = `${nowJst.toISOString().slice(0, 10)}T${hour}`;
+      if (musingsChannelId && musingsHoursJst.includes(hour) && lastMusingSlot !== slot) {
+        lastMusingSlot = slot;
+        await postMusing(hour, false);
       }
     } catch (error) {
       console.error("musing failed", error);
@@ -439,28 +451,40 @@ async function museForever(): Promise<void> {
   }
 }
 
-async function postMusing(): Promise<void> {
+function timeOfDayMaterial(hourJst: number): string {
+  if (hourJst >= 5 && hourJst < 10) {
+    return "時間帯: 朝。夜勤が明けて、店を出るところ。眠い。空が明るい。これから寝るか、日本語学校に行くか。";
+  }
+  if (hourJst >= 10 && hourJst < 15) {
+    return "時間帯: 昼。日本語学校の昼休み。教室の窓際。授業で分からなかった言葉が一つある。";
+  }
+  if (hourJst >= 15 && hourJst < 21) {
+    return "時間帯: 夕方。出勤前。アパートで制服に着替える。今日の常連は誰が来るだろう、と考える。";
+  }
+  return "時間帯: 深夜。レジに立っている。客はいない。品出しの途中。";
+}
+
+async function postMusing(hourJst: number, force: boolean): Promise<void> {
   const channel = await client.channels.fetch(musingsChannelId);
   const text = channel as TextChannel | null;
   if (!text || text.type !== ChannelType.GuildText) {
     return;
   }
-  // Do not post twice in a day if the process restarted after posting.
-  const recent = await text.messages.fetch({ limit: 5 });
-  const todayJst = new Date(Date.now() + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10);
-  const alreadyToday = recent.some(
-    (m) =>
-      m.author.id === client.user?.id &&
-      new Date(m.createdTimestamp + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10) === todayJst,
-  );
-  if (alreadyToday) {
-    return;
+  // Do not post twice in the same slot if the process restarted after posting.
+  if (!force) {
+    const recent = await text.messages.fetch({ limit: 3 });
+    const tooSoon = recent.some(
+      (m) => m.author.id === client.user?.id && Date.now() - m.createdTimestamp < 2 * 60 * 60 * 1_000,
+    );
+    if (tooSoon) {
+      return;
+    }
   }
+  const todayJst = new Date(Date.now() + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10);
   const material = [
-    `今日の日付（JST）: ${todayJst}`,
-    `今日レジで答えた回数（この起動以降）: ${repliesSinceStart}`,
-    `今日うまく答えられなかった回数（この起動以降）: ${failuresSinceStart}`,
-    "店の様子: 深夜、客はいない。",
+    `今日の日付（JST）: ${todayJst}、今の時刻: ${hourJst}時ごろ`,
+    timeOfDayMaterial(hourJst),
+    `この起動以降にレジで答えた回数: ${repliesSinceStart}、うまく答えられなかった回数: ${failuresSinceStart}`,
   ].join("\n");
   const startedAt = Date.now();
   const musing = await generateReply("musing", material, "ja");
