@@ -73,6 +73,48 @@ export const discordCommands: DiscordCommandDefinition[] = [
     ],
   },
   {
+    name: "feedback",
+    description: "スーへの感想・違和感・要望。改善の材料にします（本文は保存されます）",
+    integration_types: [GUILD_INSTALL, USER_INSTALL],
+    contexts: sharedContexts,
+    options: [
+      {
+        type: STRING,
+        name: "message",
+        description: "返答がおかしかった、こうしてほしい、など",
+        required: true,
+      },
+    ],
+  },
+  {
+    name: "inquiry",
+    description: "店長（運営）へのお問い合わせ。CaseFlow に起票して受付番号を返します",
+    integration_types: [GUILD_INSTALL, USER_INSTALL],
+    contexts: sharedContexts,
+    options: [
+      {
+        type: STRING,
+        name: "message",
+        description: "問い合わせ内容（10文字以上）",
+        required: true,
+      },
+    ],
+  },
+  {
+    name: "inquiry-status",
+    description: "受付番号（CF-…）で、お問い合わせの状況を確認します",
+    integration_types: [GUILD_INSTALL, USER_INSTALL],
+    contexts: sharedContexts,
+    options: [
+      {
+        type: STRING,
+        name: "case_number",
+        description: "受付番号。例: CF-20260906-78X0",
+        required: true,
+      },
+    ],
+  },
+  {
     name: "about",
     description: "この店員（Bot）の説明とデータ方針",
     integration_types: [GUILD_INSTALL, USER_INSTALL],

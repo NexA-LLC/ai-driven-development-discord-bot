@@ -36,6 +36,12 @@ interface Env {
   /** Fine-grained GitHub token (issues:write on this repo) for incident issues. */
   GITHUB_TOKEN?: string;
   GITHUB_REPO?: string;
+  CASEFLOW_MCP_URL?: string;
+  CASEFLOW_MCP_TOKEN?: string;
+  CASEFLOW_PROJECT_ID?: string;
+  DECISIONGARDEN_MCP_URL?: string;
+  DECISIONGARDEN_MCP_TOKEN?: string;
+  DECISIONGARDEN_GARDEN_ID?: string;
 }
 
 interface AiJobRow {
@@ -189,7 +195,34 @@ export default {
       return handleInternalJobsComplete(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/internal/digest/run") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+        return json({ error: "invalid_internal_signature" }, 401);
+      }
+      let hours = 24;
+      try {
+        const parsed = JSON.parse(rawBody || "{}") as { hours?: unknown };
+        if (typeof parsed.hours === "number" && parsed.hours > 0 && parsed.hours <= 24 * 30) {
+          hours = parsed.hours;
+        }
+      } catch {
+        // default window
+      }
+      await runImprovementDigest(env, hours);
+      return json({ ok: true, hours });
+    }
+
     return json({ error: "not_found" }, 404);
+  },
+
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    context: ExecutionContext,
+  ): Promise<void> {
+    // Daily at 18:00 UTC = 03:00 JST: turn yesterday's feedback into proposals.
+    context.waitUntil(runImprovementDigest(env, 24));
   },
 };
 
@@ -255,6 +288,15 @@ async function handleDiscordInteraction(
 
     case "agent-submit":
       return handleAgentSubmitCommand(interaction, env);
+
+    case "feedback":
+      return handleFeedbackCommand(interaction, env);
+
+    case "inquiry":
+      return handleInquiryCommand(interaction, env, context);
+
+    case "inquiry-status":
+      return handleInquiryStatusCommand(interaction, env, context);
 
     case "about":
       return interactionMessage(ABOUT_TEXT, true);
@@ -359,9 +401,9 @@ async function handleInternalAsk(
     return json({ error: "invalid_internal_signature" }, 401);
   }
 
-  let body: { prompt?: unknown };
+  let body: { prompt?: unknown; provider?: unknown };
   try {
-    body = JSON.parse(rawBody) as { prompt?: unknown };
+    body = JSON.parse(rawBody) as { prompt?: unknown; provider?: unknown };
   } catch {
     return json({ error: "invalid_json" }, 400);
   }
@@ -374,7 +416,9 @@ async function handleInternalAsk(
     return json({ error: "invalid_prompt" }, 400);
   }
 
-  const text = await callAi(env, "ask", body.prompt);
+  const provider =
+    body.provider === "workers-ai" && env.AI ? "workers-ai" : undefined;
+  const text = await callAi(env, "ask", body.prompt, provider);
   return json({ text: truncate(text, 1_900) });
 }
 
@@ -1179,6 +1223,401 @@ async function handleInternalFeedback(request: Request, env: Env): Promise<Respo
     )
     .run();
   return json({ ok: true, id });
+}
+
+
+// ---------------------------------------------------------------------------
+// MCP clients (CaseFlow, DecisionGarden) — JSON-RPC over HTTPS with a bearer.
+// ---------------------------------------------------------------------------
+
+async function mcpCall(
+  url: string,
+  token: string,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "user-agent": "su-discord-bot",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args },
+    }),
+  });
+  let text = await response.text();
+  if (text.includes("data:")) {
+    text = text.split("\n").filter((l) => l.startsWith("data:")).pop()?.slice(5) ?? "";
+  }
+  if (!response.ok) {
+    throw new Error(`MCP ${name} -> ${response.status}: ${text.slice(0, 200)}`);
+  }
+  const envelope = JSON.parse(text) as {
+    result?: { content?: Array<{ text?: string }>; isError?: boolean };
+    error?: { message?: string };
+  };
+  if (envelope.error) {
+    throw new Error(`MCP ${name}: ${envelope.error.message ?? "error"}`);
+  }
+  const payload = envelope.result?.content?.[0]?.text ?? "";
+  try {
+    return JSON.parse(payload) as unknown;
+  } catch {
+    return payload;
+  }
+}
+
+function caseflow(env: Env): { url: string; token: string } | null {
+  if (!env.CASEFLOW_MCP_TOKEN) {
+    return null;
+  }
+  return {
+    url: env.CASEFLOW_MCP_URL || "https://caseflow.nex-a.net/api/mcp?tenantId=nexa",
+    token: env.CASEFLOW_MCP_TOKEN,
+  };
+}
+
+function decisiongarden(env: Env): { url: string; token: string; gardenId: string } | null {
+  if (!env.DECISIONGARDEN_MCP_TOKEN || !env.DECISIONGARDEN_GARDEN_ID) {
+    return null;
+  }
+  return {
+    url: env.DECISIONGARDEN_MCP_URL || "https://decisiongarden.nex-a.net/api/mcp",
+    token: env.DECISIONGARDEN_MCP_TOKEN,
+    gardenId: env.DECISIONGARDEN_GARDEN_ID,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /feedback, /inquiry, /inquiry-status
+// ---------------------------------------------------------------------------
+
+async function handleFeedbackCommand(
+  interaction: DiscordInteraction,
+  env: Env,
+): Promise<Response> {
+  const message = getStringOption(interaction, "message");
+  const userId = interaction.member?.user?.id ?? interaction.user?.id ?? null;
+  if (!message || message.trim().length === 0) {
+    return interactionMessage("`message` が必要です。", true);
+  }
+  await env.DB.prepare(
+    `INSERT INTO feedback_logs (id, kind, guild_id, channel_id, message_id, in_reply_to_message_id, user_id, content)
+     VALUES (?, 'command', ?, NULL, ?, NULL, ?, ?)`,
+  )
+    .bind(crypto.randomUUID(), interaction.guild_id ?? null, interaction.id, userId, truncate(message, 2_000))
+    .run();
+  return interactionMessage(
+    "ありがとうございます。レジの下のノートに書きました。……次の夜勤までに、少し直せるように考えます。",
+    true,
+  );
+}
+
+async function handleInquiryCommand(
+  interaction: DiscordInteraction,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const message = getStringOption(interaction, "message");
+  if (!message || message.trim().length < 10) {
+    return interactionMessage("お問い合わせは10文字以上でお願いします。", true);
+  }
+  const cf = caseflow(env);
+  if (!cf) {
+    return interactionMessage(
+      "すみません、今は店長への取り次ぎ（CaseFlow）がつながっていません。店長室に直接お願いします。",
+      true,
+    );
+  }
+  context.waitUntil(fileInquiry(interaction, env, cf, message));
+  return deferInteraction(true);
+}
+
+async function fileInquiry(
+  interaction: DiscordInteraction,
+  env: Env,
+  cf: { url: string; token: string },
+  message: string,
+): Promise<void> {
+  const userId = interaction.member?.user?.id ?? interaction.user?.id ?? "unknown";
+  let text: string;
+  try {
+    const result = (await mcpCall(cf.url, cf.token, "create_case", {
+      projectId: env.CASEFLOW_PROJECT_ID || undefined,
+      source: "discord:su",
+      title: truncate(message.replace(/\s+/g, " "), 60),
+      detail: message,
+      reporterName: `discord:${userId}`,
+      reporterUserId: `discord:${userId}`,
+      locale: "ja",
+      metadata: {
+        channel: "su-discord",
+        guildId: interaction.guild_id ?? null,
+        interactionId: interaction.id,
+      },
+    })) as { caseNumber?: string; caseId?: string; case?: { caseNumber?: string; caseId?: string } };
+    const caseNumber = result.caseNumber ?? result.case?.caseNumber;
+    const caseId = result.caseId ?? result.case?.caseId;
+    if (!caseNumber) {
+      throw new Error("create_case returned no caseNumber");
+    }
+    text = [
+      `店長に渡しました。受付番号は **${caseNumber}** です。`,
+      `状況は \`/inquiry-status ${caseNumber}\` で確認できます。`,
+      "返事があったら、この店（サーバー）でお知らせします。",
+    ].join("\n");
+    if (env.OPS_CHANNEL_ID) {
+      await notifyOps(
+        env,
+        [
+          `📮 **お問い合わせを受け付けました** — ${caseNumber}`,
+          `from <@${userId}>`,
+          `CaseFlow: https://caseflow.nex-a.net/ja/cases/${caseId ?? ""}`,
+          `> ${truncate(message.replace(/\s+/g, " "), 200)}`,
+        ].join("\n"),
+      );
+    }
+  } catch (error) {
+    console.error("inquiry failed", error);
+    await recordIncident(env, {
+      kind: "inquiry_failed",
+      severity: "error",
+      source: "worker",
+      summary: "お問い合わせの CaseFlow 起票に失敗",
+      detail: String(error),
+    });
+    text = "すみません、店長への取り次ぎに失敗しました。内容は外に出していません。少し時間を置いて、もう一度お願いします。";
+  }
+  await sendFollowUp(interaction, truncate(text, 1_900), true);
+}
+
+async function handleInquiryStatusCommand(
+  interaction: DiscordInteraction,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const caseNumber = getStringOption(interaction, "case_number")?.trim().toUpperCase();
+  if (!caseNumber || !/^CF-\d{8}-[A-Z0-9]{4,8}$/.test(caseNumber)) {
+    return interactionMessage("受付番号は `CF-20260906-78X0` の形でお願いします。", true);
+  }
+  const cf = caseflow(env);
+  if (!cf) {
+    return interactionMessage("すみません、今は CaseFlow がつながっていません。", true);
+  }
+  const requesterId = interaction.member?.user?.id ?? interaction.user?.id ?? "unknown";
+  context.waitUntil(
+    (async () => {
+      let text: string;
+      try {
+        const result = (await mcpCall(cf.url, cf.token, "get_case", { caseNumber })) as {
+          case?: { status?: string; updatedAt?: string; reporterUserId?: string; title?: string; comments?: unknown[] };
+          status?: string;
+          updatedAt?: string;
+          reporterUserId?: string;
+          title?: string;
+          comments?: unknown[];
+        };
+        const c = result.case ?? result;
+        // Only the reporter (or operators via 店長室) may read status details.
+        if (c.reporterUserId && c.reporterUserId !== `discord:${requesterId}`) {
+          text = `受付番号 ${caseNumber} は、別のお客さんの分です。ご本人だけ確認できます。`;
+        } else {
+          const comments = Array.isArray(c.comments) ? c.comments.length : 0;
+          text = [
+            `**${caseNumber}** — 状況: ${c.status ?? "不明"}`,
+            c.updatedAt ? `最終更新: ${c.updatedAt}` : null,
+            `店長からの返信: ${comments} 件`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+      } catch (error) {
+        console.error("inquiry status failed", error);
+        text = "すみません、今は状況を確認できませんでした。少し時間を置いて、もう一度お願いします。";
+      }
+      await sendFollowUp(interaction, truncate(text, 1_900), true);
+    })(),
+  );
+  return deferInteraction(true);
+}
+
+// ---------------------------------------------------------------------------
+// Improvement loop: daily digest of feedback -> DecisionGarden seed + issue
+// ---------------------------------------------------------------------------
+
+interface DigestFinding {
+  theme: string;
+  evidence: string[];
+  severity: "low" | "medium" | "high";
+  proposal: string;
+}
+
+async function runImprovementDigest(env: Env, hours = 24): Promise<void> {
+  const since = new Date(Date.now() - hours * 60 * 60 * 1_000).toISOString().replace("T", " ").slice(0, 19);
+  const feedback = await env.DB.prepare(
+    `SELECT kind, content, created_at FROM feedback_logs WHERE created_at >= ? ORDER BY created_at ASC LIMIT 200`,
+  )
+    .bind(since)
+    .all<{ kind: string; content: string | null; created_at: string }>();
+  const replies = await env.DB.prepare(
+    `SELECT event, ok, latency_ms, provider FROM reply_logs WHERE created_at >= ?`,
+  )
+    .bind(since)
+    .all<{ event: string; ok: number; latency_ms: number | null; provider: string | null }>();
+  const incidents = await env.DB.prepare(
+    `SELECT kind, count, summary FROM su_incidents WHERE last_seen_at >= ? AND status = 'open'`,
+  )
+    .bind(since)
+    .all<{ kind: string; count: number; summary: string }>();
+
+  const textual = feedback.results.filter((f) => f.kind !== "reaction" && f.content && f.content.trim().length > 0);
+  const reactions = feedback.results.filter((f) => f.kind === "reaction");
+  const total = replies.results.length;
+  const failed = replies.results.filter((r) => r.ok === 0).length;
+  const avgLatency = total
+    ? Math.round(replies.results.reduce((a, r) => a + (r.latency_ms ?? 0), 0) / total)
+    : 0;
+
+  if (textual.length === 0 && incidents.results.length === 0) {
+    console.log("digest: nothing to analyse");
+    return;
+  }
+
+  let findings: DigestFinding[] = [];
+  if (env.AI && textual.length > 0) {
+    const prompt = [
+      "あなたはDiscord Bot「スー」の改善担当です。以下は直近のユーザーからの返信・感想（スー宛のもの）です。",
+      "この中から「返答がおかしい」「違和感がある」「こうしてほしい」という不満・要望・繰り返される指摘を抽出し、JSON配列で返してください。",
+      '各要素: {"theme": 一言, "evidence": [根拠となる発言の短い引用（最大3件）], "severity": "low"|"medium"|"high", "proposal": 具体的な改善案（プロンプト/実装のどこを直すか）}',
+      "不満や要望が無ければ [] を返してください。JSON以外は出力しないこと。",
+      "",
+      ...textual.map((f) => `- [${f.kind} ${f.created_at}] ${f.content?.replace(/\s+/g, " ").slice(0, 300)}`),
+    ].join("\n");
+    try {
+      const result = (await env.AI.run(
+        (env.AI_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast") as Parameters<Ai["run"]>[0],
+        {
+          messages: [
+            { role: "system", content: "You extract user complaints and turn them into concrete improvement proposals. Output JSON only." },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: 1_200,
+          temperature: 0.2,
+        } as never,
+      )) as { response?: string; choices?: Array<{ message?: { content?: string } }> };
+      const raw = (result.response ?? result.choices?.[0]?.message?.content ?? "").trim();
+      const jsonText = raw.slice(raw.indexOf("["), raw.lastIndexOf("]") + 1);
+      const parsed = JSON.parse(jsonText) as unknown;
+      if (Array.isArray(parsed)) {
+        findings = parsed
+          .filter((f): f is DigestFinding => typeof f === "object" && f !== null && typeof (f as DigestFinding).theme === "string")
+          .slice(0, 8);
+      }
+    } catch (error) {
+      console.error("digest analysis failed", error);
+    }
+  }
+
+  const dateJst = new Date(Date.now() + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10);
+  const statsLine = `返答 ${total} 件（失敗 ${failed}、平均 ${avgLatency}ms）、感想・返信 ${textual.length} 件、リアクション ${reactions.length} 件、未解決 incident ${incidents.results.length} 種`;
+
+  // DecisionGarden: one memory node per day (idempotent via sourceKey), one seed per high finding.
+  const dg = decisiongarden(env);
+  if (dg) {
+    try {
+      await mcpCall(dg.url, dg.token, "save_memory_node", {
+        gardenId: dg.gardenId,
+        sourceKey: `su-digest:${dateJst}`,
+        kind: "knowledge",
+        title: `スー 日次ダイジェスト ${dateJst}`,
+        body: [
+          statsLine,
+          "",
+          ...(findings.length
+            ? findings.map((f) => `- [${f.severity}] ${f.theme}: ${f.proposal}`)
+            : ["不満・要望の抽出なし"]),
+          ...(incidents.results.length
+            ? ["", "incident:", ...incidents.results.map((i) => `- ${i.kind} x${i.count}: ${i.summary}`)]
+            : []),
+        ].join("\n"),
+      });
+      for (const f of findings.filter((x) => x.severity === "high")) {
+        await mcpCall(dg.url, dg.token, "save_decision_seed", {
+          gardenId: dg.gardenId,
+          projectKey: "ai-driven-development-discord-bot",
+          decisionQuestion: `スーの改善: ${f.theme}`,
+          customerProblem: f.evidence.join(" / "),
+          hypothesis: f.proposal,
+          evidence: f.evidence.slice(0, 3).map((e) => ({ checkedAt: dateJst, source: "discord feedback_logs", fact: e })),
+          nextStep: "persona.ts か実装を直す PR を出し、次の1週間の feedback で再評価する",
+          status: "open",
+        });
+      }
+    } catch (error) {
+      console.error("digest -> decisiongarden failed", error);
+    }
+  }
+
+  // GitHub: one improvement issue per high finding (Repo Deck picks it up).
+  if (env.GITHUB_TOKEN) {
+    for (const f of findings.filter((x) => x.severity === "high")) {
+      await openImprovementIssue(env, f, dateJst);
+    }
+  }
+
+  // Ops: short summary so humans see the loop turning.
+  if (env.OPS_CHANNEL_ID) {
+    await notifyOps(
+      env,
+      [
+        `📝 **今日のレジ裏ノート（${dateJst}）**`,
+        statsLine,
+        ...(findings.length ? findings.map((f) => `- [${f.severity}] ${f.theme} → ${f.proposal}`) : ["- 不満・要望の抽出なし"]),
+      ].join("\n"),
+    );
+  }
+}
+
+async function openImprovementIssue(env: Env, f: DigestFinding, dateJst: string): Promise<void> {
+  const repo = env.GITHUB_REPO || "NexA-LLC/ai-driven-development-discord-bot";
+  const response = await fetch(`https://api.github.com/repos/${repo}/issues`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.GITHUB_TOKEN ?? ""}`,
+      accept: "application/vnd.github+json",
+      "content-type": "application/json",
+      "user-agent": "su-discord-bot-improvement-loop",
+    },
+    body: JSON.stringify({
+      title: `[improve] ${f.theme}`.slice(0, 200),
+      labels: ["improvement", "su"],
+      body: [
+        `ユーザーの返信・感想から抽出した改善点です（${dateJst}、severity: ${f.severity}）。`,
+        "",
+        "## 根拠（ユーザーの発言）",
+        ...f.evidence.map((e) => `- ${e}`),
+        "",
+        "## 提案",
+        f.proposal,
+        "",
+        "## 期待する作業",
+        "1. `src/shared/persona.ts`（口調・場面）か実装のどこを直すか決める",
+        "2. PR を出す（main は PR 必須）",
+        "3. 次の1週間の feedback_logs で再評価する",
+        "",
+        "_opened automatically by the Worker improvement loop_",
+      ].join("\n"),
+    }),
+  });
+  if (!response.ok) {
+    console.error("improvement issue failed", response.status, (await response.text()).slice(0, 200));
+  }
 }
 
 /**
