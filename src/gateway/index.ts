@@ -464,8 +464,13 @@ function timeOfDayMaterial(hourJst: number): string {
   return "時間帯: 深夜。レジに立っている。客はいない。品出しの途中。";
 }
 
-async function postMusing(hourJst: number, force: boolean): Promise<void> {
-  const channel = await client.channels.fetch(musingsChannelId);
+async function postMusing(
+  hourJst: number,
+  force: boolean,
+  topic?: string,
+  channelId: string = musingsChannelId,
+): Promise<void> {
+  const channel = await client.channels.fetch(channelId);
   const text = channel as TextChannel | null;
   if (!text || text.type !== ChannelType.GuildText) {
     return;
@@ -485,6 +490,7 @@ async function postMusing(hourJst: number, force: boolean): Promise<void> {
     `今日の日付（JST）: ${todayJst}、今の時刻: ${hourJst}時ごろ`,
     timeOfDayMaterial(hourJst),
     `この起動以降にレジで答えた回数: ${repliesSinceStart}、うまく答えられなかった回数: ${failuresSinceStart}`,
+    ...(topic ? [`頼まれた話題（これを材料にする）: ${topic}`] : []),
   ].join("\n");
   const startedAt = Date.now();
   const musing = await generateReply("musing", material, "ja");
@@ -562,7 +568,54 @@ async function pollJobsForever(): Promise<void> {
     } catch (error) {
       console.error("job poll failed", error);
     }
+    try {
+      const { commands } = await postSigned<{
+        commands: Array<{ id: string; kind: string; payload: Record<string, unknown> }>;
+      }>("/internal/commands/claim", {});
+      for (const command of commands) {
+        await processCommand(command);
+      }
+    } catch (error) {
+      console.error("command poll failed", error);
+    }
     await sleep(jobPollMs);
+  }
+}
+
+/** Commands queued by the Worker (MCP: "muse now", "say this"). */
+async function processCommand(command: {
+  id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+}): Promise<void> {
+  try {
+    if (command.kind === "muse") {
+      const topic = typeof command.payload.topic === "string" ? command.payload.topic : undefined;
+      const hour = new Date(Date.now() + 9 * 60 * 60 * 1_000).getUTCHours();
+      const target = command.payload.channel === "ops" ? opsChannelId : musingsChannelId;
+      await postMusing(hour, true, topic, target);
+      await postSigned("/internal/commands/complete", { id: command.id, ok: true, result: "posted" });
+      return;
+    }
+    if (command.kind === "say") {
+      const target = command.payload.channel === "ops" ? opsChannelId : musingsChannelId;
+      const text = typeof command.payload.text === "string" ? command.payload.text : "";
+      const channel = (await client.channels.fetch(target)) as TextChannel | null;
+      if (!channel || !text) {
+        throw new Error("say: channel or text missing");
+      }
+      await channel.send({ content: truncate(text, 1_900), allowedMentions: { parse: [] } });
+      await postSigned("/internal/commands/complete", { id: command.id, ok: true, result: "posted" });
+      return;
+    }
+    throw new Error(`unknown command kind ${command.kind}`);
+  } catch (error) {
+    console.error(`command ${command.id} failed`, error);
+    await postSigned("/internal/commands/complete", {
+      id: command.id,
+      ok: false,
+      result: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 

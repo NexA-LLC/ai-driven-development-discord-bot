@@ -230,3 +230,21 @@ staging D1
 ## License
 
 MIT License. Copyright © 2026 NexA LLC and contributors. See [LICENSE](LICENSE).
+
+## MCP（外部からスーを動かす）
+
+Worker が `POST /api/mcp`（JSON-RPC、`Authorization: Bearer <SU_MCP_TOKEN>`）を提供します。Codex / Claude などから登録して使えます。
+
+| tool | 何をするか |
+|---|---|
+| `su_muse` | 今すぐ独り言を1本（`topic` で材料指定可）。Gateway が社内LLMで生成して投稿 |
+| `su_say` | 与えた文面をそのまま `musings` / `ops` チャンネルへ投稿（LLMなし） |
+| `su_status` | 直近の返答、待機中の注文、未解決 incident |
+| `su_incidents` / `su_resolve_incident` | incident 一覧・解決 |
+| `su_feedback_recent` | 直近のフィードバック |
+| `su_run_digest` | 改善ダイジェストを今すぐ実行 |
+
+```bash
+curl -s https://<worker>/api/mcp -H "authorization: Bearer $SU_MCP_TOKEN" -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"su_muse","arguments":{"topic":"今日は雨"}}}'
+```

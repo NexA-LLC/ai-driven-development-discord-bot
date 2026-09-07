@@ -42,6 +42,9 @@ interface Env {
   DECISIONGARDEN_MCP_URL?: string;
   DECISIONGARDEN_MCP_TOKEN?: string;
   DECISIONGARDEN_GARDEN_ID?: string;
+  /** Bearer token for the public MCP endpoint (/api/mcp). */
+  SU_MCP_TOKEN?: string;
+  MUSINGS_CHANNEL_ID?: string;
 }
 
 interface AiJobRow {
@@ -151,6 +154,18 @@ export default {
       url.pathname === "/internal/register-commands"
     ) {
       return handleInternalRegisterCommands(request, env);
+    }
+
+    if (url.pathname === "/api/mcp") {
+      return handleMcp(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/commands/claim") {
+      return handleInternalCommandsClaim(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/commands/complete") {
+      return handleInternalCommandsComplete(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/internal/incidents") {
@@ -1621,6 +1636,302 @@ async function openImprovementIssue(env: Env, f: DigestFinding, dateJst: string)
   if (!response.ok) {
     console.error("improvement issue failed", response.status, (await response.text()).slice(0, 200));
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// MCP endpoint: external agents can ask スー to muse, say, report, digest.
+// Streamable-HTTP style JSON-RPC over POST, bearer-authenticated.
+// ---------------------------------------------------------------------------
+
+const MCP_TOOLS = [
+  {
+    name: "su_muse",
+    description:
+      "スーに今すぐ独り言を1本呟かせる（#スーの独り言）。生成は社内LLMなのでGatewayが拾って投稿する。topic を渡すとその話題を材料にする。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "任意の話題・材料（例: 今日のイベント、誰かの発言の要旨）" },
+        channel: { type: "string", enum: ["musings", "ops"], description: "投稿先。既定は musings" },
+      },
+    },
+  },
+  {
+    name: "su_say",
+    description: "指定チャンネルに、スーとして与えられた文面をそのまま投稿する（LLMを通さない）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", enum: ["musings", "ops"], description: "投稿先" },
+        text: { type: "string", description: "投稿本文（1900字まで）" },
+      },
+      required: ["channel", "text"],
+    },
+  },
+  {
+    name: "su_status",
+    description: "スーの稼働状況（直近の返答、待機中の注文、未解決 incident）を返す。",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "su_incidents",
+    description: "incident 一覧（既定は未解決のみ）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["open", "resolved", "all"] },
+        limit: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "su_resolve_incident",
+    description: "incident を resolved にする。",
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+  },
+  {
+    name: "su_feedback_recent",
+    description: "直近のフィードバック（スーへの返信・リアクション・/feedback）を返す。",
+    inputSchema: { type: "object", properties: { hours: { type: "number" }, limit: { type: "number" } } },
+  },
+  {
+    name: "su_run_digest",
+    description: "改善ダイジェストを今すぐ実行する（feedback を要約して秘密日記・Issue・店長室へ）。",
+    inputSchema: { type: "object", properties: { hours: { type: "number" } } },
+  },
+] as const;
+
+function mcpResult(id: unknown, result: unknown): Response {
+  return json({ jsonrpc: "2.0", id, result });
+}
+function mcpError(id: unknown, code: number, message: string, status = 200): Response {
+  return json({ jsonrpc: "2.0", id, error: { code, message } }, status);
+}
+function mcpText(id: unknown, payload: unknown): Response {
+  return mcpResult(id, {
+    content: [{ type: "text", text: typeof payload === "string" ? payload : JSON.stringify(payload, null, 2) }],
+  });
+}
+
+async function handleMcp(request: Request, env: Env): Promise<Response> {
+  if (request.method === "GET") {
+    return json({ name: "su-discord-bot", transport: "http-json-rpc", tools: MCP_TOOLS.map((t) => t.name) });
+  }
+  if (request.method !== "POST") {
+    return json({ error: "method_not_allowed" }, 405);
+  }
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!env.SU_MCP_TOKEN || !token || !constantTimeEqual(token, env.SU_MCP_TOKEN)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  let rpc: { id?: unknown; method?: unknown; params?: unknown };
+  try {
+    rpc = (await request.json()) as typeof rpc;
+  } catch {
+    return mcpError(null, -32700, "parse error", 400);
+  }
+  const id = rpc.id ?? null;
+
+  switch (rpc.method) {
+    case "initialize":
+      return mcpResult(id, {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "su-discord-bot", version: "0.2.0" },
+      });
+    case "notifications/initialized":
+      return new Response(null, { status: 204 });
+    case "ping":
+      return mcpResult(id, {});
+    case "tools/list":
+      return mcpResult(id, { tools: MCP_TOOLS });
+    case "tools/call": {
+      const params = (rpc.params ?? {}) as { name?: unknown; arguments?: unknown };
+      const name = typeof params.name === "string" ? params.name : "";
+      const args = (params.arguments ?? {}) as Record<string, unknown>;
+      try {
+        return mcpText(id, await callSuTool(env, name, args));
+      } catch (error) {
+        return mcpResult(id, {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        });
+      }
+    }
+    default:
+      return mcpError(id, -32601, "method not found");
+  }
+}
+
+async function callSuTool(env: Env, name: string, args: Record<string, unknown>): Promise<unknown> {
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const num = (v: unknown, fallback: number, max: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.min(v, max) : fallback;
+
+  switch (name) {
+    case "su_muse": {
+      const id = await queueGatewayCommand(env, "muse", {
+        topic: str(args.topic) ?? null,
+        channel: str(args.channel) === "ops" ? "ops" : "musings",
+      });
+      return { queued: true, commandId: id, note: "Gateway が数秒〜1分で拾って投稿します" };
+    }
+    case "su_say": {
+      const channelKey = str(args.channel) === "ops" ? "ops" : "musings";
+      const text = str(args.text);
+      if (!text) {
+        throw new Error("text is required");
+      }
+      const channelId = channelKey === "ops" ? env.OPS_CHANNEL_ID : env.MUSINGS_CHANNEL_ID;
+      if (!channelId) {
+        throw new Error(`${channelKey} channel id is not configured on the Worker`);
+      }
+      const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+        method: "POST",
+        headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: truncate(text, 1_900), allowed_mentions: { parse: [] } }),
+      });
+      if (!response.ok) {
+        throw new Error(`discord ${response.status}: ${(await response.text()).slice(0, 200)}`);
+      }
+      const message = (await response.json()) as { id?: string };
+      await env.DB.prepare(
+        `INSERT INTO reply_logs (id, event, channel_id, message_id, provider, ok, reply_text)
+         VALUES (?, 'say', ?, ?, 'mcp', 1, ?)`,
+      )
+        .bind(crypto.randomUUID(), channelId, message.id ?? null, truncate(text, 4_000))
+        .run();
+      return { posted: true, messageId: message.id ?? null };
+    }
+    case "su_status": {
+      const lastReply = await env.DB.prepare(
+        `SELECT event, created_at, latency_ms, ok FROM reply_logs ORDER BY created_at DESC LIMIT 1`,
+      ).first();
+      const pending = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM ai_jobs WHERE status IN ('pending','claimed')`,
+      ).first<{ n: number }>();
+      const openIncidents = await env.DB.prepare(
+        `SELECT kind, count, last_seen_at FROM su_incidents WHERE status = 'open' ORDER BY last_seen_at DESC LIMIT 10`,
+      ).all();
+      const replies24h = await env.DB.prepare(
+        `SELECT COUNT(*) AS n, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed FROM reply_logs
+          WHERE created_at >= datetime('now', '-1 day')`,
+      ).first<{ n: number; failed: number }>();
+      return {
+        lastReply,
+        pendingOrders: pending?.n ?? 0,
+        replies24h: replies24h?.n ?? 0,
+        failed24h: replies24h?.failed ?? 0,
+        openIncidents: openIncidents.results,
+        note: "Gateway の readiness は 202 の 127.0.0.1:8791/readiness（ローカルのみ）",
+      };
+    }
+    case "su_incidents": {
+      const status = str(args.status) ?? "open";
+      const limit = num(args.limit, 20, 100);
+      const rows =
+        status === "all"
+          ? await env.DB.prepare(`SELECT * FROM su_incidents ORDER BY last_seen_at DESC LIMIT ?`).bind(limit).all()
+          : await env.DB.prepare(`SELECT * FROM su_incidents WHERE status = ? ORDER BY last_seen_at DESC LIMIT ?`)
+              .bind(status, limit)
+              .all();
+      return rows.results;
+    }
+    case "su_resolve_incident": {
+      const id = str(args.id);
+      if (!id) {
+        throw new Error("id is required");
+      }
+      const result = await env.DB.prepare(
+        `UPDATE su_incidents SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`,
+      )
+        .bind(new Date().toISOString(), id)
+        .run();
+      return { resolved: (result.meta.changes ?? 0) > 0 };
+    }
+    case "su_feedback_recent": {
+      const hours = num(args.hours, 24, 24 * 30);
+      const limit = num(args.limit, 50, 200);
+      const rows = await env.DB.prepare(
+        `SELECT kind, user_id, content, in_reply_to_message_id, created_at FROM feedback_logs
+          WHERE created_at >= datetime('now', ?) ORDER BY created_at DESC LIMIT ?`,
+      )
+        .bind(`-${hours} hours`, limit)
+        .all();
+      return rows.results;
+    }
+    case "su_run_digest": {
+      const hours = num(args.hours, 24, 24 * 30);
+      await runImprovementDigest(env, hours);
+      return { ran: true, hours };
+    }
+    default:
+      throw new Error(`unknown tool: ${name}`);
+  }
+}
+
+async function queueGatewayCommand(env: Env, kind: "muse" | "say", payload: Record<string, unknown>): Promise<string> {
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO gateway_commands (id, kind, payload_json, requested_by, status, expires_at)
+     VALUES (?, ?, ?, 'mcp', 'pending', ?)`,
+  )
+    .bind(id, kind, JSON.stringify(payload), new Date(Date.now() + 60 * 60 * 1_000).toISOString())
+    .run();
+  return id;
+}
+
+async function handleInternalCommandsClaim(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `UPDATE gateway_commands SET status = 'expired', completed_at = ? WHERE status = 'pending' AND expires_at < ?`,
+  )
+    .bind(now, now)
+    .run();
+  const pending = await env.DB.prepare(
+    `SELECT id, kind, payload_json FROM gateway_commands WHERE status = 'pending' ORDER BY created_at ASC LIMIT 5`,
+  ).all<{ id: string; kind: string; payload_json: string }>();
+  const claimed: Array<{ id: string; kind: string; payload: unknown }> = [];
+  for (const row of pending.results) {
+    const result = await env.DB.prepare(
+      `UPDATE gateway_commands SET status = 'claimed', claimed_at = ? WHERE id = ? AND status = 'pending'`,
+    )
+      .bind(now, row.id)
+      .run();
+    if ((result.meta.changes ?? 0) > 0) {
+      claimed.push({ id: row.id, kind: row.kind, payload: JSON.parse(row.payload_json) as unknown });
+    }
+  }
+  return json({ commands: claimed });
+}
+
+async function handleInternalCommandsComplete(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: { id?: unknown; ok?: unknown; result?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (typeof body.id !== "string") {
+    return json({ error: "id_is_required" }, 400);
+  }
+  await env.DB.prepare(
+    `UPDATE gateway_commands SET status = ?, completed_at = ?, result = ? WHERE id = ? AND status = 'claimed'`,
+  )
+    .bind(body.ok === false ? "failed" : "done", new Date().toISOString(), truncate(String(body.result ?? ""), 500), body.id)
+    .run();
+  return json({ ok: true });
 }
 
 /**

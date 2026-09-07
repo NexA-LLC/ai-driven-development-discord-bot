@@ -15,6 +15,7 @@
     "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "PITCHEEE_URL": "",
     "OPS_CHANNEL_ID": "1546347217705639987",
+    "MUSINGS_CHANNEL_ID": "1546347219244818482",
     "GITHUB_REPO": "NexA-LLC/ai-driven-development-discord-bot",
     "CASEFLOW_MCP_URL": "https://caseflow.nex-a.net/api/mcp?tenantId=nexa",
     "CASEFLOW_PROJECT_ID": "01a07746-6221-7b69-a50b-f1e53ae72a9a",
