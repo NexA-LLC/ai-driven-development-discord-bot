@@ -15,10 +15,17 @@
     "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "PITCHEEE_URL": "",
     "OPS_CHANNEL_ID": "1546347217705639987",
-    "GITHUB_REPO": "NexA-LLC/ai-driven-development-discord-bot"
+    "GITHUB_REPO": "NexA-LLC/ai-driven-development-discord-bot",
+    "CASEFLOW_MCP_URL": "https://caseflow.nex-a.net/api/mcp?tenantId=nexa",
+    "CASEFLOW_PROJECT_ID": "01a07746-6221-7b69-a50b-f1e53ae72a9a",
+    "DECISIONGARDEN_MCP_URL": "https://decisiongarden.nex-a.net/api/mcp",
+    "DECISIONGARDEN_GARDEN_ID": "01a07678-baa8-7d55-8463-f11944a2b0f8"
   },
   "ai": {
     "binding": "AI"
+  },
+  "triggers": {
+    "crons": ["0 18 * * *"]
   },
   "d1_databases": [
     {

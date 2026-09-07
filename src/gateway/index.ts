@@ -293,11 +293,21 @@ async function onMessage(message: Message): Promise<void> {
   try {
     text = await generateReply("mention", prompt);
   } catch (error) {
-    ok = false;
-    console.error("mention reply failed", error);
-    await reportIncident("mention_unanswered", "error", "メンションに答えられませんでした", String(error));
-    text =
-      "すみません、今、答えが作れませんでした。少し時間を置いて、もう一度お願いします。";
+    console.error("mention reply failed; falling back to the Worker", error);
+    await reportIncident("mention_llm_unreachable", "warning", "メンション: 社内LLMに届かず、Workers AI で代替", String(error));
+    try {
+      const fallback = await postSigned<{ text: string }>("/internal/ask", {
+        prompt,
+        provider: "workers-ai",
+      });
+      text = fallback.text;
+    } catch (fallbackError) {
+      ok = false;
+      console.error("mention fallback failed", fallbackError);
+      await reportIncident("mention_unanswered", "error", "メンションに答えられませんでした", String(fallbackError));
+      text =
+        "すみません、今、答えが作れませんでした。少し時間を置いて、もう一度お願いします。";
+    }
   } finally {
     inFlight -= 1;
   }
