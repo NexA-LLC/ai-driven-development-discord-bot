@@ -81,6 +81,10 @@ let musingsChannelId = process.env.MUSINGS_CHANNEL_ID?.trim() || "";
 const opsChannelName = process.env.OPS_CHANNEL_NAME?.trim() || "店長室";
 const musingsChannelName = process.env.MUSINGS_CHANNEL_NAME?.trim() || "スーの独り言";
 const musingsHourJst = readPositiveInteger("MUSINGS_HOUR_JST", 23);
+// Daily improvement digest (Worker /internal/digest/run). The account has no
+// spare Workers cron trigger, so the Gateway is the clock.
+const digestHourJst = readPositiveInteger("DIGEST_HOUR_JST", 3);
+let lastDigestDate = "";
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
 
@@ -115,6 +119,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.error("channel resolution failed", error);
   }
   startReadinessServer();
+  void digestForever();
   if (llmApiUrl) {
     void pollJobsForever();
     void museForever();
@@ -395,6 +400,25 @@ function startReadinessServer(): void {
   server.listen(readinessPort, "127.0.0.1", () =>
     console.log(`readiness at http://127.0.0.1:${readinessPort}/readiness`),
   );
+}
+
+/** Once a day around DIGEST_HOUR_JST, ask the Worker to run the improvement digest. */
+async function digestForever(): Promise<void> {
+  for (;;) {
+    try {
+      const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1_000);
+      const today = nowJst.toISOString().slice(0, 10);
+      if (nowJst.getUTCHours() === digestHourJst && lastDigestDate !== today) {
+        lastDigestDate = today;
+        await postSigned("/internal/digest/run", { hours: 24 });
+        console.log(`digest requested for ${today}`);
+      }
+    } catch (error) {
+      console.error("digest request failed", error);
+      await reportIncident("digest_failed", "warning", "日次の改善ダイジェストの実行に失敗", String(error));
+    }
+    await sleep(5 * 60 * 1_000);
+  }
 }
 
 /** Once a day around MUSINGS_HOUR_JST, スー posts one musing to her channel. */
