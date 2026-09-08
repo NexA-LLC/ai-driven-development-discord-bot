@@ -10,7 +10,7 @@ interface QuizDraft {
   type: "knowledge" | "prediction" | "opinion";
   question: string;
   choices: [string, string, string, string];
-  sourceTitle?: string;
+  sourceTitle?: string | undefined;
 }
 
 const token = process.env.DISCORD_BOT_TOKEN?.trim() || "";
