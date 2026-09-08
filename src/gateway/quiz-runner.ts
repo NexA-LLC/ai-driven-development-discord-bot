@@ -20,11 +20,15 @@ const llmApiUrl = process.env.LLM_API_URL?.trim() || "";
 const llmModel = process.env.LLM_MODEL?.trim() || "";
 const llmApiKey = process.env.LLM_API_KEY?.trim() || "";
 const llmTimeoutMs = readPositiveInteger("LLM_TIMEOUT_SECONDS", 120) * 1_000;
+// Reasoning models spend most of their budget before the first content token,
+// so this has to be well above the ~150 tokens the quiz JSON itself needs.
+const llmMaxTokens = readPositiveInteger("QUIZ_MAX_TOKENS", 1_400);
 const quizChannelId =
   process.env.QUIZ_CHANNEL_ID?.trim() || process.env.MUSINGS_CHANNEL_ID?.trim() || "";
 const quizHourJst = readHour("QUIZ_HOUR_JST", 20);
 const quizOnStart = readBoolean("QUIZ_ON_START", false);
 const quizEnabled = readBoolean("QUIZ_ENABLED", true);
+const quizDryRun = readBoolean("QUIZ_DRY_RUN", false);
 const communityPrompts = (process.env.QUIZ_COMMUNITY_PROMPTS ?? "")
   .split("|")
   .map((value) => value.trim())
@@ -37,6 +41,8 @@ let lastQuizDate = "";
 
 if (!quizEnabled) {
   console.log("quiz runner disabled (QUIZ_ENABLED=false)");
+} else if (quizDryRun) {
+  void printDryRunQuiz();
 } else if (!token || !quizChannelId || !llmApiUrl) {
   console.warn(
     `quiz runner idle: token=${Boolean(token)} channel=${Boolean(quizChannelId)} llm=${Boolean(llmApiUrl)}`,
@@ -48,6 +54,24 @@ if (!quizEnabled) {
     );
   }
   void quizForever();
+}
+
+// QUIZ_DRY_RUN builds one quiz and prints it instead of posting to Discord, so
+// a prompt or model change can be checked without spending a community post.
+async function printDryRunQuiz(): Promise<void> {
+  if (!llmApiUrl) {
+    console.error("QUIZ_DRY_RUN needs LLM_API_URL");
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const draft = await buildQuiz(jstNow().toISOString().slice(0, 10));
+    console.log(`--- dry run (type=${draft.type}, nothing posted) ---`);
+    console.log(renderQuiz(draft));
+  } catch (error) {
+    console.error("dry run quiz failed", error);
+    process.exitCode = 1;
+  }
 }
 
 async function quizForever(): Promise<void> {
@@ -109,9 +133,10 @@ async function buildQuiz(today: string): Promise<QuizDraft> {
         "単なる暗記より、何が起きたか・次に何が起きそうか・開発者への影響のどれかを問う。",
       ].join("\n");
 
-  const prompt = [
+  const basePrompt = [
     "AI開発者コミュニティ向けの4択クイズ/予測を1問だけ作ってください。",
-    "必ず日本語。回答はDiscordの1️⃣2️⃣3️⃣4️⃣リアクションで行います。",
+    "questionとchoicesは必ず日本語で書く。中国語や英語の文で書かない。",
+    "回答はDiscordの1️⃣2️⃣3️⃣4️⃣リアクションで行います。",
     "出力はJSONだけ。Markdownコードブロックは禁止。",
     'schema: {"type":"knowledge|prediction|opinion","question":"...","choices":["...","...","...","..."],"sourceTitle":"任意"}',
     "choicesは必ず4個、各40文字以内。questionは120文字以内。",
@@ -120,8 +145,32 @@ async function buildQuiz(today: string): Promise<QuizDraft> {
     material,
   ].join("\n\n");
 
-  const raw = await callLlm(prompt);
-  return parseQuiz(raw, news);
+  // Reasoning models drift into Chinese or English on this prompt, and a
+  // wrong-language post into a Japanese channel is worse than skipping a day.
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const prompt =
+      attempt === 1
+        ? basePrompt
+        : `${basePrompt}\n\n直前の出力は日本語ではありませんでした。questionとchoicesを、ひらがなとカタカナを含む自然な日本語で書き直してください。`;
+    try {
+      const draft = parseQuiz(await callLlm(prompt), news);
+      if (isJapanese(draft)) {
+        return draft;
+      }
+      lastError = new Error("quiz was not written in Japanese");
+      console.warn(`quiz attempt ${attempt} was not Japanese`);
+    } catch (error) {
+      lastError = error;
+      console.warn(`quiz attempt ${attempt} failed`, error);
+    }
+  }
+  throw lastError ?? new Error("quiz generation failed");
+}
+
+function isJapanese(quiz: QuizDraft): boolean {
+  // Kana only: CJK ideographs alone cannot tell Japanese from Chinese.
+  return /[぀-ヿ]/.test([quiz.question, ...quiz.choices].join(" "));
 }
 
 async function fetchAiNews(): Promise<NewsItem[]> {
@@ -186,12 +235,12 @@ async function callLlm(prompt: string): Promise<string> {
         {
           role: "system",
           content:
-            "あなたはDiscordコミュニティの編集者。短く、具体的で、4択が重複しない問いを作る。JSON以外を返さない。",
+            "あなたは日本語のDiscordコミュニティの編集者。短く、具体的で、4択が重複しない問いを日本語で作る。JSON以外を返さない。",
         },
         { role: "user", content: prompt },
       ],
       temperature: 0.6,
-      max_tokens: 700,
+      max_tokens: llmMaxTokens,
     }),
     signal: AbortSignal.timeout(llmTimeoutMs),
   });
