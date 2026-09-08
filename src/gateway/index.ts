@@ -1,3 +1,6 @@
+import { readSlot, writeSlot } from "./schedule-state.js";
+import { lifecycle } from "./lifecycle.js";
+import { inbox } from "./inbox.js";
 import { createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
@@ -90,7 +93,7 @@ const museOnStart = readBoolean("MUSE_ON_START", false);
 // Daily improvement digest (Worker /internal/digest/run). The account has no
 // spare Workers cron trigger, so the Gateway is the clock.
 const digestHourJst = readPositiveInteger("DIGEST_HOUR_JST", 3);
-let lastDigestDate = "";
+let lastDigestDate = readSlot("digest-date");
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
 
@@ -111,8 +114,9 @@ const client = new Client({
   intents,
   partials: [Partials.Message, Partials.Reaction, Partials.Channel],
 });
+let startupReady = false;
 let inFlight = 0;
-let lastMusingSlot = "";
+let lastMusingSlot = readSlot("musing-slot");
 const botRateState = new Map<string, RateState>();
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -125,6 +129,12 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.error("channel resolution failed", error);
   }
   startReadinessServer();
+  while (!lifecycle.draining) {
+    try { await lifecycle.run(catchUpMessages); startupReady = true; break; }
+    catch (error) { console.error("inbox recovery blocked", error); await sleep(5000); }
+  }
+  void replayInboxForever();
+  setInterval(() => { if (client.isReady() && !lifecycle.draining) inbox.heartbeat(); }, 5000);
   void digestForever();
   if (llmApiUrl) {
     void pollJobsForever();
@@ -153,7 +163,7 @@ client.on(Events.ShardResume, () => {
   console.log("discord shard resumed");
 });
 
-client.on(Events.MessageReactionAdd, async (reaction, user) => {
+client.on(Events.MessageReactionAdd, async (reaction, user) => lifecycle.run(async () => {
   try {
     if (user.bot) {
       return;
@@ -174,9 +184,9 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
   } catch (error) {
     console.error("reaction feedback failed", error);
   }
-});
+}));
 
-client.on(Events.GuildMemberAdd, async (member) => {
+client.on(Events.GuildMemberAdd, async (member) => lifecycle.run(async () => {
   if (!welcomeChannelId || member.user.bot) {
     return;
   }
@@ -216,17 +226,19 @@ client.on(Events.GuildMemberAdd, async (member) => {
     console.error("welcome failed", error);
     await reportIncident("welcome_failed", "warning", "新規参加者への挨拶に失敗", String(error));
   }
-});
+}));
 
 client.on(Events.MessageCreate, async (message) => {
   try {
-    await onMessage(message);
+    if (message.author.bot) return;
+    inbox.add(message.channelId, message.id);
+
   } catch (error) {
     console.error("message handler failed", error);
   }
 });
 
-async function onMessage(message: Message): Promise<void> {
+async function onMessageImpl(message: Message): Promise<void> {
   if (!message.guildId || message.author.id === client.user?.id) {
     return;
   }
@@ -398,10 +410,15 @@ function startReadinessServer(): void {
     }
     const body = {
       contract: "nexa.host.update.readiness/v1",
-      decision: inFlight > 0 ? "defer" : "ready",
-      reasonCode: inFlight > 0 ? "active_work" : "idle",
-      message: inFlight > 0 ? `${inFlight} replies in progress` : "idle",
-      activeWork: inFlight,
+      decision: lifecycle.active > 0 ? "defer" : "ready",
+      draining: lifecycle.draining,
+      startupReady: startupReady && client.isReady(),
+      pid: process.pid,
+      release: process.env.SU_RELEASE_SHA ?? "unknown",
+      queuedMessages: inbox.size,
+      reasonCode: lifecycle.active > 0 ? "active_work" : "idle",
+      message: `${lifecycle.active} operations in progress`,
+      activeWork: lifecycle.active,
       retryAfterSeconds: 30,
       observedAt: new Date().toISOString(),
     };
@@ -416,12 +433,14 @@ function startReadinessServer(): void {
 /** Once a day around DIGEST_HOUR_JST, ask the Worker to run the improvement digest. */
 async function digestForever(): Promise<void> {
   for (;;) {
+    if (lifecycle.draining) { await sleep(1000); continue; }
     try {
       const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1_000);
       const today = nowJst.toISOString().slice(0, 10);
       if (nowJst.getUTCHours() === digestHourJst && lastDigestDate !== today) {
         lastDigestDate = today;
-        await postSigned("/internal/digest/run", { hours: 24 });
+        writeSlot("digest-date", today);
+        await lifecycle.run(() => postSigned("/internal/digest/run", { hours: 24 }));
         console.log(`digest requested for ${today}`);
       }
     } catch (error) {
@@ -435,12 +454,14 @@ async function digestForever(): Promise<void> {
 /** At each configured hour (JST), スー posts one musing to her channel. */
 async function museForever(): Promise<void> {
   for (;;) {
+    if (lifecycle.draining) { await sleep(1000); continue; }
     try {
       const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1_000);
       const hour = nowJst.getUTCHours();
       const slot = `${nowJst.toISOString().slice(0, 10)}T${hour}`;
       if (musingsChannelId && musingsHoursJst.includes(hour) && lastMusingSlot !== slot) {
         lastMusingSlot = slot;
+        writeSlot("musing-slot", slot);
         await postMusing(hour, false);
       }
     } catch (error) {
@@ -464,7 +485,7 @@ function timeOfDayMaterial(hourJst: number): string {
   return "時間帯: 深夜。レジに立っている。客はいない。品出しの途中。";
 }
 
-async function postMusing(
+async function postMusingImpl(
   hourJst: number,
   force: boolean,
   topic?: string,
@@ -535,7 +556,7 @@ async function logReply(entry: {
   }
 }
 
-async function reportIncident(
+async function reportIncidentImpl(
   kind: string,
   severity: "info" | "warning" | "error" | "critical",
   summary: string,
@@ -557,7 +578,9 @@ async function reportIncident(
 
 async function pollJobsForever(): Promise<void> {
   for (;;) {
+    if (lifecycle.draining) { await sleep(1000); continue; }
     try {
+      await lifecycle.run(async () => {
       const { jobs } = await postSigned<{ jobs: AiJob[] }>(
         "/internal/jobs/claim",
         {},
@@ -565,16 +588,20 @@ async function pollJobsForever(): Promise<void> {
       for (const job of jobs) {
         await processJob(job);
       }
+      });
     } catch (error) {
       console.error("job poll failed", error);
     }
+    if (lifecycle.draining) continue;
     try {
+      await lifecycle.run(async () => {
       const { commands } = await postSigned<{
         commands: Array<{ id: string; kind: string; payload: Record<string, unknown> }>;
       }>("/internal/commands/claim", {});
       for (const command of commands) {
         await processCommand(command);
       }
+      });
     } catch (error) {
       console.error("command poll failed", error);
     }
@@ -583,7 +610,7 @@ async function pollJobsForever(): Promise<void> {
 }
 
 /** Commands queued by the Worker (MCP: "muse now", "say this"). */
-async function processCommand(command: {
+async function processCommandImpl(command: {
   id: string;
   kind: string;
   payload: Record<string, unknown>;
@@ -619,7 +646,7 @@ async function processCommand(command: {
   }
 }
 
-async function processJob(job: AiJob): Promise<void> {
+async function processJobImpl(job: AiJob): Promise<void> {
   let text: string;
   const startedAt = Date.now();
   inFlight += 1;
@@ -872,6 +899,7 @@ async function postSigned<T = unknown>(
       "x-nexa-signature": signature,
     },
     body,
+    signal: AbortSignal.timeout(30000),
   });
 
   if (!response.ok) {
@@ -928,11 +956,72 @@ function truncate(value: string, maxLength: number): string {
     : `${value.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.once(signal, () => {
-    client.destroy();
-    process.exit(0);
+for (const signal of ["SIGINT", "SIGTERM", "SIGUSR2"] as const) {
+  process.on(signal, () => {
+    lifecycle.drain();
+    console.log(`draining: signal=${signal} active=${lifecycle.active} queued=${inbox.size}`);
   });
 }
+setInterval(() => {
+  if (lifecycle.draining && lifecycle.active === 0) {
+    client.destroy();
+    console.log("drain complete; queued requests retained");
+    process.exit(0);
+  }
+}, 250);
+
+async function catchUpMessages(): Promise<void> {
+  const after = ((BigInt(Math.max(1420070400000, inbox.onlineAt - 10000)) - 1420070400000n) << 22n).toString();
+  for (const channelId of new Set([...monitoredChannelIds, musingsChannelId].filter(Boolean))) {
+    const channel = await client.channels.fetch(channelId) as TextChannel | null;
+    if (!channel?.messages) continue;
+    let cursor: string | undefined;
+    for (;;) {
+      const messages = await channel.messages.fetch(cursor ? { before: cursor, limit: 100 } : { limit: 100 });
+      const ordered = [...messages.values()].sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
+      for (const message of ordered) {
+        if (BigInt(message.id) > BigInt(after) && !message.author.bot) inbox.add(channelId, message.id);
+      }
+      const last = ordered.at(0);
+      if (!last || BigInt(last.id) <= BigInt(after) || last.id === cursor || messages.size < 100) break;
+      cursor = last.id;
+    }
+  }
+  inbox.heartbeat();
+  console.log(`inbox recovery complete; queued=${inbox.size}`);
+}
+
+async function replayInboxForever(): Promise<void> {
+  for (;;) {
+    if (!lifecycle.draining) {
+      for (const item of inbox.items()) {
+        if (lifecycle.draining) break;
+        try {
+          await lifecycle.run(async () => {
+            const channel = await client.channels.fetch(item.channelId) as TextChannel | null;
+            if (!channel?.messages) throw new Error("inbox channel unavailable");
+            const message = await channel.messages.fetch(item.messageId);
+            await onMessage(message);
+            inbox.remove(item.messageId);
+          });
+        } catch (error) {
+          if ((error as { code?: number }).code === 10008) inbox.remove(item.messageId);
+          else console.error("inbox replay failed", error);
+        }
+      }
+    }
+    await sleep(5000);
+  }
+}
+
+const onMessage = (...args: Parameters<typeof onMessageImpl>): ReturnType<typeof onMessageImpl> => lifecycle.run(() => onMessageImpl(...args));
+
+const postMusing = (...args: Parameters<typeof postMusingImpl>): ReturnType<typeof postMusingImpl> => lifecycle.run(() => postMusingImpl(...args));
+
+const processJob = (...args: Parameters<typeof processJobImpl>): ReturnType<typeof processJobImpl> => lifecycle.run(() => processJobImpl(...args));
+
+const processCommand = (...args: Parameters<typeof processCommandImpl>): ReturnType<typeof processCommandImpl> => lifecycle.run(() => processCommandImpl(...args));
+
+const reportIncident = (...args: Parameters<typeof reportIncidentImpl>): ReturnType<typeof reportIncidentImpl> => lifecycle.run(() => reportIncidentImpl(...args));
 
 await client.login(token);

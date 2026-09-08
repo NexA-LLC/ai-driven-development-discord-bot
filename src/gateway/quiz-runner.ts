@@ -1,3 +1,5 @@
+import { readSlot, writeSlot } from "./schedule-state.js";
+import { lifecycle } from "./lifecycle.js";
 import { createHmac } from "node:crypto";
 
 interface NewsItem {
@@ -33,7 +35,7 @@ const newsQuery =
   process.env.QUIZ_NEWS_QUERY?.trim() ||
   "AI OR OpenAI OR Anthropic OR Claude OR Gemini OR LLM when:1d";
 
-let lastQuizDate = "";
+let lastQuizDate = readSlot("quiz-date");
 
 if (!quizEnabled) {
   console.log("quiz runner disabled (QUIZ_ENABLED=false)");
@@ -65,7 +67,12 @@ async function quizForever(): Promise<void> {
   }
 }
 
-async function postDailyQuiz(force: boolean): Promise<void> {
+function postDailyQuiz(force: boolean): Promise<void> {
+  if (lifecycle.draining) return Promise.resolve();
+  return lifecycle.run(() => postDailyQuizImpl(force));
+}
+
+async function postDailyQuizImpl(force: boolean): Promise<void> {
   const today = jstNow().toISOString().slice(0, 10);
   if (!force && lastQuizDate === today) {
     return;
@@ -74,6 +81,8 @@ async function postDailyQuiz(force: boolean): Promise<void> {
   const draft = await buildQuiz(today);
   const content = renderQuiz(draft);
   const message = await sendDiscordMessage(quizChannelId, content);
+  lastQuizDate = today;
+  writeSlot("quiz-date", today);
   for (const emoji of ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]) {
     await addDiscordReaction(quizChannelId, message.id, emoji);
   }
