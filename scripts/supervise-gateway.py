@@ -17,7 +17,10 @@ lock = (ROOT / 'supervisor.lock').open('w')
 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 NODE = '/opt/homebrew/bin/node'
 os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
-PORT = int(os.environ.get('READINESS_PORT', '8790'))
+PORT = 8790
+for line in ENV.read_text().splitlines():
+    if line.startswith('READINESS_PORT='):
+        PORT = int(line.split('=', 1)[1].strip().strip(chr(34)).strip(chr(39)))
 child = None
 stopping = False
 

@@ -58,6 +58,6 @@ same-slot repeats. A musing/digest failure after reservation skips that slot.
 The launchd label is `net.nex-a.su.gateway-managed`. Its SSH loopback entrypoint
 preserves the existing host's local-network permission workaround. The supervisor
 is a service-specific updater; NexA Host fleet inventory integration is separate.
-Use loopback `/readiness` on port 8790 to inspect `activeWork`, `draining`,
+Use loopback `/readiness` on the configured `READINESS_PORT` (202: 8791) to inspect `activeWork`, `draining`,
 `startupReady`, `queuedMessages`, `release` and `pid`. Send SIGUSR2 to that PID for
 a graceful same-release restart. Never use `kill -9` for planned updates.
