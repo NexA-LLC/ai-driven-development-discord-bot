@@ -56,7 +56,9 @@ musing/digest slots and successful quiz posts persist across restart to suppress
 same-slot repeats. A musing/digest failure after reservation skips that slot.
 
 The launchd label is `net.nex-a.su.gateway-managed`. Its SSH loopback entrypoint
-preserves the existing host's local-network permission workaround. The supervisor
+preserves the host's local-network permission workaround. A dedicated SSH identity
+is restricted to localhost and a fixed supervisor command; shell and forwarding
+are disabled, and authentication is preflighted before stopping the old process. The supervisor
 is a service-specific updater; NexA Host fleet inventory integration is separate.
 Use loopback `/readiness` on the configured `READINESS_PORT` (202: 8791) to inspect `activeWork`, `draining`,
 `startupReady`, `queuedMessages`, `release` and `pid`. Send SIGUSR2 to that PID for

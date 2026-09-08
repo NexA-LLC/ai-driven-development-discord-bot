@@ -25,6 +25,23 @@ for args in [['npm', 'ci', '--no-audit', '--no-fund'], ['npm', 'run', 'typecheck
     subprocess.run(args, cwd=release, check=True)
 (release / '.built').touch()
 shutil.copy2(release / 'scripts/supervise-gateway.py', root / 'supervise-gateway.py')
+# Loopback-only, forced-command identity: no general shell or forwarding access.
+identity = home / '.ssh/su_gateway_local'
+if not identity.exists():
+    subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(identity), '-C', 'su-gateway-loopback-only'], check=True)
+entry = root / 'ssh-entry.sh'
+entry.write_text('#!/bin/sh\ncase "$SSH_ORIGINAL_COMMAND" in\ncheck) echo ready;;\nrun) exec /usr/bin/python3 ' + str(root / 'supervise-gateway.py') + ';;\n*) exit 64;;\nesac\n')
+os.chmod(entry, 0o700)
+authorized = home / '.ssh/authorized_keys'
+public = identity.with_suffix('.pub').read_text().strip()
+existing = authorized.read_text() if authorized.exists() else ''
+if public not in existing:
+    if authorized.exists(): shutil.copy2(authorized, root / 'authorized_keys.before-su')
+    with authorized.open('a') as file:
+        file.write('\nrestrict,pty,from="127.0.0.1,::1",command="/bin/sh ' + str(entry) + '" ' + public + '\n')
+    os.chmod(authorized, 0o600)
+probe = subprocess.check_output(['/usr/bin/ssh', '-T', '-i', str(identity), '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', 'buildman@127.0.0.1', 'check'], timeout=15).decode().strip()
+if probe != 'ready': raise SystemExit('loopback preflight failed; old gateway untouched')
 # Legacy gateway cannot drain. Require several consecutive idle observations.
 port = 8790
 for line in (home / 'service-runners/flow-local-workers/su-gateway.env').read_text().splitlines():
@@ -56,7 +73,7 @@ plist_path = home / 'Library/LaunchAgents' / (label + '.plist')
 logs = home / 'Library/Logs/su-gateway'
 plist = {
     'Label': label,
-    'ProgramArguments': ['/usr/bin/ssh', '-tt', '-i', str(home / '.ssh/id_ed25519'), '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3', 'buildman@127.0.0.1', 'exec /usr/bin/python3 ' + str(root / 'supervise-gateway.py')],
+    'ProgramArguments': ['/usr/bin/ssh', '-tt', '-i', str(identity), '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3', 'buildman@127.0.0.1', 'run'],
     'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10,
     'StandardOutPath': str(logs / 'managed.stdout.log'),
     'StandardErrorPath': str(logs / 'managed.stderr.log'),
