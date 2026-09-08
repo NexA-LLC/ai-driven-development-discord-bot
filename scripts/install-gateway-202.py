@@ -26,9 +26,13 @@ for args in [['npm', 'ci', '--no-audit', '--no-fund'], ['npm', 'run', 'typecheck
 (release / '.built').touch()
 shutil.copy2(release / 'scripts/supervise-gateway.py', root / 'supervise-gateway.py')
 # Legacy gateway cannot drain. Require several consecutive idle observations.
+port = 8790
+for line in (home / 'service-runners/flow-local-workers/su-gateway.env').read_text().splitlines():
+    if line.startswith('READINESS_PORT='):
+        port = int(line.split('=', 1)[1].strip().strip(chr(34)).strip(chr(39)))
 old_pid = None
 for _ in range(3):
-    with urllib.request.urlopen('http://127.0.0.1:8790/readiness', timeout=5) as response:
+    with urllib.request.urlopen(f'http://127.0.0.1:{port}/readiness', timeout=5) as response:
         value = json.load(response)
     if value.get('activeWork') != 0:
         raise SystemExit('legacy gateway busy; retry installation later')
