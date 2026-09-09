@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { postChannelMessage } from "./channel-post.js";
 import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agent.js";
 import { readMentionedChannels } from "./channel-context.js";
@@ -342,6 +343,7 @@ async function onMessageImpl(message: Message): Promise<void> {
     const audit = { id: message.id, event: "mention", userId: message.author.id, guildId: message.guildId, channelId: message.channelId };
     auditConversation({ ...audit, phase: "received", input: message.content });
     let text: string;
+    let lethweiReaction = false;
     let ok = true;
     const startedAt = Date.now();
     inFlight += 1;
@@ -363,6 +365,10 @@ async function onMessageImpl(message: Message): Promise<void> {
           return answer;
         },
         async (name, args) => {
+          if (name === "show_lethwei_reaction") {
+            lethweiReaction = true;
+            return { attachedToReply: true, animation: "怒りのラウェイ・コンボ", realAction: false };
+          }
           if (name === "post_channel_message") return postChannelMessage(message, args);
           const id = (args as { channel_id?: unknown } | null)?.channel_id;
           const allowed = [...message.content.matchAll(/<#(\d+)>/g)].map(match => match[1]);
@@ -383,6 +389,7 @@ async function onMessageImpl(message: Message): Promise<void> {
     auditConversation({ ...audit, phase: "generated", response: truncate(text, 1_900), ok });
     const sent = await message.reply({
       content: truncate(text, 1_900),
+      ...(ok && lethweiReaction ? { files: [{ attachment: resolve("assets/su-lethwei.webp"), name: "su-lethwei.webp", description: "怒りのラウェイ・コンボ（コミカルなキャラクター演出）" }] } : {}),
       allowedMentions: {
         parse: [],
         repliedUser: false,
