@@ -21,6 +21,7 @@ export interface DiscordCommandOption {
   name: string;
   description: string;
   required: boolean;
+  max_length?: number;
 }
 
 export interface DiscordCommandDefinition {
@@ -41,8 +42,9 @@ export const discordCommands: DiscordCommandDefinition[] = [
       {
         type: STRING,
         name: "topic",
-        description: "出したい問い・テーマ（例：カニとエビはどっちが美味しい？）",
-        required: false,
+        description: "必須：出したい問い（例：ClaudeとCodex、どちらが流行る？）",
+        required: true,
+        max_length: 120,
       },
       {
         type: BOOLEAN,

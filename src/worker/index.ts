@@ -4,7 +4,7 @@ import {
   type AgentPassport,
 } from "../shared/agent-manifest.js";
 import { discordCommands } from "../shared/commands.js";
-import { buildQuizPrompt, isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
+import { buildQuizPrompt, buildRequestedQuizPrompt, parseRequestedQuiz, isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
 import {
   ABOUT_TEXT,
   APP_DESCRIPTION,
@@ -280,7 +280,10 @@ async function handleDiscordInteraction(
     case "quiz": {
       const topic = getStringOption(interaction, "topic");
       const isPublic = getBooleanOption(interaction, "public") ?? true;
-      return startAiJob(interaction, env, context, "ask", buildQuizPrompt(topic), !isPublic);
+      let prompt: string;
+      try { prompt = buildRequestedQuizPrompt(topic); }
+      catch (error) { return interactionMessage((error as Error).message, true); }
+      return startAiJob(interaction, env, context, "ask", prompt, !isPublic);
     }
 
     case "ask": {
@@ -631,7 +634,7 @@ async function generateAndFollowUp(
 
 async function callAi(env: Env, mode: AskMode, input: string, providerOverride?: string): Promise<string> {
   const raw = await callRawAi(env, mode, input, providerOverride);
-  return isQuizPrompt(input) ? renderQuiz(parseQuiz(raw)) : raw;
+  return isQuizPrompt(input) ? renderQuiz(parseRequestedQuiz(raw, input)) : raw;
 }
 
 async function callRawAi(

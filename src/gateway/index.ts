@@ -1,5 +1,5 @@
 import { seedQuizReactions } from "../shared/quiz-reactions.js";
-import { isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
+import { isQuizPrompt, parseRequestedQuiz, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { auditConversation } from "./conversation-audit.js";
@@ -720,7 +720,7 @@ async function processJobImpl(job: AiJob): Promise<void> {
 
 async function generateReply(event: SuEvent, input: string, language = detectLanguage(input)): Promise<string> {
   const raw = await generateRawReply(event, input, language);
-  return isQuizPrompt(input) ? renderQuiz(parseQuiz(raw)) : raw;
+  return isQuizPrompt(input) ? renderQuiz(parseRequestedQuiz(raw, input)) : raw;
 }
 
 async function generateRawReply(
