@@ -1,4 +1,4 @@
-import { buildQuizPrompt, parseQuiz, renderQuiz, type QuizDraft } from "../shared/quiz.js";
+import { buildQuizPrompt, parseQuiz, renderQuiz, quizEmojis, type QuizDraft } from "../shared/quiz.js";
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { createHmac } from "node:crypto";
@@ -77,7 +77,7 @@ async function postDailyQuizImpl(force: boolean): Promise<void> {
   const message = await sendDiscordMessage(quizChannelId, content);
   lastQuizDate = today;
   writeSlot("quiz-date", today);
-  for (const emoji of ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]) {
+  for (const emoji of quizEmojis(draft)) {
     await addDiscordReaction(quizChannelId, message.id, emoji);
   }
 
