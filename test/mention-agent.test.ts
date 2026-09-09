@@ -49,3 +49,9 @@ it("allows the model to prepare an audio reply", async () => {
   await runMentionAgent("声で挨拶して", "persona", complete, execute);
   expect(execute).toHaveBeenCalledWith("speak_reply", { text: "こんにちは。スーです。" });
 });
+it("routes a voice-channel invitation through the model-selected join tool", async () => {
+  const complete = vi.fn().mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "join", type: "function", function: { name: "join_voice_channel", arguments: "{}" } }] }).mockResolvedValueOnce({ role: "assistant", content: "参加しました。" });
+  const execute = vi.fn().mockResolvedValue({ joined: true });
+  await runMentionAgent("今いるボイスチャンネルに来て", "persona", complete, execute);
+  expect(execute).toHaveBeenCalledWith("join_voice_channel", {});
+});
