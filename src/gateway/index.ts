@@ -195,10 +195,15 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => lifecycle.run(asy
   }
 }));
 
+const welcomeInProgress = new Set<string>();
 client.on(Events.GuildMemberAdd, async (member) => lifecycle.run(async () => {
-  if (!welcomeChannelId || member.user.bot) {
+  if (!welcomeChannelId || member.user.bot || (primaryGuildId && member.guild.id !== primaryGuildId)) {
     return;
   }
+  const slot = `welcome-${member.guild.id}-${member.id}`;
+  const joined = String(member.joinedTimestamp ?? "unknown");
+  if (welcomeInProgress.has(slot) || readSlot(slot) === joined) return;
+  welcomeInProgress.add(slot);
   try {
     const name = member.displayName || member.user.username;
     const text = await generateReply(
@@ -211,7 +216,9 @@ client.on(Events.GuildMemberAdd, async (member) => lifecycle.run(async () => {
       | {
           send?: (options: {
             content: string;
-            allowedMentions: { users: string[] };
+            allowedMentions: { users: string[]; parse: [] };
+            nonce: string;
+            enforceNonce: boolean;
           }) => Promise<unknown>;
         }
       | null;
@@ -221,8 +228,11 @@ client.on(Events.GuildMemberAdd, async (member) => lifecycle.run(async () => {
     }
     const sent = (await sendable.send({
       content: `<@${member.id}> ${truncate(text, 1_800)}`,
-      allowedMentions: { users: [member.id] },
+      allowedMentions: { users: [member.id], parse: [] },
+      nonce: createHmac("sha256", "welcome").update(`${slot}:${joined}`).digest("hex").slice(0, 24),
+      enforceNonce: true,
     })) as { id?: string } | undefined;
+    writeSlot(slot, joined);
     await logReply({
       event: "welcome",
       guildId: member.guild.id,
@@ -234,6 +244,8 @@ client.on(Events.GuildMemberAdd, async (member) => lifecycle.run(async () => {
   } catch (error) {
     console.error("welcome failed", error);
     await reportIncident("welcome_failed", "warning", "新規参加者への挨拶に失敗", String(error));
+  } finally {
+    welcomeInProgress.delete(slot);
   }
 }));
 
