@@ -1,0 +1,31 @@
+import { expect, it, vi } from "vitest";
+import { runMentionAgent, type AgentMessage } from "../src/gateway/mention-agent.js";
+
+it("lets the model decide whether to read, then returns the tool result to the model", async () => {
+  const complete = vi.fn()
+    .mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "read1", type: "function", function: { name: "read_channel_history", arguments: '{"channel_id":"123"}' } }] })
+    .mockImplementationOnce(async (messages: AgentMessage[]) => {
+      expect(messages.at(-1)).toMatchObject({ role: "tool", tool_call_id: "read1" });
+      expect(messages.at(-1)?.content).toContain("本文を取得できない");
+      return { role: "assistant", content: "チャンネルは見えますが、本文を取得できない状態です。" };
+    });
+  const execute = vi.fn().mockResolvedValue({ status: "1件あるが本文を取得できない" });
+  const result = await runMentionAgent("<#123> は見える？", "persona", complete, execute);
+  expect(execute).toHaveBeenCalledWith("read_channel_history", { channel_id: "123" });
+  expect(result).toContain("チャンネルは見えます");
+});
+it("does not force a history read merely because a channel is mentioned", async () => {
+  const complete = vi.fn().mockResolvedValue({ role: "assistant", content: "投稿機能は未接続ですが、沖縄らしい挨拶案を作ります。" });
+  const execute = vi.fn();
+  const question = "<#123> に挨拶投稿できる? 沖縄っぽく";
+  expect(await runMentionAgent(question, "persona", complete, execute)).toContain("挨拶案");
+  expect(execute).not.toHaveBeenCalled();
+  expect(complete.mock.calls[0]?.[0][1]).toEqual({ role: "user", content: question });
+});
+it("returns unsupported tool errors to the model without executing them", async () => {
+  const complete = vi.fn().mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "x", type: "function", function: { name: "post_channel_message", arguments: "{}" } }] }).mockResolvedValueOnce({ role: "assistant", content: "投稿はしていません。" });
+  const execute = vi.fn();
+  await runMentionAgent("投稿して", "persona", complete, execute);
+  expect(execute).not.toHaveBeenCalled();
+  expect(complete.mock.calls[1]?.[0].at(-1).content).toContain("not available");
+});

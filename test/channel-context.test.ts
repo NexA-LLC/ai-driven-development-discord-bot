@@ -45,3 +45,9 @@ it("does not read cross-guild channels", async () => {
   expect((await readMentionedChannels(message(channel) as never))?.readable).toBe(false);
   expect(channel.messages.fetch).not.toHaveBeenCalled();
 });
+it("does not mistake content redaction for an empty channel", async () => {
+  const { channelReadStatus } = await import("../src/gateway/channel-context.js");
+  expect(channelReadStatus("123", 1, false)).toContain("本文は取得できていません");
+  expect(channelReadStatus("123", 1, false)).toContain("Message Content Intent");
+  expect(channelReadStatus("123", 0, false)).toContain("投稿が返ってきません");
+});
