@@ -2,7 +2,8 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, expect, it, vi } from "vitest";
 import { ChannelType, Events, type Client, type Message } from "discord.js";
-const mocks = vi.hoisted(() => ({ connections: [] as any[], subscribe: vi.fn(), play: vi.fn(), stt: vi.fn(), tts: vi.fn() }));
+const mocks = vi.hoisted(() => ({ audit: vi.fn(), connections: [] as any[], subscribe: vi.fn(), play: vi.fn(), stt: vi.fn(), tts: vi.fn() }));
+vi.mock("../src/gateway/conversation-audit.js", () => ({ auditConversation: mocks.audit }));
 vi.mock("../src/gateway/audio.js", () => ({ transcribeAudioBytes: mocks.stt, synthesizeSpeech: mocks.tts }));
 vi.mock("@discordjs/voice", async () => {
   const { EventEmitter } = await import("node:events");
@@ -41,4 +42,10 @@ it("decodes subscribed speech, runs ASR and model, and plays the generated respo
   input.end(); encoder.delete();
   await vi.waitFor(() => expect(mocks.play).toHaveBeenCalledTimes(1));
   expect(mocks.stt.mock.calls[0][0].toString("ascii", 0, 4)).toBe("RIFF"); expect(answer).toHaveBeenCalled(); expect(mocks.tts).toHaveBeenCalledWith("こんにちは");
+  const entries = mocks.audit.mock.calls.map(([entry]) => entry);
+  expect(entries.map(e => e.phase)).toEqual(["received", "transcribed", "decided", "synthesized", "played"]);
+  expect(new Set(entries.map(e => e.id)).size).toBe(1);
+  expect(entries[1]).toMatchObject({ event: "voice", userId: "user", channelId: "vc", input: "こんにちは" });
+  expect(JSON.parse(entries[2].response)).toEqual({ action: "reply", text: "こんにちは" });
+  expect(entries[4].ok).toBe(true);
 });
