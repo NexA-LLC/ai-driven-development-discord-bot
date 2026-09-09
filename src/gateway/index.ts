@@ -1,3 +1,4 @@
+import { seedQuizReactions } from "../shared/quiz-reactions.js";
 import { isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
@@ -804,7 +805,7 @@ async function sendInteractionFollowUp(
   content: string,
 ): Promise<void> {
   const response = await fetch(
-    `https://discord.com/api/v10/webhooks/${job.application_id}/${job.interaction_token}`,
+    `https://discord.com/api/v10/webhooks/${job.application_id}/${job.interaction_token}?wait=true`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -820,6 +821,13 @@ async function sendInteractionFollowUp(
     throw new Error(
       `Discord follow-up returned ${response.status}: ${(await response.text()).slice(0, 300)}`,
     );
+  }
+  if (job.input && isQuizPrompt(job.input) && !job.ephemeral) {
+    const message = await response.json() as { id: string; channel_id: string };
+    // Delivery has succeeded: reaction failure must never trigger a second reply.
+    await seedQuizReactions(content, message, token).catch(error => {
+      console.error("quiz reaction seeding failed", error);
+    });
   }
 }
 
