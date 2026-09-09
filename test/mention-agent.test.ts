@@ -43,3 +43,9 @@ it("lets the model select the cosmetic reaction and sees the result before answe
   await runMentionAgent("不適切な発言", "persona", complete, execute);
   expect(execute).toHaveBeenCalledWith("show_lethwei_reaction", {});
 });
+it("allows the model to prepare an audio reply", async () => {
+  const complete = vi.fn().mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "voice", type: "function", function: { name: "speak_reply", arguments: '{"text":"こんにちは。スーです。"}' } }] }).mockResolvedValueOnce({ role: "assistant", content: "こんにちは。スーです。" });
+  const execute = vi.fn().mockResolvedValue({ prepared: true });
+  await runMentionAgent("声で挨拶して", "persona", complete, execute);
+  expect(execute).toHaveBeenCalledWith("speak_reply", { text: "こんにちは。スーです。" });
+});

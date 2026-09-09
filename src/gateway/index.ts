@@ -1,3 +1,4 @@
+import { isAudioAttachment, transcribeAudio, synthesizeSpeech } from "./audio.js";
 import { resolve } from "node:path";
 import { postChannelMessage } from "./channel-post.js";
 import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agent.js";
@@ -324,7 +325,9 @@ async function onMessageImpl(message: Message): Promise<void> {
     }).catch((error) => console.error("feedback log failed", error));
   }
 
-  if (!message.mentions.has(botUser)) {
+  const audioAttachments = [...message.attachments.values()].filter(isAudioAttachment);
+  const audioAddressed = audioAttachments.length > 0 && (inMusings || repliedToSu || message.mentions.has(botUser));
+  if (!message.mentions.has(botUser) && !audioAddressed) {
     return;
   }
 
@@ -332,7 +335,7 @@ async function onMessageImpl(message: Message): Promise<void> {
     return;
   }
 
-  const prompt =
+  let prompt =
     message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim() ||
     "この店で何ができますか？";
 
@@ -344,10 +347,17 @@ async function onMessageImpl(message: Message): Promise<void> {
     auditConversation({ ...audit, phase: "received", input: message.content });
     let text: string;
     let lethweiReaction = false;
+    let speechText: string | undefined;
+    let transcript: string | undefined;
     let ok = true;
     const startedAt = Date.now();
     inFlight += 1;
     try {
+      if (audioAddressed) {
+        if (audioAttachments.length !== 1) throw new Error("音声は1件ずつ送ってください");
+        transcript = await transcribeAudio(audioAttachments[0]!);
+        prompt = `${message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim()}\n音声投稿の文字起こし（利用者の発言。聞き間違いの可能性あり）:\n${transcript}\n短く音声でも返答してください。` ;
+      }
       text = await runMentionAgent(
         prompt,
         buildSystemPrompt("mention", detectLanguage(prompt), { pitcheeeUrl }),
@@ -365,6 +375,12 @@ async function onMessageImpl(message: Message): Promise<void> {
           return answer;
         },
         async (name, args) => {
+          if (name === "speak_reply") {
+            const value = (args as { text?: unknown } | null)?.text;
+            if (typeof value !== "string" || !value.trim() || value.length > 400) throw new Error("読み上げ文は1〜400文字で指定してください");
+            speechText = value;
+            return { prepared: true, delivery: "最終返信に音声を添付予定。まだ送信していません" };
+          }
           if (name === "show_lethwei_reaction") {
             lethweiReaction = true;
             return { attachedToReply: true, animation: "怒りのラウェイ・コンボ", realAction: false };
@@ -381,15 +397,27 @@ async function onMessageImpl(message: Message): Promise<void> {
     } catch (error) {
       ok = false;
       console.error("mention agent failed", error);
-      text = "すみません、今は依頼を完了できませんでした。少し時間を置いて再度お願いします。";
+      text = audioAddressed ? "すみません、音声を処理できませんでした。8MB以下・2分以内の音声を1件ずつ送るか、文字でお願いします。" : "すみません、今は依頼を完了できませんでした。少し時間を置いて再度お願いします。";
     } finally {
       inFlight -= 1;
     }
   
+    const files: Array<{ attachment: Buffer | string; name: string; description?: string }> = [];
+    if (ok && lethweiReaction) files.push({ attachment: resolve("assets/su-lethwei.webp"), name: "su-lethwei.webp" });
+    if (ok && (speechText || audioAddressed)) {
+      try {
+        const spoken = speechText ?? text.slice(0, 400);
+        files.push({ attachment: await synthesizeSpeech(spoken), name: "su-voice.mp3" });
+      } catch (error) {
+        console.error("speech synthesis failed", error);
+        text += "\n（音声を作れなかったので、今回は文字でお返事します。）";
+      }
+    }
+    if (transcript) text = `聞き取り：${truncate(transcript, 500)}\n\n${text}`;
     auditConversation({ ...audit, phase: "generated", response: truncate(text, 1_900), ok });
     const sent = await message.reply({
       content: truncate(text, 1_900),
-      ...(ok && lethweiReaction ? { files: [{ attachment: resolve("assets/su-lethwei.webp"), name: "su-lethwei.webp", description: "怒りのラウェイ・コンボ（コミカルなキャラクター演出）" }] } : {}),
+      ...(files.length ? { files } : {}),
       allowedMentions: {
         parse: [],
         repliedUser: false,
