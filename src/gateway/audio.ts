@@ -23,8 +23,14 @@ export async function transcribeAudio(a: AudioAttachment, fetcher: typeof fetch 
   const endpoint = process.env.SU_STT_URL;
   if (!endpoint) throw new Error("音声認識が未設定です");
   const audio = await boundedAudio(await fetcher(a.url, { redirect: "error", signal: AbortSignal.timeout(30000) }));
+  return transcribeAudioBytes(audio, a.name, a.contentType ?? "application/octet-stream", fetcher);
+}
+export async function transcribeAudioBytes(audio: Buffer, name = "voice.wav", mime = "audio/wav", fetcher: typeof fetch = fetch): Promise<string> {
+  const endpoint = process.env.SU_STT_URL;
+  if (!endpoint) throw new Error("音声認識が未設定です");
+  if (!audio.length || audio.length > MAX_AUDIO_BYTES) throw new Error("音声サイズが範囲外です");
   const form = new FormData();
-  form.append("file", new Blob([new Uint8Array(audio)], { type: a.contentType ?? "application/octet-stream" }), a.name);
+  form.append("file", new Blob([new Uint8Array(audio)], { type: mime }), name);
   form.append("response_format", "json"); form.append("language", "ja");
   const response = await fetcher(endpoint, { method: "POST", body: form, signal: AbortSignal.timeout(120000) });
   if (!response.ok) throw new Error(`音声認識に失敗しました (${response.status})`);
