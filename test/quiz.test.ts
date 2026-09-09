@@ -18,3 +18,17 @@ it("rejects invalid choices instead of showing raw model output", () => {
   expect(() => parseQuiz('{"question":"test","choices":["a","a","b","c"]}')).toThrow();
   expect(() => parseQuiz("answer: Python for loop")).toThrow();
 });
+
+it("uses the same semantic emoji set for choices and reactions", async () => {
+  const { quizEmojis } = await import("../src/shared/quiz.js");
+  const quiz = parseQuiz(JSON.stringify({ question: "増加する？", choices: ["倍増", "増加", "横ばい", "減少"], emojis: ["🚀", "📈", "➡️", "📉"] }));
+  expect(quizEmojis(quiz)).toEqual(["🚀", "📈", "➡️", "📉"]);
+  quizEmojis(quiz).forEach((emoji, i) => expect(renderQuiz(quiz)).toContain(`${emoji} ${quiz.choices[i]}`));
+});
+
+it.each([undefined, ["🚀", "🚀", "➡️", "📉"], ["🚀"], ["🚀", "📈", "text", "📉"], ["🚀", "📈", "<:custom:123>", "📉"]])("falls back as a whole when emoji output is unusable: %j", async (emojis) => {
+  const { quizEmojis } = await import("../src/shared/quiz.js");
+  const quiz = parseQuiz(JSON.stringify({ question: "test", choices: ["a", "b", "c", "d"], emojis }));
+  expect(quizEmojis(quiz)).toEqual(["1️⃣", "2️⃣", "3️⃣", "4️⃣"]);
+  expect(renderQuiz(quiz)).toContain("1️⃣ a");
+});
