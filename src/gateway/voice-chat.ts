@@ -99,6 +99,7 @@ export class VoiceChat {
       } finally { clearTimeout(timer); decoder.delete(); s.streams.delete(userId); }
       const pcm = Buffer.concat(chunks);
       if (!s.closed && !lifecycle.draining && s.player.state.status === AudioPlayerStatus.Idle && Date.now() >= s.mutedUntil && s.users.has(userId) && hasSpeechEnergy(pcm) && s.pending.length < 2) {
+        console.log(`voice stage=received guild=${s.channel.guild.id} pcmBytes=${pcm.length}`);
         s.pending.push({ userId, pcm }); s.lastActive = Date.now();
         void this.process(s);
       }
@@ -115,14 +116,17 @@ export class VoiceChat {
           let shouldLeave = false;
           try {
             const transcript = await transcribeAudioBytes(pcmToWav(item.pcm));
+            console.log(`voice stage=transcribed guild=${s.channel.guild.id} characters=${transcript.length}`);
             if (s.closed) break;
             const result = await this.answer(transcript, s.history);
             if (s.closed) break;
+            console.log(`voice stage=decided guild=${s.channel.guild.id} action=${result.action}`);
             if (result.action === "ignore") continue;
             shouldLeave = result.action === "leave";
             s.history.push({ role: "user", content: transcript }, { role: "assistant", content: result.text });
             s.history = s.history.slice(-8);
             const audio = await synthesizeSpeech(result.text);
+            console.log(`voice stage=synthesized guild=${s.channel.guild.id} audioBytes=${audio.length}`);
             if (s.closed || lifecycle.draining) break;
             // Discard overlapping speech before playback, preventing acoustic feedback.
             s.mutedUntil = Date.now() + 100_000;

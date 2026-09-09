@@ -22,3 +22,13 @@ export function parseVoiceDecision(raw: string): VoiceDecision {
   if (!["reply", "leave", "ignore"].includes(value.action) || typeof value.text !== "string" || value.text.length > 300 || (value.action !== "ignore" && !value.text.trim())) throw new Error("Invalid voice decision");
   return value;
 }
+
+// The deployed OpenAI-compatible provider accepts json_schema, not json_object.
+export const VOICE_RESPONSE_FORMAT = {
+  type: "json_schema",
+  json_schema: { name: "voice_reply", strict: true, schema: {
+    type: "object",
+    properties: { action: { type: "string", enum: ["reply", "leave", "ignore"] }, text: { type: "string" } },
+    required: ["action", "text"], additionalProperties: false,
+  } },
+} as const;

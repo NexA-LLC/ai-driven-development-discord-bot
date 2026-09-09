@@ -1,5 +1,5 @@
 import { VoiceChat } from "./voice-chat.js";
-import { parseVoiceDecision } from "./voice-audio.js";
+import { parseVoiceDecision, VOICE_RESPONSE_FORMAT } from "./voice-audio.js";
 import { isAudioAttachment, transcribeAudio, synthesizeSpeech } from "./audio.js";
 import { resolve } from "node:path";
 import { postChannelMessage } from "./channel-post.js";
@@ -131,7 +131,7 @@ const client = new Client({
 const voiceChat = new VoiceChat(client, async (text, history) => {
   const response = await fetch(llmApiUrl, {
     method: "POST", headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
-    body: JSON.stringify({ model: llmModel || undefined, response_format: { type: "json_object" }, max_tokens: 700,
+    body: JSON.stringify({ model: llmModel || undefined, response_format: VOICE_RESPONSE_FORMAT, max_tokens: 700,
       messages: [{ role: "system", content: buildSystemPrompt("mention", "ja", { pitcheeeUrl }) + '\n音声通話中です。聞き取りは誤認識の可能性があります。応答はJSONだけで {"action":"reply|leave|ignore","text":"読み上げる自然な日本語、300文字以内"}。利用者の意図を判断して、退室依頼はleave、無音・雑音・意味不明な認識結果はignore、それ以外の会話はreply。返答は1〜3文で短く。読み上げに不向きなMarkdownやURLを入れない。通話以外の外部操作は実行できないので実行済みと主張しない。' }, ...history, { role: "user", content: text }],
     }), signal: AbortSignal.timeout(llmTimeoutMs),
   });

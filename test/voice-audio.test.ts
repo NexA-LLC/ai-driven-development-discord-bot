@@ -17,3 +17,11 @@ it("executes the model's structured reply or leave decision, rejecting invalid o
   expect(() => parseVoiceDecision('{"action":"ban","text":"done"}')).toThrow();
   expect(() => parseVoiceDecision('{"action":"reply","text":""}')).toThrow();
 });
+it("uses the deployed provider's supported strict JSON schema response format", async () => {
+  const { VOICE_RESPONSE_FORMAT } = await import("../src/gateway/voice-audio.js");
+  expect(VOICE_RESPONSE_FORMAT.type).toBe("json_schema");
+  expect(VOICE_RESPONSE_FORMAT.json_schema.schema.required).toEqual(["action", "text"]);
+  for (const action of VOICE_RESPONSE_FORMAT.json_schema.schema.properties.action.enum) {
+    expect(parseVoiceDecision(JSON.stringify({ action, text: action === "ignore" ? "" : "はい。" })).action).toBe(action);
+  }
+});
