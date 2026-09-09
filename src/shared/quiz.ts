@@ -101,3 +101,29 @@ export function renderQuiz(quiz: QuizDraft): string {
 function truncate(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }
+
+/** Slash commands must never silently substitute the daily default topic. */
+export function buildRequestedQuizPrompt(topic: string | undefined): string {
+  const question = topic?.trim();
+  if (!question) throw new Error("topic を入力してください。例：ClaudeとCodex、どちらが流行る？");
+  if (question.length > 120) throw new Error("topic は120文字以内で入力してください。");
+  return buildQuizPrompt(question) + "\n\n指定テーマ(JSON): " + JSON.stringify(question);
+}
+
+export function parseRequestedQuiz(raw: string, input: string): QuizDraft {
+  const quiz = parseQuiz(raw);
+  const marker = "\n\n指定テーマ(JSON): ";
+  const position = input.lastIndexOf(marker);
+  if (position < 0) return quiz; // Existing queued jobs retain compatibility.
+  const question = JSON.parse(input.slice(position + marker.length)) as string;
+  // Preserve the actual requested wording rather than accepting a model rewrite.
+  quiz.question = question;
+  const names = [...new Set(question.match(/[A-Za-z][A-Za-z0-9.+-]{1,}/g) ?? [])];
+  if (names.length >= 2 && /ど|比較|vs|対|or/i.test(question)) {
+    const choices = quiz.choices.join(" ").toLowerCase();
+    if (names.some(name => !choices.includes(name.toLowerCase()))) {
+      throw new Error("指定された比較対象が選択肢に含まれていません。話題を変えた投票は投稿しません。");
+    }
+  }
+  return quiz;
+}
