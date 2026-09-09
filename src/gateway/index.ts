@@ -370,7 +370,7 @@ async function onMessageImpl(message: Message): Promise<void> {
       if (audioAddressed) {
         if (audioAttachments.length !== 1) throw new Error("音声は1件ずつ送ってください");
         transcript = await transcribeAudio(audioAttachments[0]!);
-        prompt = `${message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim()}\n音声投稿の文字起こし（利用者の発言。聞き間違いの可能性あり）:\n${transcript}\n短く音声でも返答してください。` ;
+        prompt = `${message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim()}\n音声投稿の文字起こし（利用者の発言。聞き間違いの可能性あり）:\n${transcript}` ;
       }
       text = await runMentionAgent(
         prompt,
@@ -420,9 +420,9 @@ async function onMessageImpl(message: Message): Promise<void> {
   
     const files: Array<{ attachment: Buffer | string; name: string; description?: string }> = [];
     if (ok && lethweiReaction) files.push({ attachment: resolve("assets/su-lethwei.webp"), name: "su-lethwei.webp" });
-    if (ok && (speechText || audioAddressed)) {
+    if (ok && speechText) {
       try {
-        const spoken = speechText ?? text.slice(0, 400);
+        const spoken = speechText;
         files.push({ attachment: await synthesizeSpeech(spoken), name: "su-voice.mp3" });
       } catch (error) {
         console.error("speech synthesis failed", error);
