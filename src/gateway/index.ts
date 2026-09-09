@@ -1,3 +1,4 @@
+import { startTyping } from "./typing.js";
 import { seedQuizReactions } from "../shared/quiz-reactions.js";
 import { isQuizPrompt, parseRequestedQuiz, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
 import { readSlot, writeSlot } from "./schedule-state.js";
@@ -319,53 +320,60 @@ async function onMessageImpl(message: Message): Promise<void> {
     message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim() ||
     "この店で何ができますか？";
 
-  const audit = { id: message.id, event: "mention", userId: message.author.id, guildId: message.guildId, channelId: message.channelId };
-  auditConversation({ ...audit, phase: "received", input: message.content });
-  let text: string;
-  let ok = true;
-  const startedAt = Date.now();
-  inFlight += 1;
+  const stopTyping = "sendTyping" in message.channel
+    ? startTyping(message.channel)
+    : () => {};
   try {
-    text = await generateReply("mention", prompt);
-  } catch (error) {
-    console.error("mention reply failed; falling back to the Worker", error);
-    await reportIncident("mention_llm_unreachable", "warning", "メンション: 社内LLMに届かず、Workers AI で代替", String(error));
+    const audit = { id: message.id, event: "mention", userId: message.author.id, guildId: message.guildId, channelId: message.channelId };
+    auditConversation({ ...audit, phase: "received", input: message.content });
+    let text: string;
+    let ok = true;
+    const startedAt = Date.now();
+    inFlight += 1;
     try {
-      const fallback = await postSigned<{ text: string }>("/internal/ask", {
-        prompt,
-        provider: "workers-ai",
-      });
-      text = fallback.text;
-    } catch (fallbackError) {
-      ok = false;
-      console.error("mention fallback failed", fallbackError);
-      await reportIncident("mention_unanswered", "error", "メンションに答えられませんでした", String(fallbackError));
-      text =
-        "すみません、今、答えが作れませんでした。少し時間を置いて、もう一度お願いします。";
+      text = await generateReply("mention", prompt);
+    } catch (error) {
+      console.error("mention reply failed; falling back to the Worker", error);
+      await reportIncident("mention_llm_unreachable", "warning", "メンション: 社内LLMに届かず、Workers AI で代替", String(error));
+      try {
+        const fallback = await postSigned<{ text: string }>("/internal/ask", {
+          prompt,
+          provider: "workers-ai",
+        });
+        text = fallback.text;
+      } catch (fallbackError) {
+        ok = false;
+        console.error("mention fallback failed", fallbackError);
+        await reportIncident("mention_unanswered", "error", "メンションに答えられませんでした", String(fallbackError));
+        text =
+          "すみません、今、答えが作れませんでした。少し時間を置いて、もう一度お願いします。";
+      }
+    } finally {
+      inFlight -= 1;
     }
+  
+    auditConversation({ ...audit, phase: "generated", response: truncate(text, 1_900), ok });
+    const sent = await message.reply({
+      content: truncate(text, 1_900),
+      allowedMentions: {
+        parse: [],
+        repliedUser: false,
+      },
+    });
+    auditConversation({ ...audit, phase: "sent", messageId: sent.id });
+    await logReply({
+      event: "mention",
+      guildId: message.guildId,
+      channelId: message.channelId,
+      messageId: sent.id,
+      requesterUserId: message.author.id,
+      latencyMs: Date.now() - startedAt,
+      ok,
+      replyText: text,
+    });
   } finally {
-    inFlight -= 1;
+    stopTyping();
   }
-
-  auditConversation({ ...audit, phase: "generated", response: truncate(text, 1_900), ok });
-  const sent = await message.reply({
-    content: truncate(text, 1_900),
-    allowedMentions: {
-      parse: [],
-      repliedUser: false,
-    },
-  });
-  auditConversation({ ...audit, phase: "sent", messageId: sent.id });
-  await logReply({
-    event: "mention",
-    guildId: message.guildId,
-    channelId: message.channelId,
-    messageId: sent.id,
-    requesterUserId: message.author.id,
-    latencyMs: Date.now() - startedAt,
-    ok,
-    replyText: text,
-  });
 }
 
 async function resolveOperatorChannels(): Promise<void> {
