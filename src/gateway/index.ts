@@ -1,3 +1,4 @@
+import { postChannelMessage } from "./channel-post.js";
 import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agent.js";
 import { readMentionedChannels } from "./channel-context.js";
 import { startTyping } from "./typing.js";
@@ -349,7 +350,8 @@ async function onMessageImpl(message: Message): Promise<void> {
           if (!answer) throw new Error("Agent LLM returned no message");
           return answer;
         },
-        async (_name, args) => {
+        async (name, args) => {
+          if (name === "post_channel_message") return postChannelMessage(message, args);
           const id = (args as { channel_id?: unknown } | null)?.channel_id;
           const allowed = [...message.content.matchAll(/<#(\d+)>/g)].map(match => match[1]);
           if (typeof id !== "string" || !allowed.includes(id)) throw new Error("ユーザーが今回指定したチャンネルのみ参照できます");
