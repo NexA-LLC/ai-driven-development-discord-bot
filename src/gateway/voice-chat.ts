@@ -1,11 +1,14 @@
 import { AudioPlayerStatus, EndBehaviorType, VoiceConnectionStatus, createAudioPlayer, createAudioResource, entersState, joinVoiceChannel, type AudioReceiveStream, type VoiceConnection } from "@discordjs/voice";
 import { ChannelType, Events, PermissionFlagsBits, type Client, type Message, type VoiceChannel } from "discord.js";
 import OpusScript from "opusscript";
+import { randomUUID } from "node:crypto";
+import { auditConversation } from "./conversation-audit.js";
 import { Readable } from "node:stream";
 import { lifecycle } from "./lifecycle.js";
 import { synthesizeSpeech, transcribeAudioBytes } from "./audio.js";
 import { MAX_VOICE_SECONDS, PCM_BYTES_PER_SECOND, hasSpeechEnergy, pcmToWav, type VoiceDecision } from "./voice-audio.js";
 
+export type VoiceAuditContext = { id: string; event: string; userId: string; guildId: string; channelId: string };
 type History = Array<{ role: "user" | "assistant"; content: string }>;
 type Session = {
   channel: VoiceChannel; connection: VoiceConnection; player: ReturnType<typeof createAudioPlayer>;
@@ -14,7 +17,7 @@ type Session = {
 };
 export class VoiceChat {
   private sessions = new Map<string, Session>();
-  constructor(private client: Client, private answer: (text: string, history: History) => Promise<VoiceDecision>) {
+  constructor(private client: Client, private answer: (text: string, history: History, audit: VoiceAuditContext) => Promise<VoiceDecision>) {
     client.on(Events.VoiceStateUpdate, (_old, current) => {
       const session = this.sessions.get(current.guild.id);
       if (!session) return;
@@ -114,11 +117,16 @@ export class VoiceChat {
           const item = s.pending.shift()!;
           if (!s.users.has(item.userId)) continue;
           let shouldLeave = false;
+          const audit: VoiceAuditContext = { id: randomUUID(), event: "voice", userId: item.userId, guildId: s.channel.guild.id, channelId: s.channel.id };
+          const started = Date.now();
+          auditConversation({ ...audit, phase: "received", input: JSON.stringify({ pcmBytes: item.pcm.length, durationMs: item.pcm.length / PCM_BYTES_PER_SECOND * 1000 }) });
           try {
             const transcript = await transcribeAudioBytes(pcmToWav(item.pcm));
             console.log(`voice stage=transcribed guild=${s.channel.guild.id} characters=${transcript.length}`);
             if (s.closed) break;
-            const result = await this.answer(transcript, s.history);
+            auditConversation({ ...audit, phase: "transcribed", input: transcript });
+            const result = await this.answer(transcript, s.history, audit);
+            auditConversation({ ...audit, phase: "decided", response: JSON.stringify(result) });
             if (s.closed) break;
             console.log(`voice stage=decided guild=${s.channel.guild.id} action=${result.action}`);
             if (result.action === "ignore") continue;
@@ -127,6 +135,7 @@ export class VoiceChat {
             s.history = s.history.slice(-8);
             const audio = await synthesizeSpeech(result.text);
             console.log(`voice stage=synthesized guild=${s.channel.guild.id} audioBytes=${audio.length}`);
+            auditConversation({ ...audit, phase: "synthesized", response: JSON.stringify({ audioBytes: audio.length, elapsedMs: Date.now() - started }) });
             if (s.closed || lifecycle.draining) break;
             // Discard overlapping speech before playback, preventing acoustic feedback.
             s.mutedUntil = Date.now() + 100_000;
@@ -136,10 +145,12 @@ export class VoiceChat {
             try { await entersState(s.player, AudioPlayerStatus.Playing, 10_000); await entersState(s.player, AudioPlayerStatus.Idle, 90_000); }
             finally { s.player.stop(true); resource.playStream.destroy(); s.mutedUntil = Date.now() + 800; }
             s.lastActive = Date.now();
+            auditConversation({ ...audit, phase: "played", ok: true, response: JSON.stringify({ elapsedMs: Date.now() - started }) });
             console.log(`voice reply completed guild=${s.channel.guild.id} audioBytes=${audio.length}`);
             if (result.action === "leave") this.close(s);
           } catch (error) {
             s.player.stop(true); s.mutedUntil = Date.now() + 800;
+            auditConversation({ ...audit, phase: "failed", ok: false, response: error instanceof Error ? error.message : "unknown" });
             console.error("voice turn failed", error instanceof Error ? error.message : "unknown");
             if (!s.closed) await s.channel.send({ content: "すみません、今の音声への返答を完了できませんでした。少し待ってもう一度お願いします。", allowedMentions: { parse: [] } }).catch(() => {});
           } finally { if (shouldLeave) this.close(s); }
