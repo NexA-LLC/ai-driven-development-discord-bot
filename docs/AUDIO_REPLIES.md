@@ -21,3 +21,11 @@ LLMは`speak_reply`を選択して読み上げ文を用意し、nexa-voiceでMP3
 
 202から204のnexa-voiceで生成した挨拶をWhisperで読み戻し、期待する内容になることを確認。
 実ユーザーのDiscord音声添付からの一連の動作は、利用開始後に確認が必要。
+
+## 選定した声: D2
+
+ユーザー選定のD2（Dの声を2.5半音上げた音声）を生成時の参照にする。
+`SU_TTS_REF_AUDIO_PATH` は **nexa-voiceサーバー側** の永続ファイルを指す。
+`SU_TTS_REF_TEXT` に参照音声のセリフ、`SU_TTS_SEED` に生成seedを設定できる。
+202の設定は204の `/Users/buildman/service-runners/su-voice/references/su-D2.mp3` を参照する。
+参照を指定した生成であり、完成した音声の再生速度を毎回変更する仕組みではない。

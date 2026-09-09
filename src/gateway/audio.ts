@@ -36,7 +36,7 @@ export async function synthesizeSpeech(text: string, fetcher: typeof fetch = fet
   const endpoint = process.env.SU_TTS_URL;
   if (!endpoint) throw new Error("音声生成が未設定です");
   if (!text.trim() || text.length > 400) throw new Error("音声返信は400文字以内です");
-  const response = await fetcher(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text, backend: process.env.SU_TTS_BACKEND || "irodori-tts", speaker: process.env.SU_TTS_SPEAKER || "Ono_Anna", instruct: process.env.SU_TTS_INSTRUCT || "落ち着いた若い女性の声。自然で親しみやすい日本語。", language: "Japanese", audio_format: "mp3" }), signal: AbortSignal.timeout(180000) });
+  const response = await fetcher(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text, ...(process.env.SU_TTS_REF_AUDIO_PATH ? { ref_audio_path: process.env.SU_TTS_REF_AUDIO_PATH, ref_text: process.env.SU_TTS_REF_TEXT || undefined } : {}), ...(process.env.SU_TTS_SEED ? { seed: process.env.SU_TTS_SEED } : {}), backend: process.env.SU_TTS_BACKEND || "irodori-tts", speaker: process.env.SU_TTS_SPEAKER || "Ono_Anna", instruct: process.env.SU_TTS_INSTRUCT || "落ち着いた若い女性の声。自然で親しみやすい日本語。", language: "Japanese", audio_format: "mp3" }), signal: AbortSignal.timeout(180000) });
   if (response.ok && !response.headers.get("content-type")?.startsWith("audio/")) throw new Error("音声APIが音声を返しませんでした");
   return boundedAudio(response);
 }

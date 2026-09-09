@@ -30,3 +30,12 @@ it("returns generated audio with the configured speaker", async () => {
 it("bounds actual downloaded bytes even when metadata is wrong", async () => {
   await expect(boundedAudio(new Response(new Uint8Array(8 * 1024 * 1024 + 1)))).rejects.toThrow("8MB");
 });
+it("passes the operator-selected reference and seed to Nexa Voice", async () => {
+  vi.stubEnv("SU_TTS_URL", "http://tts.test/tts");
+  vi.stubEnv("SU_TTS_REF_AUDIO_PATH", "/references/su-D2.mp3");
+  vi.stubEnv("SU_TTS_REF_TEXT", "いらっしゃいませ。");
+  vi.stubEnv("SU_TTS_SEED", "24104");
+  const fetcher = vi.fn().mockResolvedValue(new Response("mp3", { headers: { "content-type": "audio/mpeg" } }));
+  await synthesizeSpeech("今日もよろしくお願いします。", fetcher);
+  expect(JSON.parse(fetcher.mock.calls[0][1].body)).toMatchObject({ ref_audio_path: "/references/su-D2.mp3", ref_text: "いらっしゃいませ。", seed: "24104" });
+});
