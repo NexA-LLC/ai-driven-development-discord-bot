@@ -33,6 +33,26 @@ export interface DiscordCommandDefinition {
 
 export const discordCommands: DiscordCommandDefinition[] = [
   {
+    name: "quiz",
+    description: "スーが4択クイズを出します。正解と解説はネタバレ表示で確認",
+    integration_types: [GUILD_INSTALL, USER_INSTALL],
+    contexts: sharedContexts,
+    options: [
+      {
+        type: STRING,
+        name: "topic",
+        description: "出題テーマ（省略するとAI・プログラミングの基礎）",
+        required: false,
+      },
+      {
+        type: BOOLEAN,
+        name: "public",
+        description: "サーバー内でクイズを公開する（既定は自分だけ）",
+        required: false,
+      },
+    ],
+  },
+  {
     name: "ask",
     description: "レジ横で相談。答えと、次に取れる一手を返します",
     integration_types: [GUILD_INSTALL, USER_INSTALL],

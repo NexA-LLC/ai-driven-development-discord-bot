@@ -4,6 +4,7 @@ import {
   type AgentPassport,
 } from "../shared/agent-manifest.js";
 import { discordCommands } from "../shared/commands.js";
+import { buildQuizPrompt } from "../shared/quiz.js";
 import {
   ABOUT_TEXT,
   APP_DESCRIPTION,
@@ -276,6 +277,12 @@ async function handleDiscordInteraction(
   const command = interaction.data?.name;
 
   switch (command) {
+    case "quiz": {
+      const topic = getStringOption(interaction, "topic");
+      const isPublic = getBooleanOption(interaction, "public") ?? false;
+      return startAiJob(interaction, env, context, "ask", buildQuizPrompt(topic), !isPublic);
+    }
+
     case "ask": {
       const prompt = getStringOption(interaction, "prompt");
       const isPublic = getBooleanOption(interaction, "public") ?? false;
