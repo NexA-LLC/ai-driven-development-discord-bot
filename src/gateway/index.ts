@@ -1,5 +1,6 @@
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
+import { auditConversation } from "./conversation-audit.js";
 import { inbox } from "./inbox.js";
 import { createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -28,6 +29,8 @@ interface AiJob {
   application_id: string;
   interaction_token: string;
   ephemeral: number;
+  guild_id?: string | null;
+  requester_user_id?: string | null;
 }
 
 const EPHEMERAL_FLAG = 1 << 6;
@@ -314,6 +317,8 @@ async function onMessageImpl(message: Message): Promise<void> {
     message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim() ||
     "この店で何ができますか？";
 
+  const audit = { id: message.id, event: "mention", userId: message.author.id, guildId: message.guildId, channelId: message.channelId };
+  auditConversation({ ...audit, phase: "received", input: message.content });
   let text: string;
   let ok = true;
   const startedAt = Date.now();
@@ -340,6 +345,7 @@ async function onMessageImpl(message: Message): Promise<void> {
     inFlight -= 1;
   }
 
+  auditConversation({ ...audit, phase: "generated", response: truncate(text, 1_900), ok });
   const sent = await message.reply({
     content: truncate(text, 1_900),
     allowedMentions: {
@@ -347,6 +353,7 @@ async function onMessageImpl(message: Message): Promise<void> {
       repliedUser: false,
     },
   });
+  auditConversation({ ...audit, phase: "sent", messageId: sent.id });
   await logReply({
     event: "mention",
     guildId: message.guildId,
@@ -647,6 +654,8 @@ async function processCommandImpl(command: {
 }
 
 async function processJobImpl(job: AiJob): Promise<void> {
+  const audit = { id: job.id, event: job.input?.startsWith("日本語で4択クイズ") ? "quiz" : job.mode, userId: job.requester_user_id ?? null, guildId: job.guild_id ?? null };
+  auditConversation({ ...audit, phase: "received", input: job.input });
   let text: string;
   const startedAt = Date.now();
   inFlight += 1;
@@ -657,6 +666,7 @@ async function processJobImpl(job: AiJob): Promise<void> {
     }
     text = await generateReply(job.mode, job.input);
   } catch (error) {
+    auditConversation({ ...audit, phase: "generation_failed" });
     inFlight -= 1;
     // Hand the order back: the Worker answers with its fallback model
     // (Workers AI) or apologises itself, so the customer always hears back.
@@ -679,8 +689,11 @@ async function processJobImpl(job: AiJob): Promise<void> {
   inFlight -= 1;
 
   try {
+    auditConversation({ ...audit, phase: "generated", response: truncate(text, 1_900) });
     await sendInteractionFollowUp(job, truncate(text, 1_900));
+    auditConversation({ ...audit, phase: "sent" });
   } catch (error) {
+    auditConversation({ ...audit, phase: "send_failed" });
     console.error(`job ${job.id} follow-up failed`, error);
     await reportIncident("followup_failed", "warning", "Discord への返信送信に失敗", String(error));
     await postSigned("/internal/jobs/complete", {
@@ -694,6 +707,8 @@ async function processJobImpl(job: AiJob): Promise<void> {
 
   await logReply({
     event: job.mode,
+    requesterUserId: job.requester_user_id,
+    guildId: job.guild_id,
     latencyMs: Date.now() - startedAt,
     ok: true,
     replyText: text,

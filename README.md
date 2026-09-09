@@ -173,7 +173,7 @@ Gateway は Discord へ外向き WebSocket 接続し、Worker の注文キュー
 - `ENABLE_MESSAGE_CONTENT_INTENT=false`
 - `MONITORED_CHANNEL_IDS`は明示allowlist
 - AIが他Botの発言へ自動返信しない
-- raw message contentを永続保存しない
+- Gatewayが処理するコマンド・メンションの入力、送信者ID、応答、送信結果を202の `SU_STATE_DIR/conversation-audit` に日別JSONLで30日間保存（ディレクトリ0700・ファイル0600）。生成と送信成功は別イベント。R2転送は未導入。Worker単独の代替応答はこのログの対象外。
 - 自動BAN/Kick/role変更なし
 - high-risk permissionはPassportでblocked
 - Discordデータのmodel trainingをblocked
@@ -219,7 +219,7 @@ staging D1
   -> User Install / Guild Install
   -> Gateway host
   -> /ask /pitch /mention /Warden
-  -> raw本文非保存を確認
+  -> 運営用ログの保存期間・アクセス権を確認
 ```
 
 実行順と依存関係は[`todos.jsonl`](todos.jsonl)を正本にします。
