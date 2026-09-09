@@ -6,6 +6,7 @@ interface AuditEntry {
   id: string;
   event: string;
   phase: string;
+  tool?: string;
   userId: string | null;
   guildId: string | null;
   channelId?: string;

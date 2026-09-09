@@ -10,8 +10,9 @@ export function canShareChannel(source: Pick<TextChannel, "id" | "guild" | "perm
   return !source.permissionOverwrites.cache.some(overwrite => overwrite.deny.any(READ));
 }
 
-export async function readMentionedChannels(message: Message): Promise<{ context: string; status: string; readable: boolean } | null> {
-  const ids = [...new Set([...message.content.matchAll(/<#(\d+)>/g)].map(match => match[1]!))];
+export async function readMentionedChannels(message: Message, selectedIds?: string[]): Promise<{ context: string; status: string; readable: boolean } | null> {
+  const referenced = [...new Set([...message.content.matchAll(/<#(\d+)>/g)].map(match => match[1]!))];
+  const ids = selectedIds ? selectedIds.filter(id => referenced.includes(id)) : referenced;
   if (!ids.length || !message.guild || !message.client.user) return null;
   const entries: Array<Record<string, unknown>> = [];
   const statuses: string[] = [];
@@ -43,11 +44,17 @@ export async function readMentionedChannels(message: Message): Promise<{ context
       const hasText = rows.some(row => row.content.trim());
       readable ||= hasText;
       entries.push({ channel: source.name, channelId: id, scope: "直近20件まで。添付ファイル本文は未取得。", messages: rows });
-      statuses.push(`<#${id}>: ${rows.length}件取得${hasText ? "" : "（本文なし）"}`);
+      statuses.push(channelReadStatus(id, rows.length, hasText));
     } catch {
       statuses.push(`<#${id}>: 履歴の取得に失敗しました。未確認の内容は回答しません。`);
     }
   }
   if (ids.length > 3) statuses.push("参照は1回につき3チャンネルまでです。");
   return { context: JSON.stringify({ sources: entries, status: statuses }), status: statuses.join("\n"), readable };
+}
+
+export function channelReadStatus(id: string, count: number, hasText: boolean): string {
+  if (hasText) return `<#${id}>: チャンネルを閲覧でき、直近${count}件を取得しました。`;
+  if (count === 0) return `<#${id}>: チャンネルにはアクセスできましたが、履歴APIから投稿が返ってきませんでした。`;
+  return `<#${id}>: 投稿${count}件の存在は確認できましたが、本文は取得できていません。添付のみの投稿や、Message Content Intentの設定による制限が考えられます。チャンネルが空とは判断できません。`;
 }
