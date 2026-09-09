@@ -55,3 +55,11 @@ it("routes a voice-channel invitation through the model-selected join tool", asy
   await runMentionAgent("今いるボイスチャンネルに来て", "persona", complete, execute);
   expect(execute).toHaveBeenCalledWith("join_voice_channel", {});
 });
+it("keeps an audio-origin request text-only when the model does not select speech", async () => {
+  const execute = vi.fn();
+  const complete = vi.fn().mockResolvedValue({ role: "assistant", content: "文字でお返事します。" });
+  const input = "音声投稿の文字起こし：文字だけで返答して";
+  expect(await runMentionAgent(input, "persona", complete, execute)).toBe("文字でお返事します。");
+  expect(execute).not.toHaveBeenCalled();
+  expect(complete.mock.calls[0][0][1].content).toBe(input);
+});
