@@ -4,7 +4,7 @@ import {
   type AgentPassport,
 } from "../shared/agent-manifest.js";
 import { discordCommands } from "../shared/commands.js";
-import { buildQuizPrompt } from "../shared/quiz.js";
+import { buildQuizPrompt, isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
 import {
   ABOUT_TEXT,
   APP_DESCRIPTION,
@@ -279,7 +279,7 @@ async function handleDiscordInteraction(
   switch (command) {
     case "quiz": {
       const topic = getStringOption(interaction, "topic");
-      const isPublic = getBooleanOption(interaction, "public") ?? false;
+      const isPublic = getBooleanOption(interaction, "public") ?? true;
       return startAiJob(interaction, env, context, "ask", buildQuizPrompt(topic), !isPublic);
     }
 
@@ -629,13 +629,18 @@ async function generateAndFollowUp(
   await sendFollowUp(interaction, truncate(text, 1_900), ephemeral);
 }
 
-async function callAi(
+async function callAi(env: Env, mode: AskMode, input: string, providerOverride?: string): Promise<string> {
+  const raw = await callRawAi(env, mode, input, providerOverride);
+  return isQuizPrompt(input) ? renderQuiz(parseQuiz(raw)) : raw;
+}
+
+async function callRawAi(
   env: Env,
   mode: "ask" | "pitch",
   input: string,
   providerOverride?: string,
 ): Promise<string> {
-  const systemPrompt = buildSystemPrompt(mode, detectLanguage(input), {
+  const systemPrompt = isQuizPrompt(input) ? QUIZ_SYSTEM_PROMPT : buildSystemPrompt(mode, detectLanguage(input), {
     pitcheeeUrl: env.PITCHEEE_URL,
   });
 

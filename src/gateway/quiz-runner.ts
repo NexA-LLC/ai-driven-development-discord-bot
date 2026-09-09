@@ -1,3 +1,4 @@
+import { buildQuizPrompt, parseQuiz, renderQuiz, type QuizDraft } from "../shared/quiz.js";
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { createHmac } from "node:crypto";
@@ -6,13 +7,6 @@ interface NewsItem {
   title: string;
   link: string;
   publishedAt?: string;
-}
-
-interface QuizDraft {
-  type: "knowledge" | "prediction" | "opinion";
-  question: string;
-  choices: [string, string, string, string];
-  sourceTitle?: string | undefined;
 }
 
 const token = process.env.DISCORD_BOT_TOKEN?.trim() || "";
@@ -118,16 +112,7 @@ async function buildQuiz(today: string): Promise<QuizDraft> {
         "単なる暗記より、何が起きたか・次に何が起きそうか・開発者への影響のどれかを問う。",
       ].join("\n");
 
-  const prompt = [
-    "AI開発者コミュニティ向けの4択クイズ/予測を1問だけ作ってください。",
-    "必ず日本語。回答はDiscordの1️⃣2️⃣3️⃣4️⃣リアクションで行います。",
-    "出力はJSONだけ。Markdownコードブロックは禁止。",
-    'schema: {"type":"knowledge|prediction|opinion","question":"...","choices":["...","...","...","..."],"sourceTitle":"任意"}',
-    "choicesは必ず4個、各40文字以内。questionは120文字以内。",
-    "knowledgeでも正解番号は出力しない。ここでは集合知を取るのが目的。",
-    "predictionは将来に解決可能な問いを優先。opinionは好みではなく実務判断を優先。",
-    material,
-  ].join("\n\n");
+  const prompt = buildQuizPrompt(material);
 
   const raw = await callLlm(prompt);
   return parseQuiz(raw, news);
@@ -215,60 +200,6 @@ async function callLlm(prompt: string): Promise<string> {
     throw new Error("LLM returned no quiz JSON");
   }
   return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-}
-
-function parseQuiz(raw: string, news: NewsItem[]): QuizDraft {
-  const jsonText = raw
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-  const parsed = JSON.parse(jsonText) as Partial<QuizDraft> & { choices?: unknown };
-  const type =
-    parsed.type === "prediction" || parsed.type === "opinion" || parsed.type === "knowledge"
-      ? parsed.type
-      : "prediction";
-  const question = String(parsed.question ?? "").trim();
-  const choices = Array.isArray(parsed.choices)
-    ? parsed.choices.map((value) => String(value).trim()).filter(Boolean)
-    : [];
-  if (!question || choices.length !== 4 || new Set(choices).size !== 4) {
-    throw new Error("quiz JSON was invalid or choices were not unique");
-  }
-  const sourceTitle =
-    typeof parsed.sourceTitle === "string" && parsed.sourceTitle.trim()
-      ? parsed.sourceTitle.trim()
-      : news[0]?.title;
-  return {
-    type,
-    question: truncate(question, 120),
-    choices: choices.map((choice) => truncate(choice, 40)) as [string, string, string, string],
-    sourceTitle,
-  };
-}
-
-function renderQuiz(quiz: QuizDraft): string {
-  const label =
-    quiz.type === "prediction"
-      ? "🔮 今日のAI予測"
-      : quiz.type === "opinion"
-        ? "🧠 今日のAI判断"
-        : "📰 今日のAIクイズ";
-  const lines = [
-    `**${label}**`,
-    "",
-    quiz.question,
-    "",
-    `1️⃣ ${quiz.choices[0]}`,
-    `2️⃣ ${quiz.choices[1]}`,
-    `3️⃣ ${quiz.choices[2]}`,
-    `4️⃣ ${quiz.choices[3]}`,
-    "",
-    "リアクションで1つ選んでください。",
-  ];
-  if (quiz.sourceTitle && quiz.type !== "opinion") {
-    lines.push(`元ネタ: ${truncate(quiz.sourceTitle, 120)}`);
-  }
-  return truncate(lines.join("\n"), 1_900);
 }
 
 async function sendDiscordMessage(

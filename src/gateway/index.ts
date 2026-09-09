@@ -1,3 +1,4 @@
+import { isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { auditConversation } from "./conversation-audit.js";
@@ -654,7 +655,7 @@ async function processCommandImpl(command: {
 }
 
 async function processJobImpl(job: AiJob): Promise<void> {
-  const audit = { id: job.id, event: job.input?.startsWith("日本語で4択クイズ") ? "quiz" : job.mode, userId: job.requester_user_id ?? null, guildId: job.guild_id ?? null };
+  const audit = { id: job.id, event: job.input && isQuizPrompt(job.input) ? "quiz" : job.mode, userId: job.requester_user_id ?? null, guildId: job.guild_id ?? null };
   auditConversation({ ...audit, phase: "received", input: job.input });
   let text: string;
   const startedAt = Date.now();
@@ -716,7 +717,12 @@ async function processJobImpl(job: AiJob): Promise<void> {
   await postSigned("/internal/jobs/complete", { id: job.id, ok: true });
 }
 
-async function generateReply(
+async function generateReply(event: SuEvent, input: string, language = detectLanguage(input)): Promise<string> {
+  const raw = await generateRawReply(event, input, language);
+  return isQuizPrompt(input) ? renderQuiz(parseQuiz(raw)) : raw;
+}
+
+async function generateRawReply(
   event: SuEvent,
   input: string,
   language = detectLanguage(input),
@@ -725,7 +731,7 @@ async function generateReply(
     throw new Error("LLM_API_URL is not configured");
   }
 
-  const systemPrompt = buildSystemPrompt(event, language, { pitcheeeUrl });
+  const systemPrompt = isQuizPrompt(input) ? QUIZ_SYSTEM_PROMPT : buildSystemPrompt(event, language, { pitcheeeUrl });
 
   const headers: Record<string, string> = {
     "content-type": "application/json",

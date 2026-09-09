@@ -52,7 +52,7 @@ AI駆動開発コミュニティ（Discord）のための Discord App / Bot 基�
 
 - `/ask prompt:<内容> [public:true|false]`
 - `/pitch idea:<内容> [public:true|false]`
-- `/quiz [topic:<テーマ>] [public:true|false]` — 4択を1問出題。省略時はAI・プログラミングの基礎。正解と解説はネタバレ表示をタップして確認。既定は自分だけに表示。
+- `/quiz [topic:<テーマ>] [public:true|false]` — 日次クイズと共通の生成・表示処理で、正解のない4択投票を出題。topicの質問を活かして選択肢を作成。既定は公開、リアクションで参加。`public:false` は自分用プレビュー。
 
 `/quiz` は既存の `/ask` と同じAI処理・キューを利用します。日次クイズの投稿時刻や投稿済み状態には影響しません。追加をDiscordへ反映するにはWorkerをデプロイ後、`npm run commands:register` でコマンドを再登録してください。
 - `/agents`
