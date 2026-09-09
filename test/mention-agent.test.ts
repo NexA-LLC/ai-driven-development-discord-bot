@@ -37,3 +37,9 @@ it("executes a model-selected post once and returns its receipt to the model", a
   expect(execute).toHaveBeenCalledTimes(1);
   expect(execute).toHaveBeenCalledWith("post_channel_message", { channel_id: "123", content: "はいさい" });
 });
+it("lets the model select the cosmetic reaction and sees the result before answering", async () => {
+  const complete = vi.fn().mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "r", type: "function", function: { name: "show_lethwei_reaction", arguments: "{}" } }] }).mockResolvedValueOnce({ role: "assistant", content: "その発言はやめてください💢" });
+  const execute = vi.fn().mockResolvedValue({ attachedToReply: true, realAction: false });
+  await runMentionAgent("不適切な発言", "persona", complete, execute);
+  expect(execute).toHaveBeenCalledWith("show_lethwei_reaction", {});
+});
