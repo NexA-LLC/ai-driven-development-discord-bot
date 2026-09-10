@@ -196,7 +196,11 @@ async function callLlm(prompt: string): Promise<string> {
         { role: "user", content: prompt },
       ],
       temperature: 0.6,
-      max_tokens: 700,
+      // Reasoning tokens count against this budget and are not returned as
+      // content, so a model that deliberates for a while can spend the whole
+      // allowance and hand back an empty message. The quiz JSON itself is under
+      // 100 tokens; the headroom is for the thinking in front of it.
+      max_tokens: 2_000,
     }),
     signal: AbortSignal.timeout(llmTimeoutMs),
   });
@@ -204,11 +208,16 @@ async function callLlm(prompt: string): Promise<string> {
     throw new Error(`LLM API returned ${response.status}`);
   }
   const body = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
   };
-  const text = body.choices?.[0]?.message?.content?.trim();
+  const choice = body.choices?.[0];
+  const text = choice?.message?.content?.trim();
   if (!text) {
-    throw new Error("LLM returned no quiz JSON");
+    throw new Error(
+      choice?.finish_reason === "length"
+        ? "LLM spent the whole token budget on reasoning and returned no quiz JSON"
+        : "LLM returned no quiz JSON",
+    );
   }
   return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 }

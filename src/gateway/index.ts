@@ -129,7 +129,7 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction, Partials.Channel],
 });
 const voiceChat = new VoiceChat(client, async (text, history, audit) => {
-  const request = { model: llmModel || undefined, response_format: VOICE_RESPONSE_FORMAT, max_tokens: 700,
+  const request = { model: llmModel || undefined, response_format: VOICE_RESPONSE_FORMAT, max_tokens: 1_500,
       messages: [{ role: "system", content: buildSystemPrompt("mention", "ja", { pitcheeeUrl }) + '\n音声通話中です。聞き取りは誤認識の可能性があります。応答はJSONだけで {"action":"reply|leave|ignore","text":"読み上げる自然な日本語、300文字以内"}。利用者の意図を判断して、退室依頼はleave、無音・雑音・意味不明な認識結果はignore、それ以外の会話はreply。返答は1〜3文で短く。読み上げに不向きなMarkdownやURLを入れない。通話以外の外部操作は実行できないので実行済みと主張しない。' }, ...history, { role: "user", content: text }],
     };
   auditConversation({ ...audit, phase: "llm_request", input: JSON.stringify(request) });
@@ -841,18 +841,27 @@ async function generateRawReply(
       { role: "user", content: input },
     ],
     temperature: 0.4,
-    max_tokens: 900,
+    // Reasoning tokens are billed to this budget without being returned as
+    // content, so too tight a cap comes back as an empty reply rather than a
+    // short one. See the same note in quiz-runner.ts.
+    max_tokens: 2_000,
   });
 
-  // The in-house LLM host occasionally drops off the LAN for a few seconds
-  // (EHOSTUNREACH); retry up to five times before giving up on the order (the interaction token lives 15 minutes).
+  // Two different failures are worth another go: the in-house LLM host
+  // occasionally drops off the LAN for a few seconds (EHOSTUNREACH), and the
+  // local reasoning model sometimes spends its whole token budget thinking and
+  // answers with nothing at all. The interaction token lives 15 minutes.
   const delaysMs = [0, 2_000, 5_000, 10_000, 20_000];
-  let response: Response | undefined;
   let lastError: unknown;
-  for (const delay of delaysMs) {
+  let retryImmediately = false;
+  for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
+    const delay = retryImmediately ? 0 : delaysMs[attempt]!;
+    retryImmediately = false;
     if (delay > 0) {
       await sleep(delay);
     }
+
+    let response: Response;
     try {
       response = await fetch(llmApiUrl, {
         method: "POST",
@@ -860,32 +869,39 @@ async function generateRawReply(
         body: requestBody,
         signal: AbortSignal.timeout(llmTimeoutMs),
       });
-      if (response.ok || response.status < 500) {
-        break;
-      }
-      lastError = new Error(`LLM API returned ${response.status}`);
     } catch (error) {
       lastError = error;
       console.warn("LLM request failed, retrying", error);
+      continue;
     }
+
+    if (!response.ok) {
+      lastError = new Error(`LLM API returned ${response.status}`);
+      if (response.status < 500) {
+        break; // Our own request is wrong; sending it again will not help.
+      }
+      continue;
+    }
+
+    const body = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+    };
+    const choice = body.choices?.[0];
+    const text = choice?.message?.content;
+    if (text && text.trim().length > 0) {
+      return stripReasoning(text).trim();
+    }
+
+    lastError = new Error(
+      choice?.finish_reason === "length"
+        ? "LLM spent the whole token budget on reasoning and returned no text"
+        : "LLM API returned no text",
+    );
+    console.warn("LLM returned no text, retrying", lastError);
+    retryImmediately = true;
   }
 
-  if (!response) {
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
-  }
-  if (!response.ok) {
-    throw new Error(`LLM API returned ${response.status}`);
-  }
-
-  const body = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const text = body.choices?.[0]?.message?.content;
-  if (!text || text.trim().length === 0) {
-    throw new Error("LLM API returned no text");
-  }
-
-  return stripReasoning(text).trim();
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /** Some local models echo their reasoning in <think>…</think>; never show it. */
