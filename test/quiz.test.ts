@@ -52,3 +52,34 @@ it("registers quiz topic as required", async () => {
   const { discordCommands } = await import("../src/shared/commands.js");
   expect(discordCommands.find(c => c.name === "quiz")?.options?.find(o => o.name === "topic")).toMatchObject({ required: true, max_length: 120 });
 });
+
+it("rejects a draft the model wrote in Chinese instead of Japanese", async () => {
+  const { isNonJapanese } = await import("../src/shared/quiz.js");
+  // Posted for real on 2026-09-10 by the daily runner.
+  const chinese = JSON.stringify({
+    type: "opinion",
+    question: "看到‘AI可能导致人类灭绝’的警告，你的态度是？",
+    choices: ["很担心，应暂停研发", "有些担忧，但相信可控", "不太在意，只是炒作", "完全不信，纯属科幻"],
+  });
+  expect(() => parseQuiz(chinese)).toThrow("Japanese");
+  expect(isNonJapanese("看到警告，你的态度是")).toBe(true);
+});
+
+it("keeps Japanese drafts whose choices are kanji-only", () => {
+  const quiz = parseQuiz(JSON.stringify({
+    type: "opinion",
+    question: "生成AIをどのくらい使いますか？",
+    choices: ["毎日", "週数回", "月数回", "未使用"],
+  }));
+  expect(quiz.choices).toEqual(["毎日", "週数回", "月数回", "未使用"]);
+});
+
+it("leaves drafts without kanji alone so product names still work", async () => {
+  const { isNonJapanese } = await import("../src/shared/quiz.js");
+  expect(isNonJapanese("Claude Codex Gemini Copilot")).toBe(false);
+  expect(() => parseQuiz(JSON.stringify({ question: "Which one?", choices: ["Claude", "Codex", "Both", "Neither"] }))).not.toThrow();
+});
+
+it("tells the model to write the quiz in Japanese", () => {
+  expect(buildQuizPrompt("テーマ")).toContain("必ず日本語で書いてください");
+});

@@ -1,6 +1,19 @@
 const DEFAULT_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"] as const;
 const QUIZ_EMOJIS = ["🚀", "📈", "➡️", "📉", "🔥", "🌱", "☕", "🧊", "🦀", "🦐", "🍖", "🐟", "🍎", "🍰", "🍜", "🍚", "🥗", "🍵", "🤝", "⚖️", "🤔", "🙅", "👍", "👎", "❤️", "💤", "💡", "🔧", "💻", "🤖", "🧠", "🎨", "📚", "🔬", "🔒", "🌍", "🏠", "🏢", "💰", "⏰", "⚡", "🐢", "🎯", "🎮", "🎵", "👀", "🛡️", "🧪", "☀️", "🌧️", "🌙", "⭐", "✅", "❌"] as const;
 
+/**
+ * The local model sometimes answers our Japanese prompt entirely in Chinese.
+ * Kana is the reliable separator: Chinese writing has none, and a whole quiz
+ * written in Japanese effectively always contains some. Text with no Han
+ * characters at all (a plain ASCII product name, say) is left alone.
+ */
+const KANA = /[\u3041-\u309F\u30A0-\u30FF]/u;
+const HAN = /[\u3400-\u4DBF\u4E00-\u9FFF]/u;
+
+export function isNonJapanese(text: string): boolean {
+  return HAN.test(text) && !KANA.test(text);
+}
+
 /** Use one validated set for both visible choices and Discord reactions. */
 export function quizEmojis(quiz: { emojis?: unknown }): [string, string, string, string] {
   const values = quiz.emojis;
@@ -12,7 +25,7 @@ export function quizEmojis(quiz: { emojis?: unknown }): [string, string, string,
   return [...DEFAULT_EMOJIS];
 }
 
-export const QUIZ_SYSTEM_PROMPT = "あなたはDiscordコミュニティの編集者。指定された問いを尊重し、投票したくなる4択を作る。正解・解説は付けない。JSON以外を返さない。";
+export const QUIZ_SYSTEM_PROMPT = "あなたはDiscordコミュニティの編集者。指定された問いを尊重し、投票したくなる4択を作る。questionとchoicesは必ず日本語で書く。正解・解説は付けない。JSON以外を返さない。";
 
 export function isQuizPrompt(input: string): boolean {
   return input.startsWith("日本語で4択クイズ/予測/投票を1問だけ作ってください。");
@@ -22,6 +35,7 @@ export function buildQuizPrompt(topic?: string): string {
   return [
     "日本語で4択クイズ/予測/投票を1問だけ作ってください。",
     "日次クイズと同じく、みんなの意見・好み・未来予測を集める投票です。正解・採点・解説・伏せ字は一切出しません。",
+    "questionとchoicesは必ず日本語で書いてください。中国語や英語だけで書かれた出力は破棄されます。製品名・人名などの固有名詞はそのままで構いません。",
     "入力が質問ならその質問をそのままquestionに使ってください。別の話題や知識テストに置き換えないでください。",
     "二者比較ならその2つを最初の選択肢にし、残りは両方・どちらでもないなど重複しない立場にしてください。",
     "人物名だけでも資料を要求せず、その人物についてどれくらい知っているか等の意見・関心を問えます。未確認の経歴や著作を捏造しないでください。",
@@ -58,6 +72,9 @@ export function parseQuiz(raw: string, news: Array<{ title: string }> = []): Qui
     : [];
   if (!question || choices.length !== 4 || new Set(choices).size !== 4) {
     throw new Error("quiz JSON was invalid or choices were not unique");
+  }
+  if (isNonJapanese([question, ...choices].join(" "))) {
+    throw new Error("quiz was not written in Japanese");
   }
   const sourceTitle =
     typeof parsed.sourceTitle === "string" && parsed.sourceTitle.trim()

@@ -114,8 +114,19 @@ async function buildQuiz(today: string): Promise<QuizDraft> {
 
   const prompt = buildQuizPrompt(material);
 
-  const raw = await callLlm(prompt);
-  return parseQuiz(raw, news);
+  // The local model sometimes answers in Chinese or returns unusable JSON, and
+  // parseQuiz rejects both. Retry within this run so one bad draft does not cost
+  // the whole day's quiz; quizForever still re-checks on the next tick.
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return parseQuiz(await callLlm(prompt), news);
+    } catch (error) {
+      lastError = error;
+      console.warn(`quiz draft attempt ${attempt} rejected`, error);
+    }
+  }
+  throw lastError;
 }
 
 async function fetchAiNews(): Promise<NewsItem[]> {
@@ -180,7 +191,7 @@ async function callLlm(prompt: string): Promise<string> {
         {
           role: "system",
           content:
-            "あなたはDiscordコミュニティの編集者。短く、具体的で、4択が重複しない問いを作る。JSON以外を返さない。",
+            "あなたはDiscordコミュニティの編集者。短く、具体的で、4択が重複しない問いを作る。questionとchoicesは必ず日本語で書く。JSON以外を返さない。",
         },
         { role: "user", content: prompt },
       ],
