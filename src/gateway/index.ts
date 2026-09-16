@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { postChannelMessage } from "./channel-post.js";
 import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agent.js";
 import { readMentionedChannels } from "./channel-context.js";
-import { conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
+import { allowsConversationInChannel, conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
 import { ExperienceStore, experienceReference, type ExperienceMemory } from "./experience-memory.js";
 import { ConnpassFeed, eventReference } from "./connpass-feed.js";
 import { deliverMusing } from "./musing.js";
@@ -331,7 +331,14 @@ export async function onMessageImpl(message: Message): Promise<void> {
     return;
   }
   const inMusings = musingsChannelId !== "" && message.channelId === musingsChannelId;
-  if (!inMonitoredChannel && !allowMentionsAnywhere && !inMusings) return;
+  const conversationAllowed = allowsConversationInChannel({
+    channelId: message.channelId,
+    monitoredChannelIds,
+    allowMentionsAnywhere,
+    musingsChannelId,
+    welcomeChannelId,
+  });
+  if (!conversationAllowed) return;
   // Preserve musing-channel feedback without collecting unrelated conversation context.
   if (!message.reference?.messageId && !message.mentions.has(botUser) && !inMusings) return;
   const context = message.reference?.messageId || message.mentions.has(botUser) || message.attachments.size
@@ -356,12 +363,8 @@ export async function onMessageImpl(message: Message): Promise<void> {
   const audioAttachments = [...message.attachments.values()].filter(isAudioAttachment);
   const audioAddressed = audioAttachments.length > 0 && (inMusings || repliedToSu || message.mentions.has(botUser));
   if (!shouldAnswer({ human: !message.author.bot, guildId: message.guildId, primaryGuildId,
-    allowedChannel: inMonitoredChannel || allowMentionsAnywhere || inMusings,
+    allowedChannel: conversationAllowed,
     mentioned: message.mentions.has(botUser), repliedToSu, audioAddressed })) {
-    return;
-  }
-
-  if (!inMonitoredChannel && !allowMentionsAnywhere && !inMusings) {
     return;
   }
 
