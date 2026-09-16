@@ -4,6 +4,14 @@ AI駆動開発コミュニティ（Discord）のための Discord App / Bot 基�
 
 皆で作る Bot です。Issue / PR 歓迎。改善の議論は DecisionGarden「スーの秘密日記」に残します。
 
+### 会話・経験記憶と公開イベント
+
+対応チャンネルでは、メンションだけでなくスーの投稿への通常の返信でも会話を続けます。同じ返信チェーンの最大8件・6時間・5,000文字を参照し、実在する発言から短い経験を抽出します。観察された引用とスーの解釈を分け、関連する会話に最大3件、同じチャンネルの独り言に最大1件を読み戻します。記憶・解析待ちは `SU_STATE_DIR/experiences.json` に最大30日保持します。詳細と削除・再試行の扱いは [実装ノート](docs/EXPERIENCE_AND_EVENTS.md) を参照してください。
+
+AI駆動開発の公開Atom `https://aid.connpass.com/ja.atom` を話題に使えます。`CONNPASS_ENABLED=true` で有効化し、既定は1時間ごとの取得・24時間のキャッシュ有効期限・イベント独り言1日1件です。初回は取り込みのみ。質問には取得済み情報を参照し、新着の独り言には出典URLを必ず添えます。掲載/更新日時を開催日時として扱いません。`CONNPASS_POLL_SECONDS` / `CONNPASS_CACHE_HOURS` / `CONNPASS_DAILY_LIMIT` で調整できます。公開情報はスー自身の体験記憶には登録しません。
+
+本番有効化には、このWorker/Gatewayの反映、永続 `SU_STATE_DIR`、既存のGateway用LLM設定が必要です。DB migrationはありません。DecisionGardenへの経験共有は `EXPERIENCE_PUBLIC_CHANNEL_IDS` に運営が承認した公開チャンネルを指定した場合のみで、公開用の限定された要約と記憶参照キーを送ります。日次統計は別ノードです。この変更のローカル検証だけでは本番反映・Discord送信を意味しません。
+
 > **Status — 2026-09-06:** Worker と D1 は本番に deploy 済み、Discord Application「スー」は AI駆動開発サーバーにインストール済みで、slash command も登録済みです。**Gateway の常駐（社内LLMでの回答）と test channel での E2E はこれから**です。  
 > 現在地の詳細: [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md)
 
@@ -245,7 +253,7 @@ Worker が `POST /api/mcp`（JSON-RPC、`Authorization: Bearer <SU_MCP_TOKEN>`�
 | `su_status` | 直近の返答、待機中の注文、未解決 incident |
 | `su_incidents` / `su_resolve_incident` | incident 一覧・解決 |
 | `su_feedback_recent` | 直近のフィードバック |
-| `su_run_digest` | 改善ダイジェストを今すぐ実行 |
+| `su_run_digest` | 運営統計を保存（経験解析はGatewayの別経路） |
 
 ```bash
 curl -s https://<worker>/api/mcp -H "authorization: Bearer $SU_MCP_TOKEN" -H 'content-type: application/json' \

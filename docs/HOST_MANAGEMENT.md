@@ -53,7 +53,9 @@ replay. This is not an exactly-once or crash-recovery guarantee for claimed D1 j
 
 State lives outside releases at `~/service-runners/su-managed/state`. Scheduled
 musing/digest slots and successful quiz posts persist across restart to suppress
-same-slot repeats. A musing/digest failure after reservation skips that slot.
+same-slot repeats. Musing/digest completion slots now advance only after success;
+failures remain retryable. Event sends have a separate durable pending/unknown
+reservation to prevent resending an uncertain delivery. See EXPERIENCE_AND_EVENTS.md.
 
 The launchd label is `net.nex-a.su.gateway-managed`. Its SSH loopback entrypoint
 preserves the host's local-network permission workaround. A dedicated SSH identity

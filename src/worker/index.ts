@@ -1,4 +1,5 @@
 import { verifyKey } from "discord-interactions";
+import { publicExperienceBody, publicExperienceSchema } from "../shared/public-experience.js";
 import {
   evaluateAgentManifest,
   type AgentPassport,
@@ -211,6 +212,25 @@ export default {
       return handleInternalJobsComplete(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/internal/experiences/sync") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
+      let parsed;
+      try { parsed = publicExperienceSchema.safeParse(JSON.parse(rawBody)); }
+      catch { return json({ error: "invalid_experience" }, 400); }
+      if (!parsed.success || parsed.data.at > Date.now() || parsed.data.at < Date.now() - 30 * 86400_000) return json({ error: "invalid_experience" }, 400);
+      const dg = decisiongarden(env);
+      if (!dg) return json({ synced: false, status: "not_configured" });
+      try {
+        await mcpCall(dg.url, dg.token, "save_memory_node", {
+          gardenId: dg.gardenId, sourceKey: `su-experience:${parsed.data.id}`,
+          source: "ai-driven-development-discord-bot/gateway experience",
+          kind: "knowledge", state: "active", visibility: "garden", ...publicExperienceBody(parsed.data),
+        });
+        return json({ synced: true });
+      } catch { return json({ synced: false, status: "failed" }, 502); }
+    }
+
     if (request.method === "POST" && url.pathname === "/internal/digest/run") {
       const rawBody = await request.text();
       if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
@@ -225,8 +245,8 @@ export default {
       } catch {
         // default window
       }
-      await runImprovementDigest(env, hours);
-      return json({ ok: true, hours });
+      try { return json({ ok: true, hours, ...await runImprovementDigest(env, hours) }); }
+      catch { return json({ ok: false, status: "failed" }, 502); }
     }
 
     return json({ error: "not_found" }, 404);
@@ -1280,6 +1300,7 @@ async function mcpCall(
       method: "tools/call",
       params: { name, arguments: args },
     }),
+    signal: AbortSignal.timeout(15_000),
   });
   let text = await response.text();
   if (text.includes("data:")) {
@@ -1289,18 +1310,33 @@ async function mcpCall(
     throw new Error(`MCP ${name} -> ${response.status}: ${text.slice(0, 200)}`);
   }
   const envelope = JSON.parse(text) as {
-    result?: { content?: Array<{ text?: string }>; isError?: boolean };
+    result?: { content?: Array<{ text?: string }>; isError?: boolean; structuredContent?: unknown };
     error?: { message?: string };
   };
   if (envelope.error) {
     throw new Error(`MCP ${name}: ${envelope.error.message ?? "error"}`);
   }
-  const payload = envelope.result?.content?.[0]?.text ?? "";
-  try {
-    return JSON.parse(payload) as unknown;
-  } catch {
-    return payload;
+  if (!envelope.result || envelope.result.isError) throw new Error(`MCP ${name} failed`);
+  const validated = (value: unknown): unknown => {
+    if (value && typeof value === "object" && "ok" in value && value.ok === false) throw new Error(`MCP ${name} failed`);
+    if (name === "save_memory_node") {
+      const node = (value as { memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown } } | null)?.memoryNode;
+      if (!node || typeof node.id !== "string" || !node.id || node.gardenId !== args.gardenId || node.sourceKey !== args.sourceKey) throw new Error("MCP memory receipt missing or mismatched");
+    }
+    return value;
+  };
+  if (envelope.result.structuredContent !== undefined) {
+    return validated(envelope.result.structuredContent);
   }
+  const payload = envelope.result?.content?.[0]?.text ?? "";
+  if (!payload) throw new Error(`MCP ${name} returned no result`);
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(payload) as unknown;
+  } catch {
+    return validated(payload);
+  }
+  return validated(decoded);
 }
 
 function caseflow(env: Env): { url: string; token: string } | null {
@@ -1478,179 +1514,25 @@ async function handleInquiryStatusCommand(
 }
 
 // ---------------------------------------------------------------------------
-// Improvement loop: daily digest of feedback -> DecisionGarden seed + issue
+// Operational statistics. Sourced experience analysis runs on the Gateway.
 // ---------------------------------------------------------------------------
 
-interface DigestFinding {
-  theme: string;
-  evidence: string[];
-  severity: "low" | "medium" | "high";
-  proposal: string;
-}
-
-async function runImprovementDigest(env: Env, hours = 24): Promise<void> {
-  const since = new Date(Date.now() - hours * 60 * 60 * 1_000).toISOString().replace("T", " ").slice(0, 19);
-  const feedback = await env.DB.prepare(
-    `SELECT kind, content, created_at FROM feedback_logs WHERE created_at >= ? ORDER BY created_at ASC LIMIT 200`,
-  )
-    .bind(since)
-    .all<{ kind: string; content: string | null; created_at: string }>();
-  const replies = await env.DB.prepare(
-    `SELECT event, ok, latency_ms, provider FROM reply_logs WHERE created_at >= ?`,
-  )
-    .bind(since)
-    .all<{ event: string; ok: number; latency_ms: number | null; provider: string | null }>();
-  const incidents = await env.DB.prepare(
-    `SELECT kind, count, summary FROM su_incidents WHERE last_seen_at >= ? AND status = 'open'`,
-  )
-    .bind(since)
-    .all<{ kind: string; count: number; summary: string }>();
-
-  const textual = feedback.results.filter((f) => f.kind !== "reaction" && f.content && f.content.trim().length > 0);
-  const reactions = feedback.results.filter((f) => f.kind === "reaction");
-  const total = replies.results.length;
-  const failed = replies.results.filter((r) => r.ok === 0).length;
-  const avgLatency = total
-    ? Math.round(replies.results.reduce((a, r) => a + (r.latency_ms ?? 0), 0) / total)
-    : 0;
-
-  if (textual.length === 0 && incidents.results.length === 0) {
-    console.log("digest: nothing to analyse");
-    return;
-  }
-
-  let findings: DigestFinding[] = [];
-  if (env.AI && textual.length > 0) {
-    const prompt = [
-      "あなたはDiscord Bot「スー」の改善担当です。以下は直近のユーザーからの返信・感想（スー宛のもの）です。",
-      "この中から「返答がおかしい」「違和感がある」「こうしてほしい」という不満・要望・繰り返される指摘を抽出し、JSON配列で返してください。",
-      '各要素: {"theme": 一言, "evidence": [根拠となる発言の短い引用（最大3件）], "severity": "low"|"medium"|"high", "proposal": 具体的な改善案（プロンプト/実装のどこを直すか）}',
-      "不満や要望が無ければ [] を返してください。JSON以外は出力しないこと。",
-      "",
-      ...textual.map((f) => `- [${f.kind} ${f.created_at}] ${f.content?.replace(/\s+/g, " ").slice(0, 300)}`),
-    ].join("\n");
-    try {
-      const result = (await env.AI.run(
-        (env.AI_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast") as Parameters<Ai["run"]>[0],
-        {
-          messages: [
-            { role: "system", content: "You extract user complaints and turn them into concrete improvement proposals. Output JSON only." },
-            { role: "user", content: prompt },
-          ],
-          max_tokens: 1_200,
-          temperature: 0.2,
-        } as never,
-      )) as { response?: string; choices?: Array<{ message?: { content?: string } }> };
-      const raw = (result.response ?? result.choices?.[0]?.message?.content ?? "").trim();
-      const jsonText = raw.slice(raw.indexOf("["), raw.lastIndexOf("]") + 1);
-      const parsed = JSON.parse(jsonText) as unknown;
-      if (Array.isArray(parsed)) {
-        findings = parsed
-          .filter((f): f is DigestFinding => typeof f === "object" && f !== null && typeof (f as DigestFinding).theme === "string")
-          .slice(0, 8);
-      }
-    } catch (error) {
-      console.error("digest analysis failed", error);
-    }
-  }
-
-  const dateJst = new Date(Date.now() + 9 * 60 * 60 * 1_000).toISOString().slice(0, 10);
-  const statsLine = `返答 ${total} 件（失敗 ${failed}、平均 ${avgLatency}ms）、感想・返信 ${textual.length} 件、リアクション ${reactions.length} 件、未解決 incident ${incidents.results.length} 種`;
-
-  // DecisionGarden: one memory node per day (idempotent via sourceKey), one seed per high finding.
+/** Operational counts only. Experience analysis is durable and uses the Gateway LLM. */
+export async function runImprovementDigest(env: Env, hours = 24): Promise<{ analysis: "not_run"; analysisLocation: "gateway"; statsSynced: boolean }> {
+  const since = new Date(Date.now() - hours * 3600_000).toISOString().replace("T", " ").slice(0, 19);
+  const rows = await env.DB.prepare(
+    "SELECT COUNT(*) AS total, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed FROM reply_logs WHERE created_at >= ?",
+  ).bind(since).first<{ total: number; failed: number | null }>();
+  const dateJst = new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
   const dg = decisiongarden(env);
-  if (dg) {
-    try {
-      await mcpCall(dg.url, dg.token, "save_memory_node", {
-        gardenId: dg.gardenId,
-        sourceKey: `su-digest:${dateJst}`,
-        source: "ai-driven-development-discord-bot/worker improvement digest",
-        kind: "knowledge",
-        state: "active",
-        visibility: "garden",
-        title: `スー 日次ダイジェスト ${dateJst}`,
-        body: [
-          statsLine,
-          "",
-          ...(findings.length
-            ? findings.map((f) => `- [${f.severity}] ${f.theme}: ${f.proposal}`)
-            : ["不満・要望の抽出なし"]),
-          ...(incidents.results.length
-            ? ["", "incident:", ...incidents.results.map((i) => `- ${i.kind} x${i.count}: ${i.summary}`)]
-            : []),
-        ].join("\n"),
-      });
-      for (const f of findings.filter((x) => x.severity === "high")) {
-        await mcpCall(dg.url, dg.token, "save_decision_seed", {
-          gardenId: dg.gardenId,
-          projectKey: "ai-driven-development-discord-bot",
-          decisionQuestion: `スーの改善: ${f.theme}`,
-          customerProblem: f.evidence.join(" / "),
-          hypothesis: f.proposal,
-          evidence: f.evidence.slice(0, 3).map((e) => ({ checkedAt: dateJst, source: "discord feedback_logs", fact: e })),
-          nextStep: "persona.ts か実装を直す PR を出し、次の1週間の feedback で再評価する",
-          status: "open",
-        });
-      }
-    } catch (error) {
-      console.error("digest -> decisiongarden failed", error);
-    }
-  }
-
-  // GitHub: one improvement issue per high finding (Repo Deck picks it up).
-  if (env.GITHUB_TOKEN) {
-    for (const f of findings.filter((x) => x.severity === "high")) {
-      await openImprovementIssue(env, f, dateJst);
-    }
-  }
-
-  // Ops: short summary so humans see the loop turning.
-  if (env.OPS_CHANNEL_ID) {
-    await notifyOps(
-      env,
-      [
-        `📝 **今日のレジ裏ノート（${dateJst}）**`,
-        statsLine,
-        ...(findings.length ? findings.map((f) => `- [${f.severity}] ${f.theme} → ${f.proposal}`) : ["- 不満・要望の抽出なし"]),
-      ].join("\n"),
-    );
-  }
-}
-
-async function openImprovementIssue(env: Env, f: DigestFinding, dateJst: string): Promise<void> {
-  const repo = env.GITHUB_REPO || "NexA-LLC/ai-driven-development-discord-bot";
-  const response = await fetch(`https://api.github.com/repos/${repo}/issues`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${env.GITHUB_TOKEN ?? ""}`,
-      accept: "application/vnd.github+json",
-      "content-type": "application/json",
-      "user-agent": "su-discord-bot-improvement-loop",
-    },
-    body: JSON.stringify({
-      title: `[improve] ${f.theme}`.slice(0, 200),
-      labels: ["improvement", "su"],
-      body: [
-        `ユーザーの返信・感想から抽出した改善点です（${dateJst}、severity: ${f.severity}）。`,
-        "",
-        "## 根拠（ユーザーの発言）",
-        ...f.evidence.map((e) => `- ${e}`),
-        "",
-        "## 提案",
-        f.proposal,
-        "",
-        "## 期待する作業",
-        "1. `src/shared/persona.ts`（口調・場面）か実装のどこを直すか決める",
-        "2. PR を出す（main は PR 必須）",
-        "3. 次の1週間の feedback_logs で再評価する",
-        "",
-        "_opened automatically by the Worker improvement loop_",
-      ].join("\n"),
-    }),
+  if (!dg) return { analysis: "not_run", analysisLocation: "gateway", statsSynced: false };
+  await mcpCall(dg.url, dg.token, "save_memory_node", {
+    gardenId: dg.gardenId, sourceKey: `su-stats:${dateJst}`,
+    source: "ai-driven-development-discord-bot/worker operational statistics",
+    kind: "knowledge", state: "active", visibility: "garden", title: `スー 運営統計 ${dateJst}`,
+    body: `返答 ${rows?.total ?? 0} 件（失敗 ${rows?.failed ?? 0}）。\n経験解析はここでは未実行。Gatewayの経験記憶と個別の su-experience ノードを参照。統計の保存成功は経験解析完了を意味しません。`,
   });
-  if (!response.ok) {
-    console.error("improvement issue failed", response.status, (await response.text()).slice(0, 200));
-  }
+  return { analysis: "not_run", analysisLocation: "gateway", statsSynced: true };
 }
 
 
@@ -1712,7 +1594,7 @@ const MCP_TOOLS = [
   },
   {
     name: "su_run_digest",
-    description: "改善ダイジェストを今すぐ実行する（feedback を要約して秘密日記・Issue・店長室へ）。",
+    description: "日次の運営統計を保存する。経験解析はGatewayの別経路で実行される。",
     inputSchema: { type: "object", properties: { hours: { type: "number" } } },
   },
 ] as const;
@@ -1880,8 +1762,7 @@ async function callSuTool(env: Env, name: string, args: Record<string, unknown>)
     }
     case "su_run_digest": {
       const hours = num(args.hours, 24, 24 * 30);
-      await runImprovementDigest(env, hours);
-      return { ran: true, hours };
+      return { ran: true, hours, ...await runImprovementDigest(env, hours) };
     }
     default:
       throw new Error(`unknown tool: ${name}`);
