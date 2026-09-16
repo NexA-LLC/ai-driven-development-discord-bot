@@ -1,0 +1,93 @@
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Message } from "discord.js";
+
+const mocks = vi.hoisted(() => ({ client: { user: { id: "su" }, on: vi.fn(), once: vi.fn(), login: vi.fn(), channels: { fetch: vi.fn() } }, requests: [] as Array<Record<string, any>>, feedXml: '<feed xmlns="http://www.w3.org/2005/Atom"><title>AI駆動開発</title></feed>' }));
+vi.mock("discord.js", async () => ({ ...await vi.importActual("discord.js"), Client: class { constructor() { return mocks.client; } } }));
+vi.mock("../src/gateway/voice-chat.js", () => ({ VoiceChat: class {} }));
+vi.mock("../src/gateway/conversation-audit.js", () => ({ auditConversation: vi.fn() }));
+vi.mock("../src/gateway/typing.js", () => ({ startTyping: () => () => {} }));
+let gateway: typeof import("../src/gateway/index.js");
+const now = Date.parse("2026-09-16T02:00:00Z");
+const quote = "正解のない4択は用語を分けた方がよい";
+const rows = new Map<string, any>();
+const channel: any = { id: "channel", guildId: "guild", type: 0, permissionsFor: () => ({ has: () => true }),
+  guild: { roles: { everyone: { id: "everyone" } } }, permissionOverwrites: { cache: { some: () => false } },
+  messages: { fetch: vi.fn(async id => { if (typeof id !== "string") return new Map(); if (!rows.has(id)) throw Object.assign(new Error("missing"), { code: 10008 }); return rows.get(id); }) },
+  send: vi.fn(async () => ({ id: "musing-receipt" })) };
+function message(id: string, content: string, author = "human", reference?: string, mentioned = false): Message {
+  const result = { id, content, guildId: "guild", channelId: "channel", createdTimestamp: now - 1000, createdAt: new Date(now - 1000),
+    author: { id: author, bot: author === "su" || author === "another-bot" }, client: mocks.client,
+    channel, guild: { members: { fetch: vi.fn() } }, flags: { has: () => false }, attachments: new Map(),
+    mentions: { has: () => mentioned }, reference: reference ? { messageId: reference, channelId: "channel", guildId: "guild" } : undefined,
+    reply: vi.fn(async () => ({ id: `receipt-${id}` })) };
+  rows.set(id, result); return result as unknown as Message;
+}
+const dir = mkdtempSync(join(tmpdir(), "su-gateway-flow-"));
+beforeAll(async () => {
+  vi.useFakeTimers(); vi.setSystemTime(now);
+  for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test", INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel", LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "true", MUSE_ON_START: "false", EXPERIENCE_PUBLIC_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
+  mocks.client.channels.fetch.mockResolvedValue(channel);
+  vi.stubGlobal("fetch", vi.fn(async (url: string | URL, options: RequestInit) => {
+    if (String(url).includes("aid.connpass.com")) return new Response(mocks.feedXml, { headers: { "content-type": "application/atom+xml" } });
+    if (String(url).includes("worker.test")) return Response.json({ ok: true, synced: true });
+    const request = JSON.parse(options.body as string); mocks.requests.push(request);
+    const extraction = request.messages[0].content.includes("スー宛の実際の会話");
+    return Response.json({ choices: [{ message: { role: "assistant", content: extraction ? JSON.stringify([{ sourceId: "original", quote, interpretation: "クイズと投票を分けて説明する", kind: "discovery" }]) : "正解のない4択は投票として伝えます。" } }] });
+  }));
+  gateway = await import("../src/gateway/index.js");
+});
+afterAll(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+
+it("live handler answers an unmentioned reply with bounded ancestors and later recalls its sourced experience", async () => {
+  message("original", quote, "human", undefined, true);
+  message("su-reply", "用語を分けてみましょう", "su", "original");
+  const reply = message("follow-up", "そう、その呼び方について続けたい", "human", "su-reply");
+  await gateway.onMessageImpl(reply);
+  expect(reply.reply).toHaveBeenCalledOnce();
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain(quote);
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("su-reply");
+  await gateway.experienceTick();
+  const later = message("later", "正解のない4択の用語はどう説明する？", "human", undefined, true);
+  await gateway.onMessageImpl(later);
+  const messages = mocks.requests.at(-1)?.messages;
+  const reference = messages.find((m: any) => m.content.includes("experience_reference"));
+  expect(reference.content).toContain(quote); expect(reference.content).toContain("original"); expect(reference.content).toContain("interpretation");
+  await gateway.postMusingImpl(12, true);
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain(quote);
+  expect(channel.send).toHaveBeenCalledOnce();
+  await gateway.postMusingImpl(18, true);
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).not.toContain(quote);
+});
+it("live handler ignores unrelated messages, bots, DMs, other guilds and non-allowlisted channels", async () => {
+  for (const input of [message("unrelated", "こんにちは"), message("bot", "<@su>", "another-bot", undefined, true),
+    { ...message("dm", "hi", "human", undefined, true), guildId: null },
+    { ...message("other-guild", "hi", "human", undefined, true), guildId: "other" },
+    { ...message("other-channel", "hi", "human", undefined, true), channelId: "other" }]) {
+    await gateway.onMessageImpl(input as Message); expect(input.reply).not.toHaveBeenCalled();
+  }
+});
+it("does not recall on unrelated topics, denied permissions, or deleted/edited sources", async () => {
+  const latest = () => mocks.requests.at(-1)?.messages.find((m: any) => m.content.includes("experience_reference")).content;
+  await gateway.onMessageImpl(message("weather", "今日の天気は？", "human", undefined, true)); expect(latest()).not.toContain(quote);
+  const oldPermissions = channel.permissionsFor;
+  channel.permissionsFor = () => ({ has: () => false });
+  await gateway.onMessageImpl(message("denied", "正解のない4択の用語", "human", undefined, true)); expect(latest()).not.toContain(quote);
+  channel.permissionsFor = oldPermissions;
+  rows.get("original").content = "変更済み";
+  await gateway.onMessageImpl(message("edited", "正解のない4択の用語", "human", undefined, true)); expect(latest()).not.toContain(quote);
+});
+it("live scheduler tick feeds a new Atom event into the real musing and question paths", async () => {
+  vi.setSystemTime(now + 3600_000);
+  mocks.feedXml = '<feed xmlns="http://www.w3.org/2005/Atom"><title>AI駆動開発</title><entry><id>event-new</id><title>AI駆動開発のイベント</title><link href="https://aid.connpass.com/event/407072/"/><published>2026-09-16T02:01:00Z</published><updated>2026-09-16T02:10:00Z</updated><summary>AI開発の工夫を紹介</summary></entry></feed>';
+  await gateway.experienceTick();
+  await gateway.postMusingImpl(12, true);
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("public_event_reference");
+  expect(channel.send.mock.calls.at(-1)?.[0].content).toContain("https://aid.connpass.com/event/407072/");
+  await gateway.onMessageImpl(message("event-question", "connpassのイベントを教えて", "human", undefined, true));
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("407072");
+  await gateway.postMusingImpl(18, true);
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).not.toContain("public_event_reference");
+});

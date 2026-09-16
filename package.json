@@ -26,6 +26,7 @@
     "discord-interactions": "4.4.0",
     "discord.js": "14.27.0",
     "opusscript": "0.0.8",
+    "saxes": "6.0.0",
     "zod": "4.5.4"
   },
   "devDependencies": {
