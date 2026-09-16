@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { conversationContext, shouldAnswer } from "../src/gateway/message-routing.js";
+import { allowsConversationInChannel, conversationContext, shouldAnswer } from "../src/gateway/message-routing.js";
 
 const now = Date.now();
 function fixture() {
@@ -33,4 +33,12 @@ it("fails closed for permissions and separately represents unavailable source co
   channel.permissionsFor = () => ({ has: () => true }); rows.delete("1");
   expect((await conversationContext(first, now)).status).toBe("unavailable");
   expect(shouldAnswer({ human: true, guildId: "guild", primaryGuildId: "guild", allowedChannel: true, mentioned: false, repliedToSu: false, audioAddressed: false })).toBe(false);
+});
+it("allows replies in the configured welcome channel without opening unrelated channels", () => {
+  const config = { monitoredChannelIds: new Set(["monitored"]), allowMentionsAnywhere: false, musingsChannelId: "musings", welcomeChannelId: "welcome" };
+  expect(allowsConversationInChannel({ ...config, channelId: "welcome" })).toBe(true);
+  expect(allowsConversationInChannel({ ...config, channelId: "monitored" })).toBe(true);
+  expect(allowsConversationInChannel({ ...config, channelId: "musings" })).toBe(true);
+  expect(allowsConversationInChannel({ ...config, channelId: "other" })).toBe(false);
+  expect(allowsConversationInChannel({ ...config, allowMentionsAnywhere: true, channelId: "other" })).toBe(true);
 });

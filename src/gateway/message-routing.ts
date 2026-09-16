@@ -48,6 +48,18 @@ export async function conversationContext(message: Message, now = Date.now()): P
   return result;
 }
 
+export function allowsConversationInChannel(input: {
+  channelId: string;
+  monitoredChannelIds: ReadonlySet<string>;
+  allowMentionsAnywhere: boolean;
+  musingsChannelId: string;
+  welcomeChannelId: string;
+}): boolean {
+  return input.allowMentionsAnywhere || input.monitoredChannelIds.has(input.channelId) ||
+    (!!input.musingsChannelId && input.channelId === input.musingsChannelId) ||
+    (!!input.welcomeChannelId && input.channelId === input.welcomeChannelId);
+}
+
 export function shouldAnswer(input: { human: boolean; guildId: string | null; primaryGuildId: string; allowedChannel: boolean; mentioned: boolean; repliedToSu: boolean; audioAddressed: boolean }): boolean {
   return input.human && !!input.guildId && (!input.primaryGuildId || input.guildId === input.primaryGuildId) && input.allowedChannel &&
     (input.mentioned || input.repliedToSu || input.audioAddressed);
