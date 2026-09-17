@@ -14,9 +14,9 @@ Workerの日次digestは `su-stats:<JST日>` の運営統計のみ。Worker AI�
 
 ## connpass
 
-固定 `https://aid.connpass.com/ja.atom` をGatewayが取得する。API/keyは不要。`CONNPASS_ENABLED=false` が既定。poll既定3600秒、キャッシュ24時間、イベント独り言1日1件（JST）。失敗は最大8倍のbackoff。ETag/Last-Modifiedがあれば条件付きGET、304は既存cacheの再検証。失敗/空/未実行を区別する。
+固定 `https://connpass.com/api/v2/events/?subdomain=aid&order=3&count=100` をGatewayが取得する。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`X-API-Key` headerだけで送る。キーをログやstateへ保存しない。`CONNPASS_ENABLED=false` が既定。poll既定3600秒、キャッシュ24時間、イベント独り言1日1件（JST）。失敗は最大8倍のbackoff。ETag/Last-Modifiedがあれば条件付きGET、304は既存cacheの再検証。失敗/空/未実行を区別する。
 
-初回は全件既読にし、過去イベントを投稿しない。その後、ID/正規URLが未見で、掲載日時が初回取り込み以降かつ7日以内のentryだけが独り言候補。日付不明は自発投稿しない。取得済みentryは関連する質問には参照できる。掲載/更新日時は開催日ではない。概要に明記されていない開催日/場所/参加経験を推測しない。
+初回は全件既読にし、過去イベントを投稿しない。その後、ID/正規URLが未見で、更新日時が初回取り込み以降かつ7日以内のeventだけが独り言候補。更新日時不明は自発投稿しない。取得済みeventは関連する質問には参照できる。APIの `started_at` / `ended_at` は開催日時、`updated_at` は更新日時として区別し、場所/参加経験を推測しない。
 
 イベント独り言の材料は公開entryと有限の一般的な興味だけで、私的な経験原文や人名を含めない。生成後にcanonical URLをコードで付ける。送信前にpendingを永続化し、成功receipt後だけspokenにする。明確な4xx拒否は再試行可能、timeout/5xx/再起動途中はunknown/pendingとして保留し、同じentryを自動再送しない。結果不明時の解除UIは未実装で、運営が実Discord receiptとファイルを照合するまで保留する。1日枠には当日の結果不明も含む。経験独り言も結果不明を7日保留して同じ話の連投を抑止する。
 
@@ -26,8 +26,8 @@ Workerの日次digestは `su-stats:<JST日>` の運営統計のみ。Worker AI�
 2. Worker/Gatewayを通常の承認済みリリース手順で反映。DB migrationなし。状態ファイルは遅延作成する。
 3. 永続 `SU_STATE_DIR` と既存 `LLM_API_URL` を設定。1つのstate directoryに1つのGatewayプロセスを前提とする。破損ファイルは自動上書きせず、記憶/feedを安全に無効扱いにする。
 4. データ取扱い告知を確認し、必要な場合だけ公開承認済みchannelを `EXPERIENCE_PUBLIC_CHANNEL_IDS` に設定。private channelは指定しても同期しない。Garden側は既存MCP設定を使用。
-5. Atomを読み取り確認し、`CONNPASS_ENABLED=true` にする。初回は自発投稿なし。取得、解析、公開同期、Discord receiptは別々に確認する。
+5. connpassへAPI利用申請を行い、発行されたkeyをsecret `CONNPASS_API_KEY` に設定する。API取得を確認してから `CONNPASS_ENABLED=true` にする。初回は自発投稿なし。取得、解析、公開同期、Discord receiptは別々に確認する。
 
-このPRの検証はモックと公開Atomの読み取りまで。本番deploy、Gateway再起動、Discordへの投稿、DGへの書込みは行わない。
+このPRの検証はAPI v2レスポンスのモックまで。本番API keyを使った取得、本番deploy、Gateway再起動、Discordへの投稿、DGへの書込みは行わない。
 
 ローカル記憶の上限到達時は古いものから除去する。削除要求はDiscordでの元発言削除で反映し、取得不能な記憶は返答に使わない。生本文を永久保持しない。DGに残る一般化した匿名ノードから、期限切れ/削除された私的原文を復元できない。再起動・複数tickは単一Gateway内で整合し、複数ホストの同時実行は対象外。
