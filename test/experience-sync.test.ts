@@ -330,3 +330,73 @@ it("the Worker cron runs maintenance only and creates no Garden node", async () 
   await Promise.all(waits);
   expect(fetcher).not.toHaveBeenCalled();
 });
+
+// --- A resend after a lost response must reach the Garden's unchanged branch, not stall on conflict ---
+/**
+ * Behaves like the real update_memory_node: equal content is unchanged whatever the token says,
+ * a stale token with different content is updated_at_conflict, and a good write advances updatedAt.
+ */
+function fakeGarden(initial = { title: TITLE, body: "出来事: もとの本文", updatedAt: BASELINE }) {
+  const store = { ...initial };
+  let clock = 0;
+  const calls: Array<{ name: string; arguments: any }> = [];
+  const fetcher = vi.fn().mockImplementation(async (_url: unknown, options: RequestInit) => {
+    const call = JSON.parse(options.body as string).params;
+    calls.push(call);
+    if (call.name === "get_memory_node") return got({ title: store.title, body: store.body, updatedAt: store.updatedAt });
+    if (call.name !== "update_memory_node") throw new Error(`unexpected ${call.name}`);
+    const { title, body, expectedUpdatedAt } = call.arguments;
+    if (title === store.title && body === store.body) {
+      return updated("unchanged", store.body, { title: store.title, updatedAt: store.updatedAt });
+    }
+    if (expectedUpdatedAt !== store.updatedAt) return rpc({ isError: true, content: [{ text: "updated_at_conflict" }] });
+    store.title = title; store.body = body; store.updatedAt = `2026-09-2${++clock}T00:00:00.000Z`;
+    return updated("updated", store.body, { title: store.title, updatedAt: store.updatedAt });
+  });
+  return { store, calls, fetcher };
+}
+
+it("accepts a resend whose first answer was lost, even though the Garden has already moved on", async () => {
+  const garden = fakeGarden();
+  vi.stubGlobal("fetch", garden.fetcher);
+  const at = Date.now() - 1000;
+  const body = update({ at, observation: "投票と呼ぶのが一番わかりやすい" });
+
+  // First attempt really lands: the Garden applies it and its updatedAt advances past our baseline.
+  const first = await worker.fetch(request(body), env as never, {} as never);
+  expect(await first.json()).toMatchObject({ synced: true, operation: "updated" });
+  const applied = garden.store.updatedAt;
+  expect(applied).not.toBe(BASELINE);
+
+  // That answer never reached the Gateway, so it retries with the same stale baseline and same body.
+  const retry = await worker.fetch(request(body), env as never, {} as never);
+  expect(retry.status).toBe(200);
+  expect(await retry.json()).toEqual({ synced: true, operation: "unchanged", updatedAt: applied, nodeId: NODE_ID });
+  // It reached the update tool rather than stopping at a conflict, and wrote nothing new.
+  expect(garden.calls.filter(c => c.name === "update_memory_node")).toHaveLength(2);
+  expect(garden.store.updatedAt).toBe(applied);
+
+  // A third retry is still idempotent.
+  const again = await worker.fetch(request(body), env as never, {} as never);
+  expect(await again.json()).toMatchObject({ synced: true, operation: "unchanged", updatedAt: applied });
+  expect(garden.store.updatedAt).toBe(applied);
+});
+it("still refuses to overwrite when the Garden moved because a person rewrote it", async () => {
+  const garden = fakeGarden();
+  vi.stubGlobal("fetch", garden.fetcher);
+  const at = Date.now() - 1000;
+
+  // Our update lands, then a person edits the node afterwards.
+  await worker.fetch(request(update({ at, observation: "投票と呼ぶのが一番わかりやすい" })), env as never, {} as never);
+  garden.store.body = "店長が全部書き直した本文";
+  garden.store.updatedAt = "2026-09-25T00:00:00.000Z";
+  const before = { ...garden.store };
+
+  // A retry of our own revision must not resolve that by overwriting.
+  const result = await worker.fetch(request(update({ at, observation: "投票と呼ぶのが一番わかりやすい" })), env as never, {} as never);
+  expect(result.status).toBe(409);
+  expect(await result.json()).toEqual({ synced: false, status: "conflict" });
+  expect(garden.store).toEqual(before);
+  // It stopped at the read and never asked the Garden to write.
+  expect(garden.calls.filter(c => c.name === "update_memory_node")).toHaveLength(1);
+});

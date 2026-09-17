@@ -20,7 +20,9 @@ connpass API v2 からAI駆動開発グループ（`subdomain=aid`）のイベ�
 2. **Worker（次）** — `/internal/experiences/sync`（revision 1 は `save_memory_node`、revision 2 以降は `update_memory_node`）、`/internal/experiences/retract`、`/internal/experiences/pull`、`/internal/maintenance/run` が入ります。Garden へのアクセスは、作成時に受け取った node id で `get_memory_node` を1件ずつ呼ぶ形に限定され、Garden 全体の一覧取得は行いません。`/internal/digest/run` は同じ保守処理への互換エイリアスとして残り、`deprecatedAlias: true` を返します。
 3. **Gateway（最後）** — 夜間保守の呼び先が `/internal/maintenance/run` に変わり、`MAINTENANCE_HOUR_JST`（未設定なら `DIGEST_HOUR_JST`）で動きます。`experiences.json` は既存ファイルのまま読めます（新しい項目は既定値で補完）。
 
-**未反映時の挙動**: DecisionGarden が旧版だと、初回作成は成功し、2回目以降の更新は `update_unsupported` として**同期待ち**になります。権限不足（`forbidden` / `insufficient_scope` など）は `not_permitted`、Garden 側で人が編集していた場合は `conflict`、公開済みノードが消えていた場合は `absent` として同様に保留します。いずれも成功扱いにはせず、6時間ごとに再試行し、`syncedRevision` は進めません。人の編集を上書きすることはありません。Worker が旧版だと Gateway の保守呼び出しは互換エイリアス経由で通ります。DecisionGarden 自体が未設定・不調でも会話は継続します。
+**未反映時の挙動**: DecisionGarden が旧版だと、初回作成は成功し、2回目以降の更新は `update_unsupported` として**同期待ち**になります。権限不足（`forbidden` / `insufficient_scope` など）は `not_permitted`、Garden 側で人が編集していた場合は `conflict`、公開済みノードが消えていた場合は `absent` として同様に保留します。いずれも成功扱いにはせず、6時間ごとに再試行し、`syncedRevision` は進めません。人の編集を上書きすることはありません。ただし、Garden 側が動いたのが「自分の更新が適用されたが応答が届かなかった」ためで、保存内容が送ろうとしている内容と完全一致する場合だけは再送を通し、Garden の `unchanged` として決着させます。Worker が旧版だと Gateway の保守呼び出しは互換エイリアス経由で通ります。DecisionGarden 自体が未設定・不調でも会話は継続します。
+
+**取り下げの保全**: 公開済みコピーの取り下げ待ち（tombstone）は容量のために捨てません。未処理が100件に達すると、新しい会話の受け付けと新しい公開を止めて backlog の解消を優先します（原文の30日失効はそのまま進みます）。
 
 **移行**: node id を記録する前に公開されたコピーは更新も取り下げもできないため、`node_unknown` として保留しログに出します（Garden 全体を検索して探すことはしません）。該当は手動で archived+private にするか、30日の失効を待ってください。新規の経験は作成時に node id を受け取るので影響しません。
 

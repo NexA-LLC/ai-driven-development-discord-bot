@@ -35,9 +35,13 @@ HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synce
 
 node id を記録する前に公開されたコピーは、Garden 全体を検索しない限り特定できない。そのため更新も取り下げも行わず `node_unknown` として保留し、手動対応が必要な旨をログに出す。30日で失効するので放置しても消える。
 
-**更新は自分が最後に書いた時点のtoken (`syncedUpdatedAt`) を基準にする。** Worker は毎回 list で読んだ最新の `updatedAt` をそのまま `expectedUpdatedAt` に使うことはしない。基準を持たない場合は書き込まず `awaiting_readback` を返し、先に読み戻しを行う。Garden 側の `updatedAt` が基準と違う場合は「人が編集した」と判断して `conflict` を返し、上書きしない（6時間保留）。公開済みのノードが消えている場合は作り直さず `absent` とする。同じ内容の再送は同じ基準tokenで送られ、Garden 側は `operation:"unchanged"` を返して書き込みを行わない。
+**更新は自分が最後に書いた時点のtoken (`syncedUpdatedAt`) を基準にする。** Worker は読み取った最新の `updatedAt` をそのまま `expectedUpdatedAt` に使うことはしない。基準を持たない場合は書き込まず `awaiting_readback` を返し、先に読み戻しを行う。
 
-記憶が期限切れ・根拠削除で消えたときは、新しい報告を作らずに `/internal/experiences/retract` から `set_memory_node_lifecycle` で archived + private に下げる（可逆・冪等）。200件上限での押し出しも「削除」として同じ retraction を積む。retraction queue は満杯時に古いものを捨てず、新規を拒否してログに残す。history の各revisionは**それぞれの発言時刻**で30日失効するので、新しい返信で記憶全体の寿命が延びても古い引用は残らない。毎分のtickは、公開待ちがなくても最大5件の記憶の根拠存在を確認し、消えた根拠を回収する。
+Garden 側の `updatedAt` が基準と違う場合、**GET で読んだ `title` と `body` が今回書こうとしている内容と完全一致するときに限り**「自分の更新が適用済みで応答だけが失われた再送」と認めて、古い基準のまま `update_memory_node` を送る（Garden は `operation:"unchanged"` を返して何も書かない）。内容が違えば人の編集なので `conflict` を返し、上書きしない（6時間保留）。この分岐がないと、DG が適用済みなのに応答が届かなかった再送が永久に conflict のまま止まる。公開済みのノードが消えている場合は作り直さず `absent` とする。同じ内容の再送は同じ基準tokenで送られ、Garden 側は `operation:"unchanged"` を返して書き込みを行わない。
+
+記憶が期限切れ・根拠削除で消えたときは、新しい報告を作らずに `/internal/experiences/retract` から `set_memory_node_lifecycle` で archived + private に下げる（可逆・冪等）。200件上限での押し出しも「削除」として同じ retraction を積む。
+
+**retraction queue は一件も失わない。** 記憶本体は削除されるので、この tombstone（threadId + nodeId）が公開コピーに到達できる唯一の手段になる。そのため、積んだものを容量のために捨てることは一切しない。代わりに未処理が `RETRACTION_BACKPRESSURE`(100) 件に達したら**新しい会話の受け付けと新しい公開を止める**（backpressure）。公開済み記憶は200件が上限なので、backlog がこれを大きく超えて伸びることはない。原文のTTLは backpressure 中も通常どおり進むので、30日の保持上限は守られる。nodeId を持たない旧コピーは code からは解決できないため backpressure の計算にも drain にも含めず、記録として残したうえでログで手動対応を促す。history の各revisionは**それぞれの発言時刻**で30日失効するので、新しい返信で記憶全体の寿命が延びても古い引用は残らない。毎分のtickは、公開待ちがなくても最大5件の記憶の根拠存在を確認し、消えた根拠を回収する。
 
 Gardenへのアクセスは**作成時に受け取った node id で1件ずつ**行う。`save_memory_node` の receipt から `memoryNode.id` を記憶に保存し、以後の更新・取り下げ・読み戻しはすべて `get_memory_node({nodeId})` で対象を特定する。`list_memory_nodes` による Garden 全体の取得は行わない（他channel・他用途・privateのノードを毎回読まない）。
 

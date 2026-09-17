@@ -1615,8 +1615,11 @@ async function syncPublicExperience(env: Env, item: PublicExperience, baselineUp
     // Without a baseline from our own last write there is nothing to compare a human edit against,
     // so the read-back path has to run first. Overwriting with a freshly read token would erase it.
     if (!baselineUpdatedAt) return json({ synced: false, status: "awaiting_readback" });
-    // The node moved since we last wrote it: a person edited it. Never resolve that by overwriting.
-    if (existing.updatedAt !== baselineUpdatedAt) return json({ synced: false, status: "conflict" }, 409);
+    // The node moved since we last wrote it. If what it now holds is exactly what this request wants
+    // to write, the move was our own earlier update whose answer never got back to us: resending is
+    // safe and the Garden reports it as unchanged. Any other content is a person's edit.
+    const alreadyApplied = existing.title === content.title && existing.body === content.body;
+    if (existing.updatedAt !== baselineUpdatedAt && !alreadyApplied) return json({ synced: false, status: "conflict" }, 409);
     // Only the mutable fields; gardenId/kind/source/sourceKey and state/visibility are rejected by the Garden.
     const receipt = await mcpCall(dg.url, dg.token, "update_memory_node", {
       nodeId, expectedUpdatedAt: baselineUpdatedAt, ...content,
@@ -1673,7 +1676,7 @@ async function pullPublicExperiences(env: Env, wanted: Array<{ threadId: string;
   return json({ status: "ok", covered, notes });
 }
 
-type GardenMemoryNode = { id: string; sourceKey: string; kind: string; state: string; visibility: string; source: string; body: string; updatedAt: string };
+type GardenMemoryNode = { id: string; sourceKey: string; kind: string; state: string; visibility: string; source: string; title: string; body: string; updatedAt: string };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -1698,7 +1701,7 @@ async function getMemoryNode(dg: { url: string; token: string; gardenId: string 
   if (value("id") !== nodeId || value("sourceKey") !== sourceKey || value("kind") !== "knowledge"
     || value("source") !== EXPERIENCE_SOURCE || value("state") !== "active" || value("visibility") !== "garden") return null;
   return { id: nodeId, sourceKey, kind: "knowledge", state: "active", visibility: "garden",
-    source: EXPERIENCE_SOURCE, body: value("body"), updatedAt: value("updatedAt") };
+    source: EXPERIENCE_SOURCE, title: value("title"), body: value("body"), updatedAt: value("updatedAt") };
 }
 
 // ---------------------------------------------------------------------------

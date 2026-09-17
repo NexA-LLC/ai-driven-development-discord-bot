@@ -520,3 +520,73 @@ it("offers no node to read back before anything has been published", async () =>
   expect(store.publishedNodes(20, now)).toEqual([]);
   expect(store.awaitingReadback(now)).toBe(false);
 });
+
+// --- Every published copy must still be reachable for archiving, whatever happens in between ---
+it("loses no public retraction across saturation, expiry, eviction and a restart", async () => {
+  const { store, path } = setup();
+  const kana = [..."アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモ"];
+  const unique = (i: number, salt: number) => {
+    let value = (i * 1000003 + salt * 7919) % 30 ** 6, out = "";
+    for (let k = 0; k < 6; k++) { out += kana[value % kana.length]; value = Math.floor(value / kana.length); }
+    return out;
+  };
+  const nodeOf = (i: number) => `0198f0a1-0000-7000-8000-${String(i).padStart(12, "0")}`;
+  const published = new Map<string, string>();
+
+  // Publish well past the backpressure limit, each with its own node id.
+  const TOTAL = 130;
+  for (let i = 0; i < TOTAL; i++) {
+    const id = `src-${i}`;
+    const text = `${unique(i, 1)}${unique(i, 2)}`;
+    store.enqueue(id, [{ ...source, id, at: now + i, content: text, scopeKey: id }], now + i);
+    await store.analyse(async () => JSON.stringify([{ sourceId: id, quote: text, interpretation: unique(i, 3), kind: "discovery" }]), now + i);
+    await store.review(approve({ observation: `内容${i}についての一般化した気づきをまとめた`, takeaway: `扱い方を見直したい${i}` }), () => true, now + i);
+    const memory = store.list(now + i).find(m => m.sourceId === id);
+    if (!memory) continue;
+    await store.sync(async m => ({ outcome: "synced", nodeId: nodeOf(i), bodyHash: `hash-${i}` }),
+      m => m.sourceId === id, undefined, now + i);
+    if (store.list(now + i).find(m => m.sourceId === id)?.syncedRevision === 1) published.set(memory.threadId, nodeOf(i));
+  }
+  expect(published.size).toBe(TOTAL);
+
+  // Everything expires at once, and the Garden is unreachable the whole time.
+  const dead = vi.fn().mockRejectedValue(new Error("Garden unreachable"));
+  const after = now + TOTAL + RETENTION_MS + 1;
+  store.prune(after);
+  expect(store.list(after)).toEqual([]);
+  await store.sync(vi.fn(), () => true, dead, after);
+  expect(store.pendingRetractions()).toHaveLength(TOTAL); // Nothing was shed to make room.
+
+  // Restart from the same file: the tombstones are durable, not in-memory bookkeeping.
+  const restarted = new ExperienceStore(path);
+  expect(new Set(restarted.pendingRetractions().map(r => r.nodeId))).toEqual(new Set(published.values()));
+  expect(restarted.saturated).toBe(true);
+  // While saturated it refuses new work rather than risking another copy it cannot archive.
+  restarted.enqueue("blocked", [{ ...source, id: "blocked", at: after }], after);
+  expect(restarted.status("blocked")).toBeUndefined();
+
+  // Connectivity returns: drain until the queue is empty and check every id was archived.
+  const archived: string[] = [];
+  const retract = vi.fn(async (entry: { threadId: string; nodeId: string | null }) => { archived.push(entry.nodeId!); return true; });
+  for (let pass = 0; pass < TOTAL && restarted.pendingRetractions().length; pass++) {
+    await restarted.sync(vi.fn(), () => true, retract, after + pass);
+  }
+  expect(restarted.pendingRetractions()).toEqual([]);
+  expect(new Set(archived)).toEqual(new Set(published.values()));
+  expect(archived).toHaveLength(TOTAL);
+  expect(restarted.saturated).toBe(false);
+  // And once drained it accepts conversation again.
+  restarted.enqueue("accepted", [{ ...source, id: "accepted", at: after }], after);
+  expect(restarted.status("accepted")).toBe("pending");
+});
+it("keeps expiry of the original text working while the archive backlog is draining", async () => {
+  const { store } = setup();
+  store.enqueue("event", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  await clear(store);
+  await store.sync(async () => published());
+  // A backlog that cannot drain must not keep private evidence alive past its retention.
+  store.prune(source.at + RETENTION_MS + 1);
+  expect(store.list(source.at + RETENTION_MS + 1)).toEqual([]);
+  expect(store.pendingRetractions()).toHaveLength(1);
+});
