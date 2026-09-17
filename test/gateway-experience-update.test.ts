@@ -9,7 +9,7 @@ import type { Message } from "discord.js";
 const mocks = vi.hoisted(() => ({
   client: { user: { id: "su" }, on: vi.fn(), once: vi.fn(), login: vi.fn(), channels: { fetch: vi.fn() } },
   llm: [] as Array<Record<string, any>>, worker: [] as Array<{ path: string; body: any }>,
-  extraction: "[]", pull: { status: "ok", notes: [] as Array<{ threadId: string; body: string; updatedAt: string }> },
+  extraction: "[]", pull: { status: "ok", covered: [] as string[], notes: [] as Array<{ threadId: string; body: string; updatedAt: string }> },
   // The publication reviewer: a separate pass that rewrites the memory instead of copying it.
   review: JSON.stringify({ publishable: true, summary: { observation: "唯一の正解を決めない四択の呼び方について意見をもらった",
     takeaway: "投票と呼ぶほうが誤解が少ないのかもしれないと考えている", openQuestion: "どう呼べば誤解されにくいのか" } }),
@@ -101,7 +101,7 @@ it("creates one interest, updates the same memory the next day, and publishes on
 
 it("feeds the updated memory and the human Garden edit into the next answer", async () => {
   const threadId = syncCalls()[0]!.body.id as string;
-  mocks.pull = { status: "ok", notes: [{ threadId, body: "店長の補足: 社内では投票と呼ぶ", updatedAt: "2026-09-17T00:00:00.000Z" }] };
+  mocks.pull = { status: "ok", covered: [threadId], notes: [{ threadId, body: "店長の補足: 社内では投票と呼ぶ", updatedAt: "2026-09-17T00:00:00.000Z" }] };
   vi.setSystemTime(day2 + 7200_000);
   await gateway.experienceTick();
   expect(mocks.worker.some(c => c.path === "/internal/experiences/pull")).toBe(true);
@@ -132,7 +132,8 @@ it("never asks the Worker for a daily digest and stops publishing when the sourc
 it("keeps a conflict and an unsupported update honest across the Worker transport", async () => {
   // 409 and 200-with-status must both leave the memory unsynced, not silently retried as generic failure.
   const outcomes = [
-    { response: () => Response.json({ synced: false, status: "conflict" }, { status: 409 }), hold: 3600_000 },
+    // A human edit in the Garden is held as long as a missing tool: both need a person, not a retry.
+    { response: () => Response.json({ synced: false, status: "conflict" }, { status: 409 }), hold: 6 * 3600_000 },
     { response: () => Response.json({ synced: false, status: "update_unsupported" }), hold: 6 * 3600_000 },
   ];
   let clock = day2 + 86400_000;
@@ -161,4 +162,92 @@ it("keeps a conflict and an unsupported update honest across the Worker transpor
   clock += 7 * 3600_000; vi.setSystemTime(clock);
   await gateway.experienceTick();
   expect(syncCalls().length).toBe(before + 1);
+});
+
+it("drops a Garden note the operator took down, and keeps one it could not re-check", async () => {
+  // The earlier deletion test retired the quiz thread, so this runs on the one still remembered.
+  const threadId = syncCalls().at(-1)!.body.id as string;
+  let clock = day2 + 4 * 86400_000;
+  vi.setSystemTime(clock);
+  mocks.pull = { status: "ok", covered: [threadId], notes: [{ threadId, body: "店長の補足: 社内では投票と呼ぶ", updatedAt: "2026-09-17T00:00:00.000Z" }] };
+  await gateway.experienceTick();
+  const withNote = () => {
+    const ref = mocks.llm.at(-1)!.messages.find((m: any) => m.content.includes("experience_reference"))!.content as string;
+    return ref.includes("社内では投票と呼ぶ");
+  };
+  mocks.extraction = "[]";
+  await gateway.onMessageImpl(message("check-1", "登山靴の防水手入れはどうすればいい？", clock - 1000));
+  expect(withNote()).toBe(true);
+
+  // The operator archives or privates the node: the pull still covers the thread but returns no note.
+  clock += 2 * 3600_000; vi.setSystemTime(clock);
+  mocks.pull = { status: "ok", covered: [threadId], notes: [] };
+  await gateway.experienceTick();
+  await gateway.onMessageImpl(message("check-2", "登山靴の防水手入れはどうすればいい？", clock - 1000));
+  expect(withNote()).toBe(false);
+
+  // A failed read is authoritative for nothing and must not erase a note it could not check.
+  clock += 2 * 3600_000; vi.setSystemTime(clock);
+  mocks.pull = { status: "ok", covered: [threadId], notes: [{ threadId, body: "店長の補足: 社内では投票と呼ぶ", updatedAt: "2026-09-18T00:00:00.000Z" }] };
+  await gateway.experienceTick();
+  clock += 2 * 3600_000; vi.setSystemTime(clock);
+  mocks.pull = { status: "failed", covered: [], notes: [] };
+  await gateway.experienceTick();
+  await gateway.onMessageImpl(message("check-3", "登山靴の防水手入れはどうすればいい？", clock - 1000));
+  expect(withNote()).toBe(true);
+});
+
+it("carries its own last-write token and stops publishing when the Garden reports a human edit", async () => {
+  const sent: any[] = [];
+  let clock = day2 + 10 * 86400_000;
+  vi.setSystemTime(clock);
+  // A brand-new thread so this runs from create through update.
+  mocks.extraction = JSON.stringify([{ sourceId: "kettle", quote: "やかんの注ぎ口を掃除する方法を教わった",
+    interpretation: "クエン酸を試したい", kind: "interest" }]);
+  mocks.review = JSON.stringify({ publishable: true, summary: { observation: "湯を沸かす道具の注ぎ口の掃除の仕方を教わった",
+    takeaway: "酸を使う方法を試してみたい", openQuestion: "どのくらいの間隔で掃除するのがよいのか" } });
+  mocks.syncResponse = () => { sent.push("create"); return Response.json({ synced: true, operation: "created" }); };
+  await gateway.onMessageImpl(message("kettle", "やかんの注ぎ口を掃除する方法を教わった", clock - 1000));
+  await gateway.experienceTick();
+  const created = syncCalls().at(-1)!.body;
+  expect(created.revision).toBe(1);
+  expect(created.baselineUpdatedAt).toBeUndefined(); // A create has no prior token to guard.
+
+  // A second revision on a thread with no token yet waits for the read-back rather than overwriting.
+  clock += 86400_000; vi.setSystemTime(clock);
+  mocks.extraction = JSON.stringify([{ sourceId: "kettle-2", quote: "やかんの注ぎ口の掃除はクエン酸より重曹が向いている",
+    interpretation: "酸ではなく重曹を試すことにした", kind: "changed_mind" }]);
+  mocks.review = JSON.stringify({ publishable: true, summary: { observation: "注ぎ口の掃除には別の粉の方が向くと教わった",
+    takeaway: "先に考えていた方法を変えることにした" } });
+  mocks.syncResponse = () => Response.json({ synced: false, status: "awaiting_readback" });
+  await gateway.onMessageImpl(message("kettle-2", "やかんの注ぎ口の掃除はクエン酸より重曹が向いている", clock - 1000));
+  await gateway.experienceTick();
+  expect(syncCalls().at(-1)!.body.revision).toBe(2);
+  expect(syncCalls().at(-1)!.body.baselineUpdatedAt).toBeUndefined();
+
+  // Once a write hands back a token, every later attempt carries it.
+  clock += 3600_000; vi.setSystemTime(clock);
+  mocks.syncResponse = () => Response.json({ synced: true, operation: "updated", updatedAt: "2026-09-30T00:00:00.000Z" });
+  await gateway.experienceTick();
+  expect(syncCalls().at(-1)!.body.baselineUpdatedAt).toBeUndefined(); // This attempt still had none.
+
+  clock += 86400_000; vi.setSystemTime(clock);
+  mocks.extraction = JSON.stringify([{ sourceId: "kettle-3", quote: "やかんの注ぎ口の掃除は重曹を溶かした湯で拭くのがよい",
+    interpretation: "拭き方まで決めた", kind: "discovery" }]);
+  // Deliberately a retelling: sharing a 12-character run with the original would be rejected as a quote.
+  mocks.review = JSON.stringify({ publishable: true, summary: { observation: "粉を湯に溶いてから拭き取るとよいと分かった",
+    takeaway: "手順まで決めておきたい" } });
+  // The Garden says a person edited it since our write: do not resolve that by overwriting.
+  mocks.syncResponse = () => Response.json({ synced: false, status: "conflict" }, { status: 409 });
+  await gateway.onMessageImpl(message("kettle-3", "やかんの注ぎ口の掃除は重曹を溶かした湯で拭くのがよい", clock - 1000));
+  await gateway.experienceTick();
+  const guarded = syncCalls().at(-1)!.body;
+  expect(guarded.revision).toBe(3);
+  expect(guarded.baselineUpdatedAt).toBe("2026-09-30T00:00:00.000Z");
+
+  // It stays unsynced and is not retried inside the hold window.
+  const before = syncCalls().length;
+  clock += 3600_000; vi.setSystemTime(clock);
+  await gateway.experienceTick();
+  expect(syncCalls()).toHaveLength(before);
 });

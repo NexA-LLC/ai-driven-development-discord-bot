@@ -5,21 +5,23 @@ import worker from "../src/worker/index.js";
 afterEach(() => vi.unstubAllGlobals());
 const env = { INTERNAL_SHARED_SECRET: "fixture-secret", DECISIONGARDEN_MCP_TOKEN: "fixture-token", DECISIONGARDEN_GARDEN_ID: "garden" };
 const threadId = "a".repeat(64);
+const NODE_ID = "0198f0a1-1c2d-7e3f-8a4b-5c6d7e8f9a0b";
 const sourceKey = `su-experience:${threadId}`;
 function request(body: unknown, path = "/internal/experiences/sync", signed = true) {
   const raw = JSON.stringify(body); const timestamp = String(Math.floor(Date.now() / 1000));
   return new Request("https://worker.test" + path, { method: "POST", body: raw, headers: { "x-nexa-timestamp": timestamp,
     "x-nexa-signature": signed ? createHmac("sha256", env.INTERNAL_SHARED_SECRET).update(`${timestamp}.${raw}`).digest("hex") : "invalid" } });
 }
+const BASELINE = "2026-09-17T00:00:00.000Z";
 const data = (overrides: Record<string, unknown> = {}) => ({
   id: threadId, revision: 1, at: Date.now() - 1000, topic: "quiz_terminology",
   observation: "正解のない4択は用語を分けた方がよい", takeaway: "クイズと投票を区別して説明したい", ...overrides,
 });
 const rpc = (result: unknown) => Response.json({ result });
 const structured = (value: unknown) => rpc({ structuredContent: value });
-const saved = () => structured({ operation: "created", memoryNode: { id: "node-1", gardenId: "garden", sourceKey } });
+const saved = () => structured({ operation: "created", memoryNode: { id: NODE_ID, gardenId: "garden", sourceKey } });
 const listed = (nodes: unknown[]) => structured({ memoryNodes: nodes });
-const gardenNode = (overrides: Record<string, unknown> = {}) => ({ id: "node-1", gardenId: "garden", sourceKey, kind: "knowledge", state: "active",
+const gardenNode = (overrides: Record<string, unknown> = {}) => ({ id: NODE_ID, gardenId: "garden", sourceKey, kind: "knowledge", state: "active",
   visibility: "garden", source: "ai-driven-development-discord-bot/gateway experience", body: "出来事: もとの本文", updatedAt: "2026-09-17T00:00:00.000Z", ...overrides });
 const args = (fetcher: ReturnType<typeof vi.fn>) => fetcher.mock.calls.map(c => JSON.parse((c[1] as RequestInit).body as string).params);
 
@@ -51,11 +53,11 @@ it("updates the same node in place for a later revision, guarded by expectedUpda
       return updateReceipt("updated", call.body);
     });
   vi.stubGlobal("fetch", fetcher);
-  const result = await worker.fetch(request(data({ revision: 2, observation: "投票と呼ぶのが一番わかりやすい" })), env as never, {} as never);
-  expect(await result.json()).toEqual({ synced: true, operation: "updated" });
+  const result = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE, observation: "投票と呼ぶのが一番わかりやすい" })), env as never, {} as never);
+  expect(await result.json()).toEqual({ synced: true, operation: "updated", updatedAt: BASELINE });
   const calls = args(fetcher);
   expect(calls.map(c => c.name)).toEqual(["list_memory_nodes", "update_memory_node"]);
-  expect(calls[1].arguments).toMatchObject({ nodeId: "node-1", expectedUpdatedAt: "2026-09-17T00:00:00.000Z" });
+  expect(calls[1].arguments).toMatchObject({ nodeId: NODE_ID, expectedUpdatedAt: BASELINE });
   expect(sent[0]).toContain("投票と呼ぶのが一番わかりやすい");
   // Strict schema: provenance and lifecycle fields are rejected by the Garden, so they are never sent.
   expect(Object.keys(calls[1].arguments).sort()).toEqual(["body", "expectedUpdatedAt", "nodeId", "title"]);
@@ -72,8 +74,8 @@ it("accepts operation=unchanged as the applied-retry answer, and rejects a misma
         memoryNode: { ...gardenNode(), body, title: "スーの経験: 正解のない4択の呼び方" } });
     });
   vi.stubGlobal("fetch", ok);
-  expect(await (await worker.fetch(request(data({ revision: 2 })), env as never, {} as never)).json())
-    .toEqual({ synced: true, operation: "unchanged" });
+  expect(await (await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never)).json())
+    .toEqual({ synced: true, operation: "unchanged", updatedAt: BASELINE });
 
   // An acknowledgement that does not prove our content is stored is not a completed sync.
   for (const bad of [
@@ -81,10 +83,11 @@ it("accepts operation=unchanged as the applied-retry answer, and rejects a misma
     structured({ operation: "updated", memoryNode: { ...gardenNode(), body: "誰かが書き換えた別の本文", title: "別" } }),
     structured({ operation: "updated", memoryNode: { ...gardenNode(), gardenId: "other", body } }),
     structured({ memoryNode: { ...gardenNode(), body } }),
+    structured({ operation: "updated", memoryNode: { ...gardenNode(), body, updatedAt: "" } }),
   ]) {
     const fetcher = vi.fn().mockResolvedValueOnce(listed([gardenNode()])).mockResolvedValueOnce(bad);
     vi.stubGlobal("fetch", fetcher);
-    const result = await worker.fetch(request(data({ revision: 2 })), env as never, {} as never);
+    const result = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never);
     expect(result.status).toBe(502);
     expect(await result.json()).toEqual({ synced: false, status: "failed" });
   }
@@ -94,7 +97,7 @@ it("holds on a missing scope or Garden write role instead of retrying it as a tr
     const fetcher = vi.fn().mockResolvedValueOnce(listed([gardenNode()]))
       .mockResolvedValueOnce(rpc({ isError: true, content: [{ text: denial }] }));
     vi.stubGlobal("fetch", fetcher);
-    const result = await worker.fetch(request(data({ revision: 2 })), env as never, {} as never);
+    const result = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never);
     expect(result.status).toBe(403);
     expect(await result.json()).toEqual({ synced: false, status: "not_permitted" });
   }
@@ -107,7 +110,7 @@ it("reports an older Garden without an update tool as waiting, not as a complete
   ]) {
     const fetcher = vi.fn().mockResolvedValueOnce(listed([gardenNode()])).mockResolvedValueOnce(unsupported);
     vi.stubGlobal("fetch", fetcher);
-    const result = await worker.fetch(request(data({ revision: 2 })), env as never, {} as never);
+    const result = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never);
     expect(await result.json()).toEqual({ synced: false, status: "update_unsupported" });
     expect(args(fetcher).some(c => c.name === "save_memory_node")).toBe(false);
   }
@@ -118,7 +121,7 @@ it("surfaces source_key_conflict and version conflict instead of a silent no_cha
     .mockResolvedValueOnce(listed([gardenNode()]))
     .mockResolvedValueOnce(rpc({ isError: true, content: [{ text: "updated_at_conflict" }] }));
   vi.stubGlobal("fetch", fetcher);
-  for (const body of [data(), data({ revision: 4 })]) {
+  for (const body of [data(), data({ revision: 4, baselineUpdatedAt: BASELINE })]) {
     const result = await worker.fetch(request(body), env as never, {} as never);
     expect(result.status).toBe(409);
     expect(await result.json()).toEqual({ synced: false, status: "conflict" });
@@ -142,12 +145,12 @@ it("rejects unsigned, stale, or arbitrary public prose and reports missing DG co
   expect(await result.json()).toEqual({ synced: false, status: "not_configured" });
 });
 it("retracts an expired copy by archiving it private, and treats an absent node as already retracted", async () => {
-  const fetcher = vi.fn().mockResolvedValueOnce(listed([gardenNode()])).mockResolvedValueOnce(structured({ operation: "updated", memoryNode: { id: "node-1" } }))
+  const fetcher = vi.fn().mockResolvedValueOnce(listed([gardenNode()])).mockResolvedValueOnce(structured({ operation: "updated", memoryNode: { id: NODE_ID } }))
     .mockResolvedValueOnce(listed([]));
   vi.stubGlobal("fetch", fetcher);
   const archived = await worker.fetch(request({ threadId }, "/internal/experiences/retract"), env as never, {} as never);
   expect(await archived.json()).toEqual({ retracted: true, status: "archived" });
-  expect(args(fetcher)[1]).toMatchObject({ name: "set_memory_node_lifecycle", arguments: { nodeId: "node-1", state: "archived", visibility: "private" } });
+  expect(args(fetcher)[1]).toMatchObject({ name: "set_memory_node_lifecycle", arguments: { nodeId: NODE_ID, state: "archived", visibility: "private" } });
   const absent = await worker.fetch(request({ threadId }, "/internal/experiences/retract"), env as never, {} as never);
   expect(await absent.json()).toEqual({ retracted: true, status: "absent" });
   expect((await worker.fetch(request({ threadId: "nope" }, "/internal/experiences/retract"), env as never, {} as never)).status).toBe(400);
@@ -207,4 +210,93 @@ it("the Worker cron runs maintenance only and creates no Garden node", async () 
   await worker.scheduled({} as never, { ...env, DB: db } as never, { waitUntil: (p: Promise<unknown>) => waits.push(p) } as never);
   await Promise.all(waits);
   expect(fetcher).not.toHaveBeenCalled();
+});
+
+// --- Lost-update protection: our own last-write token is the only baseline we will write over ---
+it("refuses to overwrite a human Garden edit and never writes with a freshly read token", async () => {
+  // The node moved since our last write: someone edited it. The stale body must survive.
+  const edited = gardenNode({ updatedAt: "2026-09-18T09:00:00.000Z", body: "店長が書き直した本文" });
+  const fetcher = vi.fn().mockResolvedValue(listed([edited]));
+  vi.stubGlobal("fetch", fetcher);
+  const result = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never);
+  expect(result.status).toBe(409);
+  expect(await result.json()).toEqual({ synced: false, status: "conflict" });
+  // Read only. The node's own newer timestamp is never used as permission to overwrite it.
+  expect(args(fetcher).map(c => c.name)).toEqual(["list_memory_nodes"]);
+});
+it("waits for a read-back instead of writing when it holds no baseline of its own", async () => {
+  const fetcher = vi.fn().mockResolvedValue(listed([gardenNode()]));
+  vi.stubGlobal("fetch", fetcher);
+  const result = await worker.fetch(request(data({ revision: 2 })), env as never, {} as never);
+  expect(result.status).toBe(200);
+  expect(await result.json()).toEqual({ synced: false, status: "awaiting_readback" });
+  expect(args(fetcher).map(c => c.name)).toEqual(["list_memory_nodes"]);
+});
+it("retrying the same body reuses the held baseline and asks the Garden for no new write", async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const fetcher = vi.fn().mockImplementation(async (_url: unknown, options: RequestInit) => {
+    const call = JSON.parse(options.body as string).params;
+    if (call.name === "list_memory_nodes") return listed([gardenNode()]);
+    seen.push(call.arguments);
+    // Same content as stored: the Garden reports unchanged and performs no write.
+    return structured({ operation: "unchanged", expectedUpdatedAtMatched: true,
+      memoryNode: { ...gardenNode(), title: call.arguments.title, body: call.arguments.body } });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  // The evidence timestamp is part of the body, and in production it is fixed per memory, so it is
+  // pinned here too: a retry must send a byte-identical body.
+  const at = Date.now() - 1000;
+  for (let i = 0; i < 3; i++) {
+    const result = await worker.fetch(request(data({ revision: 2, at, baselineUpdatedAt: BASELINE })), env as never, {} as never);
+    expect(await result.json()).toEqual({ synced: true, operation: "unchanged", updatedAt: BASELINE });
+  }
+  // Every retry carried the same baseline, so none of them could have been a blind overwrite.
+  expect(seen.every(a => a.expectedUpdatedAt === BASELINE)).toBe(true);
+  expect(new Set(seen.map(a => a.body)).size).toBe(1);
+  expect(args(fetcher).filter(c => c.name === "update_memory_node")).toHaveLength(3);
+});
+it("does not recreate a published node that is gone, and will not conclude it is gone from a partial listing", async () => {
+  const gone = vi.fn().mockResolvedValue(listed([]));
+  vi.stubGlobal("fetch", gone);
+  const absent = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never);
+  expect(await absent.json()).toEqual({ synced: false, status: "absent" });
+  expect(args(gone).some(c => c.name === "save_memory_node")).toBe(false);
+
+  // A listing that admits it is paged proves nothing about absence.
+  const paged = vi.fn().mockResolvedValue(structured({ memoryNodes: [], nextCursor: "more" }));
+  vi.stubGlobal("fetch", paged);
+  const partial = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never);
+  expect(partial.status).toBe(502);
+  expect(await partial.json()).toEqual({ synced: false, status: "failed" });
+});
+it("refuses a node id that is not a UUID rather than sending it to the Garden", async () => {
+  const fetcher = vi.fn().mockResolvedValue(listed([gardenNode({ id: "node-1" })]));
+  vi.stubGlobal("fetch", fetcher);
+  const result = await worker.fetch(request(data({ revision: 2, baselineUpdatedAt: BASELINE })), env as never, {} as never);
+  expect(result.status).toBe(502);
+  expect(args(fetcher).some(c => c.name === "update_memory_node")).toBe(false);
+});
+it("keeps a retraction queued when the listing cannot prove the node is gone", async () => {
+  const paged = vi.fn().mockResolvedValue(structured({ memoryNodes: [], hasMore: true }));
+  vi.stubGlobal("fetch", paged);
+  const result = await worker.fetch(request({ threadId }, "/internal/experiences/retract"), env as never, {} as never);
+  expect(result.status).toBe(502);
+  expect(await result.json()).toEqual({ retracted: false, status: "incomplete_listing" });
+});
+it("tells the caller which threads the read-back is authoritative for", async () => {
+  const other = "e".repeat(64);
+  const fetcher = vi.fn().mockResolvedValue(listed([gardenNode({ body: "店長の補足" })]));
+  vi.stubGlobal("fetch", fetcher);
+  const ok = await worker.fetch(request({ threadIds: [threadId, other] }, "/internal/experiences/pull"), env as never, {} as never);
+  const body = await ok.json() as { status: string; covered: string[]; notes: unknown[] };
+  expect(body.status).toBe("ok");
+  expect(body.covered).toEqual([threadId, other]); // `other` is covered but has no note: it is gone.
+  expect(body.notes).toHaveLength(1);
+
+  // A partial listing is authoritative for nothing, so it clears nothing.
+  const paged = vi.fn().mockResolvedValue(structured({ memoryNodes: [], nextCursor: "x" }));
+  vi.stubGlobal("fetch", paged);
+  const partial = await worker.fetch(request({ threadIds: [threadId] }, "/internal/experiences/pull"), env as never, {} as never);
+  expect(partial.status).toBe(502);
+  expect(await partial.json()).toMatchObject({ status: "incomplete_listing", covered: [] });
 });

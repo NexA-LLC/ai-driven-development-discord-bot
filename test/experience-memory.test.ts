@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ExperienceStore, RETENTION_MS, type ExperienceSource } from "../src/gateway/experience-memory.js";
+import { EDITOR_NOTE_TTL_MS, ExperienceStore, experienceReference, RETENTION_MS, type ExperienceSource } from "../src/gateway/experience-memory.js";
 import { copiesVerbatim, publicExperience, publicExperienceBody, publicExperienceSourceKey, safePublicSummary } from "../src/shared/public-experience.js";
 
 const dirs: string[] = [];
@@ -89,7 +89,7 @@ it("treats an unchanged repeat, a replay and a date-only change as no-op with ze
   store.enqueue("first", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
-  const send = vi.fn().mockResolvedValue("synced" as const);
+  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
   await store.sync(send); expect(send).toHaveBeenCalledOnce();
 
   // Same conversation re-analysed on a later day, producing the same candidate.
@@ -145,8 +145,8 @@ it("expires at original source time, retracts the public copy, and keeps sync ou
   await clear(store);
   // An unavailable or read-only Garden is never recorded as a completed sync.
   const send = vi.fn().mockRejectedValueOnce(new Error("DG failure"))
-    .mockResolvedValueOnce("not_configured" as const).mockResolvedValueOnce("update_unsupported" as const)
-    .mockResolvedValueOnce("conflict" as const).mockResolvedValue("synced" as const);
+    .mockResolvedValueOnce({ outcome: "not_configured" } as const).mockResolvedValueOnce({ outcome: "update_unsupported" } as const)
+    .mockResolvedValueOnce({ outcome: "conflict" } as const).mockResolvedValue({ outcome: "synced" } as const);
   let clock = now;
   for (let i = 0; i < 4; i++) {
     await store.sync(send, () => true, undefined, clock);
@@ -171,8 +171,8 @@ it("expiry retracts instead of writing a fresh node", async () => {
   const { store } = setup(); store.enqueue("event", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
-  await store.sync(async () => "synced");
-  const send = vi.fn().mockResolvedValue("synced" as const);
+  await store.sync(async () => ({ outcome: "synced" }));
+  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
   const retract = vi.fn().mockResolvedValue(true);
   store.prune(source.at + RETENTION_MS + 1);
   await store.sync(send, () => true, retract, source.at + RETENTION_MS + 1);
@@ -198,7 +198,7 @@ it("never publishes an ordinary personal name, even without an honorific", async
   expect(refused.publicReview).toBe("rejected");
   expect(refused.publicSummary).toBeNull();
   expect(publicExperience(refused)).toBeNull();
-  const send = vi.fn().mockResolvedValue("synced" as const);
+  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
   await store.sync(send, () => true, undefined, now);
   expect(send).not.toHaveBeenCalled();
   // And if the reviewer were wrong and carried the name through, the structural gate still refuses.
@@ -210,7 +210,7 @@ it("never publishes private content that was never labelled a secret", async () 
   expect(refused.publicReview).toBe("rejected");
   expect(publicExperience(refused)).toBeNull();
   expect(JSON.stringify(store.list(now))).toContain(privateQuote); // Still remembered privately.
-  const send = vi.fn().mockResolvedValue("synced" as const);
+  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
   await store.sync(send, () => true, undefined, now);
   expect(send).not.toHaveBeenCalled();
 });
@@ -267,7 +267,7 @@ it("retries a reviewer that is unreachable instead of treating it as a refusal",
   expect(store.list(now)[0]!.publicReview).toBe("not_run");
   await store.review(async () => { throw new Error("LLM down"); }, () => true, now + 600_000);
   expect(store.list(now)[0]!.publicReview).toBe("pending");
-  const send = vi.fn().mockResolvedValue("synced" as const);
+  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
   await store.sync(send, () => true, undefined, now + 600_000);
   expect(send).not.toHaveBeenCalled(); // Unknown is not permission to publish.
   await store.review(approve(), () => true, now + 2 * 3600_000);
@@ -280,7 +280,7 @@ it("makes a new revision re-earn its clearance instead of inheriting the old one
   store.enqueue("day-1", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
-  const send = vi.fn().mockResolvedValue("synced" as const);
+  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
   await store.sync(send); expect(send).toHaveBeenCalledOnce();
 
   const later: ExperienceSource = { ...source, id: "source-2", at: now + day, content: "正解のない4択は用語を分けるより、投票と呼ぶのが一番わかりやすい" };
@@ -329,7 +329,7 @@ it("ineligible or failing sync candidates do not starve later memories", async (
   expect(store.list(now)).toHaveLength(12);
   // The gate reviews a few per pass, so run it until every memory has a verdict.
   for (let i = 0; i < 12; i++) await clear(store, approve({ observation: `内容${i}についての一般化した気づきをまとめた`, takeaway: `扱い方を見直したいと考えている${i}` }));
-  const selected = vi.fn().mockResolvedValue("failed" as const);
+  const selected = vi.fn().mockResolvedValue({ outcome: "failed" } as const);
   await store.sync(selected, m => m.sourceId === "source-11");
   expect(selected).toHaveBeenCalledOnce(); expect(selected.mock.calls[0][0].sourceId).toBe("source-11");
   const retry = vi.fn().mockRejectedValue(new Error("DG unavailable"));
@@ -349,4 +349,139 @@ it("never turns a secret-bearing message into a memory or a public copy", async 
     interpretation: "共有された", kind: "discovery" }]), now);
   expect(store.status("mixed")).toBe("failed");
   expect(store.list(now)).toEqual([]);
+});
+
+// --- Review feedback: scope, TTL, eviction and note invalidation ---
+it("clears a cached Garden note once the read-back says that thread no longer has one", async () => {
+  const { store } = setup();
+  store.enqueue("event", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  const threadId = store.list(now)[0]!.threadId;
+  const note = { threadId, body: "店長の補足: 投票で統一", updatedAt: "2026-09-17T00:00:00.000Z" };
+  store.applyEditorNotes([note], [threadId], now);
+  expect(JSON.stringify(store.list(now))).toContain("投票で統一");
+
+  // The person archived or made the node private, so the pull no longer returns it.
+  store.applyEditorNotes([], [threadId], now + 3600_000);
+  expect(store.list(now)[0]!.editorNote).toBeNull();
+  expect(experienceReference(store.list(now), now + 3600_000)).not.toContain("投票で統一");
+
+  // A failed or partial read covers nothing and must not erase what it could not check.
+  store.applyEditorNotes([note], [threadId], now);
+  store.applyEditorNotes([], [], now + 7200_000);
+  expect(store.list(now)[0]!.editorNote?.body).toContain("投票で統一");
+});
+it("stops showing a cached Garden note that has not been re-read within its TTL", async () => {
+  const { store } = setup();
+  store.enqueue("event", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  const threadId = store.list(now)[0]!.threadId;
+  store.applyEditorNotes([{ threadId, body: "店長の補足: 投票で統一", updatedAt: "2026-09-17T00:00:00.000Z" }], [threadId], now);
+  const fresh = experienceReference(store.list(now), now + 3600_000);
+  expect(fresh).toContain("投票で統一");
+  expect(fresh).toContain("editorNoteFetchedAt");
+  // Beyond the TTL the note may already have been taken down, so it is no longer presented as current.
+  expect(experienceReference(store.list(now), now + EDITOR_NOTE_TTL_MS + 1)).not.toContain("投票で統一");
+});
+it("expires each earlier revision on its own evidence, so a fresh reply cannot extend an old quote", async () => {
+  const { store } = setup();
+  const old: ExperienceSource = { ...source, id: "old", at: now, content: `${quote}。面白い発見でした。`, scopeKey: "chain" };
+  store.enqueue("old", [old], now);
+  await store.analyse(async () => JSON.stringify([{ ...candidate, sourceId: "old" }]), now);
+  const later = now + RETENTION_MS - day;
+  const fresh: ExperienceSource = { ...source, id: "fresh", at: later, scopeKey: "chain",
+    content: "正解のない4択は用語を分けるより、投票と呼ぶのが一番わかりやすい" };
+  store.enqueue("fresh", [fresh], later);
+  await store.analyse(async () => JSON.stringify([{ sourceId: "fresh", quote: fresh.content,
+    interpretation: "分け方より呼び方を変える方が伝わると考え直した", kind: "changed_mind" }]), later);
+  expect(store.list(later)[0]!.history).toHaveLength(1);
+
+  // The memory itself lives on the new evidence, but the 30-day-old quote must go.
+  const afterOldExpiry = now + RETENTION_MS + 1;
+  store.prune(afterOldExpiry);
+  const survivor = store.list(afterOldExpiry)[0]!;
+  expect(survivor.revision).toBe(2);
+  expect(survivor.history).toEqual([]);
+  expect(JSON.stringify(store.list(afterOldExpiry))).not.toContain(quote);
+});
+it("retracts the public copy of a memory dropped by the 200-entry cap", async () => {
+  const { store } = setup();
+  // One published memory, then enough newer ones to push it out of the cap.
+  store.enqueue("published", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  await clear(store);
+  await store.sync(async () => ({ outcome: "synced" }));
+  const evicted = store.list(now)[0]!.threadId;
+
+  // Deliberately share no vocabulary, so nothing merges and each one really is a separate memory.
+  const kana = [..."アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモ"];
+  // Multiplying by a prime coprime to 30 is injective mod 30^6, so every index gets its own wording.
+  const unique = (i: number, salt: number) => {
+    let value = (i * 1000003 + salt * 7919) % 30 ** 6, out = "";
+    for (let k = 0; k < 6; k++) { out += kana[value % kana.length]; value = Math.floor(value / kana.length); }
+    return out;
+  };
+  for (let i = 0; i < 205; i++) {
+    const id = `filler-${i}`;
+    const text = `${unique(i, 1)}${unique(i, 2)}`;
+    const filler: ExperienceSource = { ...source, id, at: now + i, content: text, scopeKey: id };
+    store.enqueue(id, [filler], now + i);
+    await store.analyse(async () => JSON.stringify([{ sourceId: id, quote: text, interpretation: unique(i, 3), kind: "discovery" }]), now + i);
+  }
+  expect(store.list(now + 300)).toHaveLength(200);
+  expect(store.list(now + 300).some(m => m.threadId === evicted)).toBe(false);
+  // Eviction is a removal, so the copy that reached the Garden is queued for archiving.
+  const retract = vi.fn().mockResolvedValue(true);
+  await store.sync(vi.fn().mockResolvedValue({ outcome: "failed" }), () => false, retract, now + 300);
+  expect(retract).toHaveBeenCalledWith(evicted);
+});
+it("keeps a different conversation in the same channel out of an unrelated thread", async () => {
+  const { store } = setup();
+  const chain = (id: string, content: string, scopeKey: string, at = now): ExperienceSource =>
+    ({ ...source, id, content, scopeKey, at });
+  const first = chain("a1", `${quote}。面白い発見でした。`, "chain-a");
+  store.enqueue("a", [first], now);
+  await store.analyse(async () => JSON.stringify([{ ...candidate, sourceId: "a1" }]), now);
+
+  // A separate conversation that happens to reuse some of the same words: related, not the same thread.
+  const second = chain("b1", "4択の用語をどう呼ぶかは別として、今日の天気の話をしていた", "chain-b");
+  store.enqueue("b", [second], now);
+  await store.analyse(async () => JSON.stringify([{ sourceId: "b1", quote: second.content,
+    interpretation: "雑談の流れを覚えておく", kind: "discovery" }]), now);
+  expect(store.list(now)).toHaveLength(2);
+
+  // The same conversation continuing does join, on the normal bar.
+  const continued = chain("a2", "正解のない4択は用語を分けるより投票と呼ぶのがわかりやすい", "chain-a", now + day);
+  store.enqueue("a2", [continued], now + day);
+  await store.analyse(async () => JSON.stringify([{ sourceId: "a2", quote: continued.content,
+    interpretation: "呼び方を変える方が伝わる", kind: "changed_mind" }]), now + day);
+  expect(store.list(now + day)).toHaveLength(2);
+  expect(store.list(now + day).find(m => m.scopeKey === "chain-a")!.revision).toBe(2);
+});
+it("holds a publish that has no baseline yet and reports it as awaiting read-back", async () => {
+  const { store } = setup();
+  store.enqueue("event", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  await clear(store);
+  // A create gives no token back, so the first update has nothing to compare against.
+  await store.sync(async () => ({ outcome: "synced" }));
+  expect(store.list(now)[0]!.syncedUpdatedAt).toBeNull();
+
+  const later: ExperienceSource = { ...source, id: "source-2", at: now + day, content: "正解のない4択は用語を分けるより、投票と呼ぶのが一番わかりやすい" };
+  store.enqueue("day-2", [later], now + day);
+  await store.analyse(async () => JSON.stringify([{ sourceId: later.id, quote: later.content,
+    interpretation: "分け方より呼び方を変える方が伝わると考え直した", kind: "changed_mind" }]), now + day);
+  await clear(store, approve({ observation: "呼び分けるより投票と言う方が伝わるという話になった", takeaway: "前の考えを改めた" }), now + day);
+  expect(store.awaitingReadback(now + day)).toBe(true);
+
+  const send = vi.fn().mockResolvedValue({ outcome: "awaiting_readback" } as const);
+  await store.sync(send, () => true, undefined, now + day);
+  expect(send).toHaveBeenCalledOnce();
+  expect(store.list(now + day)[0]!.syncedRevision).toBe(1); // Not settled.
+
+  // Once a write returns a token, the next one can be compared against it.
+  const settled = vi.fn().mockResolvedValue({ outcome: "synced", updatedAt: "2026-09-18T00:00:00.000Z" } as const);
+  await store.sync(settled, () => true, undefined, now + day + 3600_000);
+  expect(store.list(now + day)[0]!.syncedUpdatedAt).toBe("2026-09-18T00:00:00.000Z");
+  expect(store.awaitingReadback(now + day + 3600_000)).toBe(false);
 });

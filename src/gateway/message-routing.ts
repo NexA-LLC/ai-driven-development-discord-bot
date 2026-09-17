@@ -35,7 +35,7 @@ export async function conversationContext(message: Message, now = Date.now()): P
     const content = current.content.slice(0, Math.min(800, budget));
     if (content.trim()) {
       result.sources.unshift({ id: current.id, guildId: message.guildId!, channelId: message.channelId,
-        at: current.createdTimestamp, role: current.author.id === botId ? "su" : "human", content });
+        at: current.createdTimestamp, role: current.author.id === botId ? "su" : "human", content, scopeKey: "" });
       budget -= content.length;
     } else if (i > 0) result.status = "unavailable";
     const ref = current.reference;
@@ -45,6 +45,10 @@ export async function conversationContext(message: Message, now = Date.now()): P
       if (i === 0) result.repliedToSu = current.author.id === botId && current.guildId === message.guildId && current.channelId === message.channelId && !current.flags?.has(64);
     } catch { result.status = "unavailable"; break; }
   }
+  // The oldest reachable ancestor names this conversation. Every source in the chain carries it, so
+  // a memory can be tied to the discussion it came from rather than to the channel as a whole.
+  const scopeKey = result.sources[0]?.id ?? message.id;
+  for (const source of result.sources) source.scopeKey = scopeKey;
   return result;
 }
 

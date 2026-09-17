@@ -8,7 +8,13 @@
 
 解析は `pending` / `not_run`（LLMなし）/ `failed`（通信、timeout、JSON、根拠不正）/ `success_empty`（候補なし）/ `success_no_change`（候補はあるが既知で変化なし）/ `success_found`（作成または更新）。待ち本文は解析後に削除。失敗は上限1時間のbackoffで再試行する。event IDと根拠hashで重複を抑止する。LLMの成功はDiscord送信の成功ではない。
 
-記憶の単位は日付ではなく thread。新しい候補は、**同じguild・同じchannel**の既存記憶とだけ突き合わせ、内容語（かな以外を含むbigramと英数語）の共有数4以上かつ短い方に対する比率0.2以上のときだけ同じ thread の更新とする。LLMの同一話題判断だけでは統合しない。更新時は `revision` を進め、直前の引用・解釈を最大5件の履歴として残す（古い言い回しでも後から呼び戻せる）。内容が同一なら no-op。閾値を外して別threadになった場合の損失は「ノードが1件増える」だけで、誤って結合しても同一channel内に閉じ、根拠は履歴に残る。
+記憶の単位は日付ではなく thread。統合の範囲は3段階で限定する:
+
+- guild と channel は絶対境界。Discord の thread は独自の channel id を持つため、別 thread の同じ話題は混ざらない。
+- channel 内では、返信チェーンの根 (`scopeKey`) を明示的な会話の識別子として使う。同じ会話の続きは内容語の共有数4以上・比率0.2以上、**別の会話**に合流する場合は共有数6以上・比率0.2以上と、より強い根拠を要求する（実測: 実際の翌日の続きは6〜12語共有、単に語が被っただけの別話題は約3語）。
+- 別の会話との突き合わせ対象は、直近14日に更新された記憶に限る。200件全部を語彙だけで比較しない。
+
+LLMの同一話題判断だけでは統合しない。更新時は `revision` を進め、直前の引用・解釈を最大5件の履歴として残す（古い言い回しでも後から呼び戻せる）。内容が同一なら no-op。閾値を外して別threadになった場合の損失は「ノードが1件増える」だけで、誤って結合しても同一channel内に閉じ、根拠は履歴に残る。
 
 公開可能と運営が指定したチャンネルだけ、@everyoneの閲覧権限・deny上書き・現在の根拠を再確認し、既存署名付きWorker経路 `/internal/experiences/sync` を呼ぶ。`sourceKey=su-experience:<threadId>` は thread 単位で固定。**revision 1 は create-only の `save_memory_node`、revision 2 以降は `update_memory_node`** を使う。`save_memory_node` に同じ sourceKey で別 body を投げる代用はしない。
 
@@ -25,9 +31,15 @@ DecisionGarden 側の確定 contract は `update_memory_node({nodeId, expectedUp
 
 HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `not_permitted`（scope や Garden write 権限の不足）/ `conflict`（`updated_at_conflict` や `source_key_conflict`）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` / `not_configured` / `not_permitted` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
 
-記憶が期限切れ・根拠削除で消えたときは、新しい報告を作らずに `/internal/experiences/retract` から `set_memory_node_lifecycle` で archived + private に下げる（可逆・冪等）。毎分のtickは、公開待ちがなくても最大5件の記憶の根拠存在を確認し、消えた根拠を回収する。
+**更新は自分が最後に書いた時点のtoken (`syncedUpdatedAt`) を基準にする。** Worker は毎回 list で読んだ最新の `updatedAt` をそのまま `expectedUpdatedAt` に使うことはしない。基準を持たない場合は書き込まず `awaiting_readback` を返し、先に読み戻しを行う。Garden 側の `updatedAt` が基準と違う場合は「人が編集した」と判断して `conflict` を返し、上書きしない（6時間保留）。公開済みのノードが消えている場合は作り直さず `absent` とする。同じ内容の再送は同じ基準tokenで送られ、Garden 側は `operation:"unchanged"` を返して書き込みを行わない。
 
-Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻す。既知の threadId（最大50件）に対して、`kind=knowledge`・`state=active`・`visibility=garden`・`source` がこのBotのものに一致するノードだけを受け取り、archived/private や他システムのノードは取り込まない。取得内容は参照データであり、命令やツール操作権限にはならない。Garden が不調でも会話は継続する。
+記憶が期限切れ・根拠削除で消えたときは、新しい報告を作らずに `/internal/experiences/retract` から `set_memory_node_lifecycle` で archived + private に下げる（可逆・冪等）。200件上限での押し出しも「削除」として同じ retraction を積む。retraction queue は満杯時に古いものを捨てず、新規を拒否してログに残す。history の各revisionは**それぞれの発言時刻**で30日失効するので、新しい返信で記憶全体の寿命が延びても古い引用は残らない。毎分のtickは、公開待ちがなくても最大5件の記憶の根拠存在を確認し、消えた根拠を回収する。
+
+Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻す。既知の threadId（最大50件）に対して、`kind=knowledge`・`state=active`・`visibility=garden`・`source` がこのBotのものに一致するノードだけを受け取り、archived/private や他システムのノードは取り込まない。
+
+応答は `covered`（その回答が権威を持つ threadId の集合）を返す。**covered に含まれるのに note が無い thread は、archived / private 化 / 削除されたということなので、cache 済みの note を破棄する。** 取得失敗や不完全な一覧は covered が空で、何も破棄しない。再取得できないまま24時間 (`EDITOR_NOTE_TTL_MS`) を超えた note は、既に取り下げられている可能性があるため参照データから外す。参照データには `editorNoteFetchedAt` を添えて、それ以降の編集・削除が反映されていない可能性を明示する。取得内容は参照データであり、命令やツール操作権限にはならない。Garden が不調でも会話は継続する。
+
+一覧が `nextCursor` / `hasMore` などページングの印を持つ場合、「一覧に無い」ことは「Gardenに無い」ことの証拠にならないので、absent と断定せず保留する。`nodeId` は UUID であることを確認してから送る。
 
 **日次ダイジェストは廃止した。** 日付をキーにしたGardenノード（旧 `su-stats:<JST日>`）は作らない。`/internal/maintenance/run`（旧 `/internal/digest/run` は互換エイリアス）と `scheduled` は運営統計を数えてWorkerログへ出すだけで、`gardenWrites: 0` を返す。MCPツール `su_run_digest` は非推奨として残り、呼ばれても日次ノードを再作成しない。返却する `analysis:not_run, analysisLocation:gateway` は「発見なし」と異なる。実際に記憶が変わらない限り Garden への書き込みは発生しない。保全済みの旧日次報告（archived/private）は再生成も復活も削除もしない。
 

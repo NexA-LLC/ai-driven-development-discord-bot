@@ -216,10 +216,16 @@ export default {
       const rawBody = await request.text();
       if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
       let parsed;
-      try { parsed = publicExperienceSchema.safeParse(JSON.parse(rawBody)); }
+      // The Gateway's own last-write token travels alongside, not inside, the strict public payload.
+      let baseline: string | null = null;
+      try {
+        const { baselineUpdatedAt, ...experience } = JSON.parse(rawBody) as Record<string, unknown>;
+        if (typeof baselineUpdatedAt === "string" && baselineUpdatedAt.trim()) baseline = baselineUpdatedAt;
+        parsed = publicExperienceSchema.safeParse(experience);
+      }
       catch { return json({ error: "invalid_experience" }, 400); }
       if (!parsed.success || parsed.data.at > Date.now() || parsed.data.at < Date.now() - 30 * 86400_000) return json({ error: "invalid_experience" }, 400);
-      return syncPublicExperience(env, parsed.data);
+      return syncPublicExperience(env, parsed.data, baseline);
     }
 
     if (request.method === "POST" && url.pathname === "/internal/experiences/retract") {
@@ -1560,7 +1566,7 @@ const EXPERIENCE_SOURCE = "ai-driven-development-discord-bot/gateway experience"
  * One Garden node per experience thread. save_memory_node is create-only and idempotent, so a later
  * revision must go through an update tool; a server without one is reported as waiting, never as synced.
  */
-async function syncPublicExperience(env: Env, item: PublicExperience): Promise<Response> {
+async function syncPublicExperience(env: Env, item: PublicExperience, baselineUpdatedAt: string | null): Promise<Response> {
   const dg = decisiongarden(env);
   if (!dg) return json({ synced: false, status: "not_configured" });
   const sourceKey = publicExperienceSourceKey(item.id);
@@ -1573,8 +1579,12 @@ async function syncPublicExperience(env: Env, item: PublicExperience): Promise<R
     return json({ synced: false, status: "failed" }, 502);
   };
   try {
-    const existing = item.revision > 1 ? await findMemoryNode(dg, sourceKey) : null;
+    const listing = item.revision > 1 || baselineUpdatedAt ? await listMemoryNodes(dg) : null;
+    const existing = listing?.nodes.find(n => n.sourceKey === sourceKey) ?? null;
     if (!existing) {
+      // A node we once published cannot be recreated from here: someone removed it on purpose,
+      // and an incomplete listing is not evidence of removal either.
+      if (baselineUpdatedAt) return json({ synced: false, status: listing?.complete ? "absent" : "failed" }, listing?.complete ? 200 : 502);
       await mcpCall(dg.url, dg.token, "save_memory_node", {
         gardenId: dg.gardenId, sourceKey, source: EXPERIENCE_SOURCE,
         // Open questions stay knowledge. スー never files an operational TODO into the Garden.
@@ -1582,19 +1592,27 @@ async function syncPublicExperience(env: Env, item: PublicExperience): Promise<R
       });
       return json({ synced: true, operation: "created" });
     }
+    // Without a baseline from our own last write there is nothing to compare a human edit against,
+    // so the read-back path has to run first. Overwriting with a freshly read token would erase it.
+    if (!baselineUpdatedAt) return json({ synced: false, status: "awaiting_readback" });
+    // The node moved since we last wrote it: a person edited it. Never resolve that by overwriting.
+    if (existing.updatedAt !== baselineUpdatedAt) return json({ synced: false, status: "conflict" }, 409);
+    if (!UUID.test(existing.id)) throw new McpToolError("other", "MCP node id is not a UUID");
     // Only the mutable fields; gardenId/kind/source/sourceKey and state/visibility are rejected by the Garden.
     const receipt = await mcpCall(dg.url, dg.token, "update_memory_node", {
-      nodeId: existing.id, expectedUpdatedAt: existing.updatedAt, ...content,
-    }) as { operation?: unknown; memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown; title?: unknown; body?: unknown } } | null;
+      nodeId: existing.id, expectedUpdatedAt: baselineUpdatedAt, ...content,
+    }) as { operation?: unknown; memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown; title?: unknown; body?: unknown; updatedAt?: unknown } } | null;
     const node = receipt?.memoryNode;
     // "unchanged" is the Garden's honest answer to a retry of an update that already landed, so it
     // counts as synced; the receipt still has to prove the stored content is the content we sent.
     if ((receipt?.operation !== "updated" && receipt?.operation !== "unchanged") || !node
       || node.id !== existing.id || node.gardenId !== dg.gardenId || node.sourceKey !== sourceKey
-      || node.title !== content.title || node.body !== content.body) {
+      || node.title !== content.title || node.body !== content.body
+      || typeof node.updatedAt !== "string" || !node.updatedAt) {
       throw new McpToolError("other", "MCP update receipt missing or mismatched");
     }
-    return json({ synced: true, operation: receipt.operation });
+    // The receipt's timestamp becomes the next baseline, so the following write can still spot an edit.
+    return json({ synced: true, operation: receipt.operation, updatedAt: node.updatedAt });
   } catch (error) { return fail(error); }
 }
 
@@ -1603,8 +1621,14 @@ async function retractPublicExperience(env: Env, threadId: string): Promise<Resp
   const dg = decisiongarden(env);
   if (!dg) return json({ retracted: false, status: "not_configured" });
   try {
-    const existing = await findMemoryNode(dg, publicExperienceSourceKey(threadId));
-    if (!existing) return json({ retracted: true, status: "absent" });
+    const listing = await listMemoryNodes(dg);
+    const existing = listing.nodes.find(n => n.sourceKey === publicExperienceSourceKey(threadId)) ?? null;
+    if (!existing) {
+      // Missing from a truncated listing is not proof the node is gone; stay queued instead.
+      if (!listing.complete) return json({ retracted: false, status: "incomplete_listing" }, 502);
+      return json({ retracted: true, status: "absent" });
+    }
+    if (!UUID.test(existing.id)) throw new McpToolError("other", "MCP node id is not a UUID");
     await mcpCall(dg.url, dg.token, "set_memory_node_lifecycle", { nodeId: existing.id, state: "archived", visibility: "private" });
     return json({ retracted: true, status: "archived" });
   } catch (error) {
@@ -1618,29 +1642,38 @@ async function pullPublicExperiences(env: Env, threadIds: string[]): Promise<Res
   if (!dg) return json({ status: "not_configured", notes: [] });
   const wanted = new Map(threadIds.map(id => [publicExperienceSourceKey(id), id]));
   try {
-    const nodes = await listMemoryNodes(dg);
-    const notes = nodes
+    const listing = await listMemoryNodes(dg);
+    // A partial listing cannot prove a note is gone, so the caller must not clear anything from it.
+    if (!listing.complete) return json({ status: "incomplete_listing", covered: [], notes: [] }, 502);
+    const notes = listing.nodes
       .filter(n => wanted.has(n.sourceKey) && n.state === "active" && n.kind === "knowledge" && n.source === EXPERIENCE_SOURCE && n.visibility === "garden")
       .map(n => ({ threadId: wanted.get(n.sourceKey)!, body: truncate(n.body, 2_000), updatedAt: n.updatedAt }));
-    return json({ status: "ok", notes });
+    // covered says which threads this answer is authoritative for: anything in it without a note
+    // has been archived, made private, or deleted, and its cached note must be dropped.
+    return json({ status: "ok", covered: threadIds, notes });
   } catch (error) {
-    return json({ status: error instanceof McpToolError && error.kind === "unsupported" ? "unsupported" : "failed", notes: [] }, 502);
+    return json({ status: error instanceof McpToolError && error.kind === "unsupported" ? "unsupported" : "failed", covered: [], notes: [] }, 502);
   }
 }
 
 type GardenMemoryNode = { id: string; sourceKey: string; kind: string; state: string; visibility: string; source: string; body: string; updatedAt: string };
 
-async function listMemoryNodes(dg: { url: string; token: string; gardenId: string }): Promise<GardenMemoryNode[]> {
-  const result = await mcpCall(dg.url, dg.token, "list_memory_nodes", { gardenId: dg.gardenId, kind: "knowledge" });
-  const nodes = (result as { memoryNodes?: unknown } | null)?.memoryNodes;
-  if (!Array.isArray(nodes)) throw new McpToolError("other", "MCP list_memory_nodes returned no list");
-  return nodes.filter((n): n is GardenMemoryNode => !!n && typeof n === "object"
-    && typeof (n as GardenMemoryNode).id === "string" && typeof (n as GardenMemoryNode).sourceKey === "string")
-    .map(n => ({ ...n, body: String(n.body ?? ""), updatedAt: String(n.updatedAt ?? ""), source: String(n.source ?? ""), state: String(n.state ?? ""), kind: String(n.kind ?? ""), visibility: String(n.visibility ?? "") }));
-}
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The confirmed contract returns every node in one answer. If a future server starts paging,
+// these markers appear and "absent from the page" stops meaning "absent from the Garden".
+const PAGINATION_KEYS = ["nextCursor", "cursor", "hasMore", "nextPageToken", "truncated", "total"] as const;
 
-async function findMemoryNode(dg: { url: string; token: string; gardenId: string }, sourceKey: string): Promise<GardenMemoryNode | null> {
-  return (await listMemoryNodes(dg)).find(n => n.sourceKey === sourceKey) ?? null;
+async function listMemoryNodes(dg: { url: string; token: string; gardenId: string }): Promise<{ nodes: GardenMemoryNode[]; complete: boolean }> {
+  const result = await mcpCall(dg.url, dg.token, "list_memory_nodes", { gardenId: dg.gardenId, kind: "knowledge" }) as Record<string, unknown> | null;
+  const nodes = result?.memoryNodes;
+  if (!Array.isArray(nodes)) throw new McpToolError("other", "MCP list_memory_nodes returned no list");
+  const complete = !!result && !PAGINATION_KEYS.some(key => result[key] !== undefined);
+  return {
+    complete,
+    nodes: nodes.filter((n): n is GardenMemoryNode => !!n && typeof n === "object"
+      && typeof (n as GardenMemoryNode).id === "string" && typeof (n as GardenMemoryNode).sourceKey === "string")
+      .map(n => ({ ...n, body: String(n.body ?? ""), updatedAt: String(n.updatedAt ?? ""), source: String(n.source ?? ""), state: String(n.state ?? ""), kind: String(n.kind ?? ""), visibility: String(n.visibility ?? "") })),
+  };
 }
 
 // ---------------------------------------------------------------------------
