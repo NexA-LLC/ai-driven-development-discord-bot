@@ -5,6 +5,11 @@ import { resolve } from "node:path";
 import { postChannelMessage } from "./channel-post.js";
 import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agent.js";
 import { readMentionedChannels } from "./channel-context.js";
+import { allowsConversationInChannel, conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
+import { ExperienceStore, experienceReference, type ExperienceMemory } from "./experience-memory.js";
+import { ConnpassFeed, eventReference } from "./connpass-feed.js";
+import { deliverMusing } from "./musing.js";
+import { publicExperience } from "../shared/public-experience.js";
 import { startTyping } from "./typing.js";
 import { seedQuizReactions } from "../shared/quiz-reactions.js";
 import { isQuizPrompt, parseRequestedQuiz, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
@@ -149,6 +154,11 @@ let startupReady = false;
 let inFlight = 0;
 let lastMusingSlot = readSlot("musing-slot");
 const botRateState = new Map<string, RateState>();
+const experiences = new ExperienceStore();
+const connpass = new ConnpassFeed(undefined, readPositiveInteger("CONNPASS_POLL_SECONDS", 3600) * 1000,
+  readPositiveInteger("CONNPASS_CACHE_HOURS", 24) * 3600_000, readPositiveInteger("CONNPASS_DAILY_LIMIT", 1));
+const connpassEnabled = readBoolean("CONNPASS_ENABLED", false);
+const publicExperienceChannels = new Set((process.env.EXPERIENCE_PUBLIC_CHANNEL_IDS ?? "").split(",").map(s => s.trim()).filter(Boolean));
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(
@@ -167,6 +177,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   void replayInboxForever();
   setInterval(() => { if (client.isReady() && !lifecycle.draining) inbox.heartbeat(); }, 5000);
   void digestForever();
+  void experienceForever();
   if (llmApiUrl) {
     void pollJobsForever();
     void museForever();
@@ -281,8 +292,8 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
-async function onMessageImpl(message: Message): Promise<void> {
-  if (!message.guildId || message.author.id === client.user?.id) {
+export async function onMessageImpl(message: Message): Promise<void> {
+  if (!message.guildId || message.flags?.has(64) || (primaryGuildId && message.guildId !== primaryGuildId) || message.author.id === client.user?.id) {
     return;
   }
 
@@ -319,20 +330,24 @@ async function onMessageImpl(message: Message): Promise<void> {
   if (!botUser) {
     return;
   }
+  const inMusings = musingsChannelId !== "" && message.channelId === musingsChannelId;
+  const conversationAllowed = allowsConversationInChannel({
+    channelId: message.channelId,
+    monitoredChannelIds,
+    allowMentionsAnywhere,
+    musingsChannelId,
+    welcomeChannelId,
+  });
+  if (!conversationAllowed) return;
+  // Preserve musing-channel feedback without collecting unrelated conversation context.
+  if (!message.reference?.messageId && !message.mentions.has(botUser) && !inMusings) return;
+  const context = message.reference?.messageId || message.mentions.has(botUser) || message.attachments.size
+    ? await conversationContext(message) : { repliedToSu: false, sources: [], status: "unavailable" as const };
 
   // Feedback: a human replying to one of スー's messages (Discord reply), or
   // talking in her musings channel, is stored as feedback (SECURITY.md).
   const repliedToId = message.reference?.messageId;
-  let repliedToSu = false;
-  if (repliedToId) {
-    try {
-      const referenced = await message.channel.messages.fetch(repliedToId);
-      repliedToSu = referenced.author.id === botUser.id;
-    } catch {
-      repliedToSu = false;
-    }
-  }
-  const inMusings = musingsChannelId !== "" && message.channelId === musingsChannelId;
+  const repliedToSu = context.repliedToSu;
   if (repliedToSu || inMusings) {
     await postSigned("/internal/feedback", {
       kind: "reply",
@@ -347,11 +362,9 @@ async function onMessageImpl(message: Message): Promise<void> {
 
   const audioAttachments = [...message.attachments.values()].filter(isAudioAttachment);
   const audioAddressed = audioAttachments.length > 0 && (inMusings || repliedToSu || message.mentions.has(botUser));
-  if (!message.mentions.has(botUser) && !audioAddressed) {
-    return;
-  }
-
-  if (!inMonitoredChannel && !allowMentionsAnywhere && !inMusings) {
+  if (!shouldAnswer({ human: !message.author.bot, guildId: message.guildId, primaryGuildId,
+    allowedChannel: conversationAllowed,
+    mentioned: message.mentions.has(botUser), repliedToSu, audioAddressed })) {
     return;
   }
 
@@ -415,6 +428,8 @@ async function onMessageImpl(message: Message): Promise<void> {
           return result?.context ? JSON.parse(result.context) : { status: result?.status ?? "参照できませんでした" };
         },
         event => auditConversation({ ...audit, phase: event.phase, ...(event.tool ? { tool: event.tool } : {}), ...(event.ok === undefined ? {} : { ok: event.ok }) }),
+        [conversationReference(context), experienceReference(await recallExperiences(message, prompt)),
+          ...(connpassEnabled ? [eventReference(connpass.reference(prompt))] : [])],
       );
     } catch (error) {
       ok = false;
@@ -446,6 +461,10 @@ async function onMessageImpl(message: Message): Promise<void> {
       },
     });
     auditConversation({ ...audit, phase: "sent", messageId: sent.id });
+    if (ok && context.status === "available") {
+      try { experiences.enqueue(message.id, context.sources); }
+      catch { console.error("experience enqueue failed"); }
+    }
     await logReply({
       event: "mention",
       guildId: message.guildId,
@@ -458,6 +477,63 @@ async function onMessageImpl(message: Message): Promise<void> {
     });
   } finally {
     stopTyping();
+  }
+}
+
+async function verifyExperience(memory: ExperienceMemory): Promise<boolean> {
+  try {
+    const channel = await client.channels.fetch(memory.channelId);
+    if (!channel || ![ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(channel.type)) return false;
+    const text = channel as TextChannel;
+    if (text.guildId !== memory.guildId || !client.user || !text.permissionsFor(client.user.id)?.has(PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory)) return false;
+    const source = await text.messages.fetch(memory.sourceId);
+    const valid = !source.author.bot && !source.flags.has(64) && source.guildId === memory.guildId && source.channelId === memory.channelId &&
+      source.createdTimestamp === memory.at && source.content.includes(memory.quote);
+    if (!valid) experiences.removeSource(memory.sourceId);
+    return valid;
+  } catch (error) {
+    if ((error as { code?: number }).code === 10008) experiences.removeSource(memory.sourceId);
+    return false;
+  }
+}
+
+async function recallExperiences(message: Message, query: string): Promise<ExperienceMemory[]> {
+  if (!await readableConversation(message)) return [];
+  const found: ExperienceMemory[] = [];
+  for (const memory of experiences.select(message.guildId!, message.channelId, query)) if (await verifyExperience(memory)) found.push(memory);
+  return found;
+}
+
+client.on(Events.MessageDelete, message => { try { experiences.removeSource(message.id); } catch { console.error("experience deletion failed"); } });
+client.on(Events.MessageBulkDelete, messages => { for (const message of messages.values()) { try { experiences.removeSource(message.id); } catch { console.error("experience deletion failed"); } } });
+
+export async function experienceTick(): Promise<void> {
+  experiences.prune();
+  if (connpassEnabled) await connpass.refresh();
+  await experiences.analyse(llmApiUrl ? async messages => {
+    const response = await fetch(llmApiUrl, { method: "POST", headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
+      body: JSON.stringify({ model: llmModel || undefined, messages, temperature: 0.1, max_tokens: 1500 }), signal: AbortSignal.timeout(llmTimeoutMs) });
+    if (!response.ok) throw new Error("Experience LLM failed");
+    const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+    return body.choices?.[0]?.message?.content ?? "";
+  } : undefined);
+  await experiences.sync(async memory => {
+    if (!await verifyExperience(memory)) return false;
+    const channel = await client.channels.fetch(memory.channelId) as TextChannel;
+    const read = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
+    if (!channel.permissionsFor(channel.guild.roles.everyone)?.has(read) || channel.permissionOverwrites.cache.some(o => o.deny.any(read))) return false;
+    const result = await postSigned<{ synced: boolean }>("/internal/experiences/sync", publicExperience(memory));
+    return result.synced === true;
+  }, memory => publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId));
+}
+
+async function experienceForever(): Promise<void> {
+  for (;;) {
+    if (!lifecycle.draining) {
+      try { await lifecycle.run(experienceTick); }
+      catch { console.error("experience tick failed"); }
+    }
+    await sleep(60_000);
   }
 }
 
@@ -539,10 +615,10 @@ async function digestForever(): Promise<void> {
     try {
       const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1_000);
       const today = nowJst.toISOString().slice(0, 10);
-      if (nowJst.getUTCHours() === digestHourJst && lastDigestDate !== today) {
-        lastDigestDate = today;
-        writeSlot("digest-date", today);
+      if (nowJst.getUTCHours() >= digestHourJst && lastDigestDate !== today) {
         await lifecycle.run(() => postSigned("/internal/digest/run", { hours: 24 }));
+        writeSlot("digest-date", today);
+        lastDigestDate = today;
         console.log(`digest requested for ${today}`);
       }
     } catch (error) {
@@ -562,9 +638,9 @@ async function museForever(): Promise<void> {
       const hour = nowJst.getUTCHours();
       const slot = `${nowJst.toISOString().slice(0, 10)}T${hour}`;
       if (musingsChannelId && musingsHoursJst.includes(hour) && lastMusingSlot !== slot) {
-        lastMusingSlot = slot;
-        writeSlot("musing-slot", slot);
         await postMusing(hour, false);
+        writeSlot("musing-slot", slot);
+        lastMusingSlot = slot;
       }
     } catch (error) {
       console.error("musing failed", error);
@@ -576,18 +652,18 @@ async function museForever(): Promise<void> {
 
 function timeOfDayMaterial(hourJst: number): string {
   if (hourJst >= 5 && hourJst < 10) {
-    return "時間帯: 朝。夜勤が明けて、店を出るところ。眠い。空が明るい。これから寝るか、日本語学校に行くか。";
+    return "時間帯: 朝。朝の空や眠気を題材に、想像や問いとして話してよい。夜勤を終えたなど、実際の出来事は根拠なしに語らない。";
   }
   if (hourJst >= 10 && hourJst < 15) {
-    return "時間帯: 昼。日本語学校の昼休み。教室の窓際。授業で分からなかった言葉が一つある。";
+    return "時間帯: 昼。言葉の学びを題材に、想像や問いとして話してよい。今日の授業や他人との会話を作らない。";
   }
   if (hourJst >= 15 && hourJst < 21) {
-    return "時間帯: 夕方。出勤前。アパートで制服に着替える。今日の常連は誰が来るだろう、と考える。";
+    return "時間帯: 夕方。これから知りたいことを問いとして話してよい。誰かの来店や会話を作らない。";
   }
-  return "時間帯: 深夜。レジに立っている。客はいない。品出しの途中。";
+  return "時間帯: 深夜。静かな時間を題材にした想像や問い。実際にした作業や来店客の様子は根拠なしに語らない。";
 }
 
-async function postMusingImpl(
+export async function postMusingImpl(
   hourJst: number,
   force: boolean,
   topic?: string,
@@ -596,8 +672,9 @@ async function postMusingImpl(
   const channel = await client.channels.fetch(channelId);
   const text = channel as TextChannel | null;
   if (!text || text.type !== ChannelType.GuildText) {
-    return;
+    throw new Error("Musing channel unavailable");
   }
+  if (primaryGuildId && text.guildId !== primaryGuildId) throw new Error("Musing guild is not allowed");
   // Do not post twice in the same slot if the process restarted after posting.
   if (!force) {
     const recent = await text.messages.fetch({ limit: 3 });
@@ -612,12 +689,15 @@ async function postMusingImpl(
   const material = [
     `今日の日付（JST）: ${todayJst}、今の時刻: ${hourJst}時ごろ`,
     timeOfDayMaterial(hourJst),
-    `この起動以降にレジで答えた回数: ${repliesSinceStart}、うまく答えられなかった回数: ${failuresSinceStart}`,
     ...(topic ? [`頼まれた話題（これを材料にする）: ${topic}`] : []),
   ].join("\n");
   const startedAt = Date.now();
-  const musing = await generateReply("musing", material, "ja");
-  const sent = await text.send({ content: truncate(musing, 400), allowedMentions: { parse: [] } });
+  const memories: ExperienceMemory[] = [];
+  for (const memory of experiences.select(text.guildId, text.id, topic ?? "", true)) if (await verifyExperience(memory)) memories.push(memory);
+  const sent = await deliverMusing({ background: material, memories, store: experiences,
+    ...(connpassEnabled && text.id === musingsChannelId && !topic ? { feed: connpass } : {}),
+    generate: input => generateReply("musing", input, "ja"),
+    send: content => text.send({ content, allowedMentions: { parse: [] } }) });
   await logReply({
     event: "musing",
     guildId: text.guildId,
@@ -625,7 +705,7 @@ async function postMusingImpl(
     messageId: sent.id,
     latencyMs: Date.now() - startedAt,
     ok: true,
-    replyText: musing,
+    replyText: sent.text,
   });
 }
 
