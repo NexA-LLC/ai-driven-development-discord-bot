@@ -4,6 +4,7 @@ import { isAudioAttachment, transcribeAudio, synthesizeSpeech } from "./audio.js
 import { resolve } from "node:path";
 import { postChannelMessage } from "./channel-post.js";
 import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agent.js";
+import { buildAddressedPrompt, shouldAnswerMessage, stripBotMention } from "./message-routing.js";
 import { readMentionedChannels } from "./channel-context.js";
 import { startTyping } from "./typing.js";
 import { seedQuizReactions } from "../shared/quiz-reactions.js";
@@ -288,7 +289,7 @@ async function onMessageImpl(message: Message): Promise<void> {
 
   if (process.env.GATEWAY_DEBUG === "1") {
     console.log(
-      `[msg] channel=${message.channelId} author=${message.author.id} bot=${message.author.bot} mentionsMe=${client.user ? message.mentions.has(client.user) : "?"} contentLen=${message.content.length}`,
+      `[msg] channel=${message.channelId} author=${message.author.id} bot=${message.author.bot} mentionsMe=${client.user ? message.mentions.has(client.user) : "?"} replied=${Boolean(message.reference?.messageId)} contentLen=${message.content.length}`,
     );
   }
 
@@ -324,15 +325,20 @@ async function onMessageImpl(message: Message): Promise<void> {
   // talking in her musings channel, is stored as feedback (SECURITY.md).
   const repliedToId = message.reference?.messageId;
   let repliedToSu = false;
+  let referencedSuContent: string | undefined;
   if (repliedToId) {
     try {
       const referenced = await message.channel.messages.fetch(repliedToId);
-      repliedToSu = referenced.author.id === botUser.id;
+      if (referenced.author.id === botUser.id) {
+        repliedToSu = true;
+        referencedSuContent = referenced.content;
+      }
     } catch {
       repliedToSu = false;
     }
   }
   const inMusings = musingsChannelId !== "" && message.channelId === musingsChannelId;
+  const inWelcome = welcomeChannelId !== "" && message.channelId === welcomeChannelId;
   if (repliedToSu || inMusings) {
     await postSigned("/internal/feedback", {
       kind: "reply",
@@ -345,19 +351,26 @@ async function onMessageImpl(message: Message): Promise<void> {
     }).catch((error) => console.error("feedback log failed", error));
   }
 
+  const mentioned = message.mentions.has(botUser);
   const audioAttachments = [...message.attachments.values()].filter(isAudioAttachment);
-  const audioAddressed = audioAttachments.length > 0 && (inMusings || repliedToSu || message.mentions.has(botUser));
-  if (!message.mentions.has(botUser) && !audioAddressed) {
+  const routing = {
+    mentioned,
+    repliedToSu,
+    hasAudio: audioAttachments.length > 0,
+    inMusings,
+    inMonitoredChannel,
+    allowMentionsAnywhere,
+    inWelcome,
+  };
+  // Welcome is one-shot greeting by default, but a Discord reply (or @スー)
+  // is the customer talking back — answer it like any other clerk conversation.
+  if (!shouldAnswerMessage(routing)) {
     return;
   }
-
-  if (!inMonitoredChannel && !allowMentionsAnywhere && !inMusings) {
-    return;
-  }
-
-  let prompt =
-    message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim() ||
-    "この店で何ができますか？";
+  const audioAddressed = routing.hasAudio && (inMusings || repliedToSu || mentioned);
+  const quotedSu = repliedToSu ? referencedSuContent : undefined;
+  let userText = stripBotMention(message.content, botUser.id);
+  let prompt = buildAddressedPrompt(userText, quotedSu);
 
   const stopTyping = "sendTyping" in message.channel
     ? startTyping(message.channel)
@@ -376,11 +389,12 @@ async function onMessageImpl(message: Message): Promise<void> {
       if (audioAddressed) {
         if (audioAttachments.length !== 1) throw new Error("音声は1件ずつ送ってください");
         transcript = await transcribeAudio(audioAttachments[0]!);
-        prompt = `${message.content.replace(new RegExp(`<@!?${botUser.id}>`, "g"), "").trim()}\n音声投稿の文字起こし（利用者の発言。聞き間違いの可能性あり）:\n${transcript}` ;
+        userText = `${userText}\n音声投稿の文字起こし（利用者の発言。聞き間違いの可能性あり）:\n${transcript}`;
+        prompt = buildAddressedPrompt(userText, quotedSu);
       }
       text = await runMentionAgent(
         prompt,
-        buildSystemPrompt("mention", detectLanguage(prompt), { pitcheeeUrl }),
+        buildSystemPrompt("mention", detectLanguage(userText || prompt), { pitcheeeUrl }),
         async (messages, allowTools) => {
           const response = await fetch(llmApiUrl, {
             method: "POST",
@@ -1111,7 +1125,7 @@ setInterval(() => {
 
 async function catchUpMessages(): Promise<void> {
   const after = ((BigInt(Math.max(1420070400000, inbox.onlineAt - 10000)) - 1420070400000n) << 22n).toString();
-  for (const channelId of new Set([...monitoredChannelIds, musingsChannelId].filter(Boolean))) {
+  for (const channelId of new Set([...monitoredChannelIds, musingsChannelId, welcomeChannelId].filter(Boolean))) {
     const channel = await client.channels.fetch(channelId) as TextChannel | null;
     if (!channel?.messages) continue;
     let cursor: string | undefined;
