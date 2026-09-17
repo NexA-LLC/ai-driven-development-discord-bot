@@ -156,8 +156,10 @@ let lastMusingSlot = readSlot("musing-slot");
 const botRateState = new Map<string, RateState>();
 const experiences = new ExperienceStore();
 const connpass = new ConnpassFeed(undefined, readPositiveInteger("CONNPASS_POLL_SECONDS", 3600) * 1000,
-  readPositiveInteger("CONNPASS_CACHE_HOURS", 24) * 3600_000, readPositiveInteger("CONNPASS_DAILY_LIMIT", 1));
+  readPositiveInteger("CONNPASS_CACHE_HOURS", 24) * 3600_000, readPositiveInteger("CONNPASS_DAILY_LIMIT", 1),
+  process.env.CONNPASS_API_KEY?.trim() ?? "");
 const connpassEnabled = readBoolean("CONNPASS_ENABLED", false);
+if (connpassEnabled && !process.env.CONNPASS_API_KEY?.trim()) console.warn("CONNPASS_ENABLED requires CONNPASS_API_KEY; event refreshes will fail until it is set");
 const publicExperienceChannels = new Set((process.env.EXPERIENCE_PUBLIC_CHANNEL_IDS ?? "").split(",").map(s => s.trim()).filter(Boolean));
 
 client.once(Events.ClientReady, async (readyClient) => {

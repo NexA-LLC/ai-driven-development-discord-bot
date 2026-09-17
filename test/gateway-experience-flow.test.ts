@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "discord.js";
 
-const mocks = vi.hoisted(() => ({ client: { user: { id: "su" }, on: vi.fn(), once: vi.fn(), login: vi.fn(), channels: { fetch: vi.fn() } }, requests: [] as Array<Record<string, any>>, feedXml: '<feed xmlns="http://www.w3.org/2005/Atom"><title>AI駆動開発</title></feed>' }));
+const mocks = vi.hoisted(() => ({ client: { user: { id: "su" }, on: vi.fn(), once: vi.fn(), login: vi.fn(), channels: { fetch: vi.fn() } }, requests: [] as Array<Record<string, any>>, connpassJson: JSON.stringify({ results_start: 1, results_returned: 0, results_available: 0, events: [] }) }));
 vi.mock("discord.js", async () => ({ ...await vi.importActual("discord.js"), Client: class { constructor() { return mocks.client; } } }));
 vi.mock("../src/gateway/voice-chat.js", () => ({ VoiceChat: class {} }));
 vi.mock("../src/gateway/conversation-audit.js", () => ({ auditConversation: vi.fn() }));
@@ -28,10 +28,13 @@ function message(id: string, content: string, author = "human", reference?: stri
 const dir = mkdtempSync(join(tmpdir(), "su-gateway-flow-"));
 beforeAll(async () => {
   vi.useFakeTimers(); vi.setSystemTime(now);
-  for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test", INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel", LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "true", MUSE_ON_START: "false", EXPERIENCE_PUBLIC_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
+  for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test", INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel", LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "true", CONNPASS_API_KEY: "connpass-fixture", MUSE_ON_START: "false", EXPERIENCE_PUBLIC_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
   mocks.client.channels.fetch.mockResolvedValue(channel);
   vi.stubGlobal("fetch", vi.fn(async (url: string | URL, options: RequestInit) => {
-    if (String(url).includes("aid.connpass.com")) return new Response(mocks.feedXml, { headers: { "content-type": "application/atom+xml" } });
+    if (String(url).includes("connpass.com/api/v2/events")) {
+      expect((options.headers as Record<string, string>)["x-api-key"]).toBe("connpass-fixture");
+      return new Response(mocks.connpassJson, { headers: { "content-type": "application/json" } });
+    }
     if (String(url).includes("worker.test")) return Response.json({ ok: true, synced: true });
     const request = JSON.parse(options.body as string); mocks.requests.push(request);
     const extraction = request.messages[0].content.includes("スー宛の実際の会話");
@@ -79,9 +82,9 @@ it("does not recall on unrelated topics, denied permissions, or deleted/edited s
   rows.get("original").content = "変更済み";
   await gateway.onMessageImpl(message("edited", "正解のない4択の用語", "human", undefined, true)); expect(latest()).not.toContain(quote);
 });
-it("live scheduler tick feeds a new Atom event into the real musing and question paths", async () => {
+it("live scheduler tick feeds a new API v2 event into the real musing and question paths", async () => {
   vi.setSystemTime(now + 3600_000);
-  mocks.feedXml = '<feed xmlns="http://www.w3.org/2005/Atom"><title>AI駆動開発</title><entry><id>event-new</id><title>AI駆動開発のイベント</title><link href="https://aid.connpass.com/event/407072/"/><published>2026-09-16T02:01:00Z</published><updated>2026-09-16T02:10:00Z</updated><summary>AI開発の工夫を紹介</summary></entry></feed>';
+  mocks.connpassJson = JSON.stringify({ results_start: 1, results_returned: 1, results_available: 1, events: [{ event_id: 407072, title: "AI駆動開発のイベント", catch: "AI開発の工夫を紹介", description: "", event_url: "https://aid.connpass.com/event/407072/", started_at: "2026-09-20T19:00:00+09:00", ended_at: "2026-09-20T21:00:00+09:00", updated_at: "2026-09-16T02:10:00Z" }] });
   await gateway.experienceTick();
   await gateway.postMusingImpl(12, true);
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("public_event_reference");
