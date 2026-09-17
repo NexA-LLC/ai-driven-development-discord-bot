@@ -1,5 +1,5 @@
 import { verifyKey } from "discord-interactions";
-import { publicExperienceBody, publicExperienceSchema } from "../shared/public-experience.js";
+import { publicExperienceBody, publicExperienceSchema, publicExperienceSourceKey, type PublicExperience } from "../shared/public-experience.js";
 import {
   evaluateAgentManifest,
   type AgentPassport,
@@ -216,22 +216,54 @@ export default {
       const rawBody = await request.text();
       if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
       let parsed;
-      try { parsed = publicExperienceSchema.safeParse(JSON.parse(rawBody)); }
+      // The Gateway's own last-write token travels alongside, not inside, the strict public payload.
+      let baseline: string | null = null;
+      let nodeId: string | null = null;
+      try {
+        const { baselineUpdatedAt, nodeId: node, ...experience } = JSON.parse(rawBody) as Record<string, unknown>;
+        if (typeof baselineUpdatedAt === "string" && baselineUpdatedAt.trim()) baseline = baselineUpdatedAt;
+        if (typeof node === "string" && node.trim()) nodeId = node;
+        parsed = publicExperienceSchema.safeParse(experience);
+      }
       catch { return json({ error: "invalid_experience" }, 400); }
       if (!parsed.success || parsed.data.at > Date.now() || parsed.data.at < Date.now() - 30 * 86400_000) return json({ error: "invalid_experience" }, 400);
-      const dg = decisiongarden(env);
-      if (!dg) return json({ synced: false, status: "not_configured" });
-      try {
-        await mcpCall(dg.url, dg.token, "save_memory_node", {
-          gardenId: dg.gardenId, sourceKey: `su-experience:${parsed.data.id}`,
-          source: "ai-driven-development-discord-bot/gateway experience",
-          kind: "knowledge", state: "active", visibility: "garden", ...publicExperienceBody(parsed.data),
-        });
-        return json({ synced: true });
-      } catch { return json({ synced: false, status: "failed" }, 502); }
+      return syncPublicExperience(env, parsed.data, baseline, nodeId);
     }
 
-    if (request.method === "POST" && url.pathname === "/internal/digest/run") {
+    if (request.method === "POST" && url.pathname === "/internal/experiences/retract") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
+      let threadId = "";
+      let retractNodeId: string | null = null;
+      try {
+        const body = JSON.parse(rawBody || "{}") as { threadId?: unknown; nodeId?: unknown };
+        threadId = String(body.threadId ?? "");
+        if (typeof body.nodeId === "string" && body.nodeId.trim()) retractNodeId = body.nodeId;
+      } catch { /* invalid below */ }
+      if (!/^[a-f0-9]{64}$/.test(threadId)) return json({ error: "invalid_thread" }, 400);
+      return retractPublicExperience(env, threadId, retractNodeId);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/experiences/pull") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
+      let wanted: Array<{ threadId: string; nodeId: string }> = [];
+      try {
+        const value = (JSON.parse(rawBody || "{}") as { nodes?: unknown }).nodes;
+        // One bounded batch of known nodes. The whole Garden is never read to find them.
+        wanted = Array.isArray(value) ? value
+          .filter((v): v is { threadId: string; nodeId: string } => !!v && typeof v === "object"
+            && /^[a-f0-9]{64}$/.test(String((v as { threadId?: unknown }).threadId ?? ""))
+            && UUID.test(String((v as { nodeId?: unknown }).nodeId ?? "")))
+          .map(v => ({ threadId: v.threadId, nodeId: v.nodeId }))
+          .slice(0, EXPERIENCE_PULL_BATCH) : [];
+      } catch { /* empty request below */ }
+      if (!wanted.length) return json({ status: "empty_request", covered: [], notes: [] }, 400);
+      return pullPublicExperiences(env, wanted);
+    }
+
+    // /internal/maintenance/run replaces the daily digest. /internal/digest/run stays as a compatible alias.
+    if (request.method === "POST" && (url.pathname === "/internal/maintenance/run" || url.pathname === "/internal/digest/run")) {
       const rawBody = await request.text();
       if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
         return json({ error: "invalid_internal_signature" }, 401);
@@ -245,7 +277,7 @@ export default {
       } catch {
         // default window
       }
-      try { return json({ ok: true, hours, ...await runImprovementDigest(env, hours) }); }
+      try { return json({ ok: true, hours, deprecatedAlias: url.pathname === "/internal/digest/run", ...await runNightlyMaintenance(env, hours) }); }
       catch { return json({ ok: false, status: "failed" }, 502); }
     }
 
@@ -257,8 +289,8 @@ export default {
     env: Env,
     context: ExecutionContext,
   ): Promise<void> {
-    // Daily at 18:00 UTC = 03:00 JST: turn yesterday's feedback into proposals.
-    context.waitUntil(runImprovementDigest(env, 24));
+    // Daily at 18:00 UTC = 03:00 JST: maintenance only. No daily report node is created.
+    context.waitUntil(runNightlyMaintenance(env, 24));
   },
 };
 
@@ -1280,6 +1312,24 @@ async function handleInternalFeedback(request: Request, env: Env): Promise<Respo
 // MCP clients (CaseFlow, DecisionGarden) — JSON-RPC over HTTPS with a bearer.
 // ---------------------------------------------------------------------------
 
+/** Distinguishes "this server cannot do it yet" and "someone else changed it" from a plain failure. */
+export type McpFailureKind = "unsupported" | "conflict" | "not_permitted" | "not_found" | "other";
+export class McpToolError extends Error {
+  constructor(readonly kind: McpFailureKind, message: string) {
+    super(message);
+    this.name = "McpToolError";
+  }
+}
+function classifyMcpFailure(text: string): McpFailureKind {
+  if (/unknown[_ ]tool|tool[_ ]not[_ ]found|method not found|not implemented|unsupported/i.test(text)) return "unsupported";
+  // DecisionGarden's compare-and-set answer, plus the create-only replay guard.
+  if (/updated_at_conflict|source_key_conflict|seed_version_conflict|conflict|expectedUpdatedAt/i.test(text)) return "conflict";
+  // A missing scope or a viewer role will not clear on a fast retry.
+  if (/forbidden|personal_token_required|insufficient_scope|provenance_immutable|lifecycle_not_updatable|unauthorized/i.test(text)) return "not_permitted";
+  if (/not_found/i.test(text)) return "not_found";
+  return "other";
+}
+
 async function mcpCall(
   url: string,
   token: string,
@@ -1307,18 +1357,24 @@ async function mcpCall(
     text = text.split("\n").filter((l) => l.startsWith("data:")).pop()?.slice(5) ?? "";
   }
   if (!response.ok) {
-    throw new Error(`MCP ${name} -> ${response.status}: ${text.slice(0, 200)}`);
+    throw new McpToolError(response.status === 404 || response.status === 501 ? "unsupported" : classifyMcpFailure(text),
+      `MCP ${name} -> ${response.status}: ${text.slice(0, 200)}`);
   }
   const envelope = JSON.parse(text) as {
     result?: { content?: Array<{ text?: string }>; isError?: boolean; structuredContent?: unknown };
-    error?: { message?: string };
+    error?: { message?: string; code?: number };
   };
   if (envelope.error) {
-    throw new Error(`MCP ${name}: ${envelope.error.message ?? "error"}`);
+    const message = envelope.error.message ?? "error";
+    throw new McpToolError(envelope.error.code === -32601 ? "unsupported" : classifyMcpFailure(message), `MCP ${name}: ${message}`);
   }
-  if (!envelope.result || envelope.result.isError) throw new Error(`MCP ${name} failed`);
+  if (!envelope.result) throw new McpToolError("other", `MCP ${name} failed`);
+  if (envelope.result.isError) {
+    const detail = envelope.result.content?.[0]?.text ?? "";
+    throw new McpToolError(classifyMcpFailure(detail), `MCP ${name} failed: ${detail.slice(0, 200)}`);
+  }
   const validated = (value: unknown): unknown => {
-    if (value && typeof value === "object" && "ok" in value && value.ok === false) throw new Error(`MCP ${name} failed`);
+    if (value && typeof value === "object" && "ok" in value && value.ok === false) throw new McpToolError("other", `MCP ${name} failed`);
     if (name === "save_memory_node") {
       const node = (value as { memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown } } | null)?.memoryNode;
       if (!node || typeof node.id !== "string" || !node.id || node.gardenId !== args.gardenId || node.sourceKey !== args.sourceKey) throw new Error("MCP memory receipt missing or mismatched");
@@ -1517,22 +1573,158 @@ async function handleInquiryStatusCommand(
 // Operational statistics. Sourced experience analysis runs on the Gateway.
 // ---------------------------------------------------------------------------
 
-/** Operational counts only. Experience analysis is durable and uses the Gateway LLM. */
-export async function runImprovementDigest(env: Env, hours = 24): Promise<{ analysis: "not_run"; analysisLocation: "gateway"; statsSynced: boolean }> {
+const EXPERIENCE_SOURCE = "ai-driven-development-discord-bot/gateway experience";
+/** Nodes read back per pull. One request per node, so this bounds the work per tick. */
+export const EXPERIENCE_PULL_BATCH = 20;
+
+/**
+ * One Garden node per experience thread, addressed by the node id we were given when we created it.
+ * save_memory_node is create-only and idempotent, so a later revision must go through an update tool;
+ * a server without one is reported as waiting, never as synced.
+ */
+async function syncPublicExperience(env: Env, item: PublicExperience, baselineUpdatedAt: string | null, nodeId: string | null): Promise<Response> {
+  const dg = decisiongarden(env);
+  if (!dg) return json({ synced: false, status: "not_configured" });
+  const sourceKey = publicExperienceSourceKey(item.id);
+  const content = publicExperienceBody(item);
+  const fail = (error: unknown): Response => {
+    const kind = error instanceof McpToolError ? error.kind : "other";
+    if (kind === "unsupported") return json({ synced: false, status: "update_unsupported" });
+    if (kind === "conflict") return json({ synced: false, status: "conflict" }, 409);
+    if (kind === "not_permitted") return json({ synced: false, status: "not_permitted" }, 403);
+    return json({ synced: false, status: "failed" }, 502);
+  };
+  try {
+    if (!nodeId) {
+      // Nothing was ever published for this thread, so create it and remember the id we get back.
+      // A memory that predates id tracking cannot be updated safely and says so instead of guessing.
+      if (item.revision > 1 && baselineUpdatedAt) return json({ synced: false, status: "node_unknown" });
+      const receipt = await mcpCall(dg.url, dg.token, "save_memory_node", {
+        gardenId: dg.gardenId, sourceKey, source: EXPERIENCE_SOURCE,
+        // Open questions stay knowledge. スー never files an operational TODO into the Garden.
+        kind: "knowledge", state: "active", visibility: "garden", ...content,
+      }) as { memoryNode?: { id?: unknown } } | null;
+      const created = receipt?.memoryNode?.id;
+      if (typeof created !== "string" || !UUID.test(created)) throw new McpToolError("other", "MCP save receipt has no usable node id");
+      return json({ synced: true, operation: "created", nodeId: created });
+    }
+    if (!UUID.test(nodeId)) throw new McpToolError("other", "node id is not a UUID");
+    const existing = await getMemoryNode(dg, nodeId, sourceKey);
+    // Only a direct read saying the node is not there means it is gone. Nothing else implies absence.
+    if (!existing) return json({ synced: false, status: "absent" });
+    // Without a baseline from our own last write there is nothing to compare a human edit against,
+    // so the read-back path has to run first. Overwriting with a freshly read token would erase it.
+    if (!baselineUpdatedAt) return json({ synced: false, status: "awaiting_readback" });
+    // The node moved since we last wrote it. If what it now holds is exactly what this request wants
+    // to write, the move was our own earlier update whose answer never got back to us: resending is
+    // safe and the Garden reports it as unchanged. Any other content is a person's edit.
+    const alreadyApplied = existing.title === content.title && existing.body === content.body;
+    if (existing.updatedAt !== baselineUpdatedAt && !alreadyApplied) return json({ synced: false, status: "conflict" }, 409);
+    // Only the mutable fields; gardenId/kind/source/sourceKey and state/visibility are rejected by the Garden.
+    const receipt = await mcpCall(dg.url, dg.token, "update_memory_node", {
+      nodeId, expectedUpdatedAt: baselineUpdatedAt, ...content,
+    }) as { operation?: unknown; memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown; title?: unknown; body?: unknown; updatedAt?: unknown } } | null;
+    const node = receipt?.memoryNode;
+    // "unchanged" is the Garden's honest answer to a retry of an update that already landed, so it
+    // counts as synced; the receipt still has to prove the stored content is the content we sent.
+    if ((receipt?.operation !== "updated" && receipt?.operation !== "unchanged") || !node
+      || node.id !== nodeId || node.gardenId !== dg.gardenId || node.sourceKey !== sourceKey
+      || node.title !== content.title || node.body !== content.body
+      || typeof node.updatedAt !== "string" || !node.updatedAt) {
+      throw new McpToolError("other", "MCP update receipt missing or mismatched");
+    }
+    // The receipt's timestamp becomes the next baseline, so the following write can still spot an edit.
+    return json({ synced: true, operation: receipt.operation, updatedAt: node.updatedAt, nodeId });
+  } catch (error) { return fail(error); }
+}
+
+/** Expired or deleted evidence archives the public copy. Reversible, never a hard delete. */
+async function retractPublicExperience(env: Env, threadId: string, nodeId: string | null): Promise<Response> {
+  const dg = decisiongarden(env);
+  if (!dg) return json({ retracted: false, status: "not_configured" });
+  // Without the node id there is nothing to address, and hunting for it would mean reading the
+  // whole Garden. These are pre-tracking copies and are reported for manual handling instead.
+  if (!nodeId || !UUID.test(nodeId)) return json({ retracted: false, status: "node_unknown" });
+  try {
+    const existing = await getMemoryNode(dg, nodeId, publicExperienceSourceKey(threadId));
+    if (!existing) return json({ retracted: true, status: "absent" });
+    await mcpCall(dg.url, dg.token, "set_memory_node_lifecycle", { nodeId, state: "archived", visibility: "private" });
+    return json({ retracted: true, status: "archived" });
+  } catch (error) {
+    return json({ retracted: false, status: error instanceof McpToolError && error.kind === "unsupported" ? "update_unsupported" : "failed" }, 502);
+  }
+}
+
+/** Reads back human edits for known nodes only, one bounded batch at a time. */
+async function pullPublicExperiences(env: Env, wanted: Array<{ threadId: string; nodeId: string }>): Promise<Response> {
+  const dg = decisiongarden(env);
+  if (!dg) return json({ status: "not_configured", covered: [], notes: [] });
+  const notes: Array<{ threadId: string; body: string; updatedAt: string }> = [];
+  const covered: string[] = [];
+  for (const { threadId, nodeId } of wanted) {
+    try {
+      const node = await getMemoryNode(dg, nodeId, publicExperienceSourceKey(threadId));
+      // Read succeeded, so this thread's answer is authoritative: present means note, absent means gone.
+      covered.push(threadId);
+      if (node) notes.push({ threadId, body: truncate(node.body, 2_000), updatedAt: node.updatedAt });
+    } catch (error) {
+      // A thread we could not read is left out of covered, so the caller clears nothing for it.
+      if (error instanceof McpToolError && error.kind === "unsupported") return json({ status: "unsupported", covered: [], notes: [] }, 502);
+    }
+  }
+  if (!covered.length) return json({ status: "failed", covered: [], notes: [] }, 502);
+  return json({ status: "ok", covered, notes });
+}
+
+type GardenMemoryNode = { id: string; sourceKey: string; kind: string; state: string; visibility: string; source: string; title: string; body: string; updatedAt: string };
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Reads one known node. Returns null only when the Garden says it is not there, so absence is a
+ * direct answer rather than something inferred from a list. Everything that identifies the node is
+ * checked: a node that is not ours, not in our Garden, or no longer active and garden-visible is
+ * treated as not found rather than used.
+ */
+async function getMemoryNode(dg: { url: string; token: string; gardenId: string }, nodeId: string, sourceKey: string): Promise<GardenMemoryNode | null> {
+  let result;
+  try {
+    result = await mcpCall(dg.url, dg.token, "get_memory_node", { nodeId }) as
+      { garden?: { id?: unknown }; memoryNode?: Record<string, unknown> } | null;
+  } catch (error) {
+    if (error instanceof McpToolError && error.kind === "not_found") return null;
+    throw error;
+  }
+  const node = result?.memoryNode;
+  if (!node || result?.garden?.id !== dg.gardenId) return null;
+  const value = (key: string) => String(node[key] ?? "");
+  if (value("id") !== nodeId || value("sourceKey") !== sourceKey || value("kind") !== "knowledge"
+    || value("source") !== EXPERIENCE_SOURCE || value("state") !== "active" || value("visibility") !== "garden") return null;
+  return { id: nodeId, sourceKey, kind: "knowledge", state: "active", visibility: "garden",
+    source: EXPERIENCE_SOURCE, title: value("title"), body: value("body"), updatedAt: value("updatedAt") };
+}
+
+// ---------------------------------------------------------------------------
+// Nightly maintenance. Replaces the daily digest: no date-keyed Garden node is
+// ever created, and operational counts go to the operations log only.
+// ---------------------------------------------------------------------------
+
+export type MaintenanceResult = {
+  analysis: "not_run"; analysisLocation: "gateway"; gardenWrites: 0;
+  dailyReport: "discontinued"; replies: number; failed: number; statsDestination: "operations_log";
+};
+
+/** Operational counts only. Nothing here writes to the Garden; experience analysis runs on the Gateway. */
+export async function runNightlyMaintenance(env: Env, hours = 24): Promise<MaintenanceResult> {
   const since = new Date(Date.now() - hours * 3600_000).toISOString().replace("T", " ").slice(0, 19);
   const rows = await env.DB.prepare(
     "SELECT COUNT(*) AS total, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed FROM reply_logs WHERE created_at >= ?",
   ).bind(since).first<{ total: number; failed: number | null }>();
-  const dateJst = new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
-  const dg = decisiongarden(env);
-  if (!dg) return { analysis: "not_run", analysisLocation: "gateway", statsSynced: false };
-  await mcpCall(dg.url, dg.token, "save_memory_node", {
-    gardenId: dg.gardenId, sourceKey: `su-stats:${dateJst}`,
-    source: "ai-driven-development-discord-bot/worker operational statistics",
-    kind: "knowledge", state: "active", visibility: "garden", title: `スー 運営統計 ${dateJst}`,
-    body: `返答 ${rows?.total ?? 0} 件（失敗 ${rows?.failed ?? 0}）。\n経験解析はここでは未実行。Gatewayの経験記憶と個別の su-experience ノードを参照。統計の保存成功は経験解析完了を意味しません。`,
-  });
-  return { analysis: "not_run", analysisLocation: "gateway", statsSynced: true };
+  const replies = rows?.total ?? 0;
+  const failed = rows?.failed ?? 0;
+  // Operations log, not a Garden node and not a Discord post.
+  console.log(JSON.stringify({ event: "su_operational_stats", windowHours: hours, replies, failed }));
+  return { analysis: "not_run", analysisLocation: "gateway", gardenWrites: 0, dailyReport: "discontinued", replies, failed, statsDestination: "operations_log" };
 }
 
 
@@ -1594,7 +1786,8 @@ const MCP_TOOLS = [
   },
   {
     name: "su_run_digest",
-    description: "日次の運営統計を保存する。経験解析はGatewayの別経路で実行される。",
+    description:
+      "[非推奨] 日次ダイジェストは廃止。運営統計を読むだけで、Gardenへの書き込みも日次報告の作成も行わない。経験の記録・更新はGatewayが変化のあったときだけ実行する。",
     inputSchema: { type: "object", properties: { hours: { type: "number" } } },
   },
 ] as const;
@@ -1762,7 +1955,11 @@ async function callSuTool(env: Env, name: string, args: Record<string, unknown>)
     }
     case "su_run_digest": {
       const hours = num(args.hours, 24, 24 * 30);
-      return { ran: true, hours, ...await runImprovementDigest(env, hours) };
+      return {
+        ran: true, hours, deprecated: true,
+        note: "日次ダイジェストは廃止しました。このツールは運営統計を読むだけで、Gardenノードも日次報告も作りません。",
+        ...await runNightlyMaintenance(env, hours),
+      };
     }
     default:
       throw new Error(`unknown tool: ${name}`);

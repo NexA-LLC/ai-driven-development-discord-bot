@@ -10,7 +10,23 @@ AI駆動開発コミュニティ（Discord）のための Discord App / Bot 基�
 
 connpass API v2 からAI駆動開発グループ（`subdomain=aid`）のイベント一覧を取得し、話題に使えます。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`CONNPASS_ENABLED=true` で有効化します。既定は1時間ごとの取得・24時間のキャッシュ有効期限・イベント独り言1日1件です。初回は取り込みのみ。質問には取得済み情報と実際の開催日時を参照し、新着の独り言には出典URLを必ず添えます。`CONNPASS_POLL_SECONDS` / `CONNPASS_CACHE_HOURS` / `CONNPASS_DAILY_LIMIT` で調整できます。公開情報はスー自身の体験記憶には登録しません。
 
-本番有効化には、このWorker/Gatewayの反映、永続 `SU_STATE_DIR`、既存のGateway用LLM設定が必要です。DB migrationはありません。DecisionGardenへの経験共有は `EXPERIENCE_PUBLIC_CHANNEL_IDS` に運営が承認した公開チャンネルを指定した場合のみで、公開用の限定された要約と記憶参照キーを送ります。日次統計は別ノードです。この変更のローカル検証だけでは本番反映・Discord送信を意味しません。
+記憶は日付ではなく話題で束ねます。同じチャンネルで同じ話が続いた場合は新しいノードを作らず、同一 thread を根拠付きで更新し（`revision` が増え、以前の引用は履歴として残ります）、変化がなければ何も書きません。未解決の問いはTODOではなく knowledge として保持します。日次ダイジェストは廃止しました。
+
+本番有効化には、このWorker/Gatewayの反映、永続 `SU_STATE_DIR`、既存のGateway用LLM設定が必要です。DB migrationはありません。DecisionGardenへの経験共有は `EXPERIENCE_PUBLIC_CHANNEL_IDS` に運営が承認した公開チャンネルを指定した場合のみです。さらにそのうえで、記憶ごとに公開判定を通す必要があります。公開されるのは原文の引用ではなく、人物名・内密の内容がないと判定されたうえで書き直された短い要約だけで、判定を通らなかった記憶はノードを作らずprivateのまま残ります。稼働統計はGardenではなく運営ログにのみ出ます。この変更のローカル検証だけでは本番反映・Discord送信を意味しません。
+
+#### 導入順・未反映時の挙動・ロールバック
+
+1. **DecisionGarden（先）** — 関連PR: [NexA-LLC/webapp-decisiongarden#21](https://github.com/NexA-LLC/webapp-decisiongarden/pull/21)（`update_memory_node` の追加と、archived な Knowledge の読み取り互換修正）。Knowledge/TODO の本文を更新する `update_memory_node({nodeId, expectedUpdatedAt, title?, body?, evidence?})` が必要です（`mcp:write` + Garden write、`gardenId`/`kind`/`source`/`sourceKey` と `state`/`visibility` は指定不可、未知フィールドは拒否）。CAS 不一致は `updated_at_conflict` で何も書きません。ただし保存済み内容が要求内容と同じ場合は「適用済みの再試行」として `operation:"unchanged"` を返すため、Bot はこれを同期成功として扱います。既存の `save_memory_node` は create-only のままで、意味は変えません。未反映でも Bot は落ちません。
+2. **Worker（次）** — `/internal/experiences/sync`（revision 1 は `save_memory_node`、revision 2 以降は `update_memory_node`）、`/internal/experiences/retract`、`/internal/experiences/pull`、`/internal/maintenance/run` が入ります。Garden へのアクセスは、作成時に受け取った node id で `get_memory_node` を1件ずつ呼ぶ形に限定され、Garden 全体の一覧取得は行いません。`/internal/digest/run` は同じ保守処理への互換エイリアスとして残り、`deprecatedAlias: true` を返します。
+3. **Gateway（最後）** — 夜間保守の呼び先が `/internal/maintenance/run` に変わり、`MAINTENANCE_HOUR_JST`（未設定なら `DIGEST_HOUR_JST`）で動きます。`experiences.json` は既存ファイルのまま読めます（新しい項目は既定値で補完）。
+
+**未反映時の挙動**: DecisionGarden が旧版だと、初回作成は成功し、2回目以降の更新は `update_unsupported` として**同期待ち**になります。権限不足（`forbidden` / `insufficient_scope` など）は `not_permitted`、Garden 側で人が編集していた場合は `conflict`、公開済みノードが消えていた場合は `absent` として同様に保留します。いずれも成功扱いにはせず、6時間ごとに再試行し、`syncedRevision` は進めません。人の編集を上書きすることはありません。ただし、Garden 側が動いたのが「自分の更新が適用されたが応答が届かなかった」ためで、保存内容が送ろうとしている内容と完全一致する場合だけは再送を通し、Garden の `unchanged` として決着させます。Worker が旧版だと Gateway の保守呼び出しは互換エイリアス経由で通ります。DecisionGarden 自体が未設定・不調でも会話は継続します。
+
+**取り下げの保全**: 公開済みコピーの取り下げ待ち（tombstone）は容量のために捨てません。未処理が100件に達すると、新しい会話の受け付けと新しい公開を止めて backlog の解消を優先します（原文の30日失効はそのまま進みます）。
+
+**移行**: node id を記録する前に公開されたコピーは更新も取り下げもできないため、`node_unknown` として保留しログに出します（Garden 全体を検索して探すことはしません）。該当は手動で archived+private にするか、30日の失効を待ってください。新規の経験は作成時に node id を受け取るので影響しません。
+
+**ロールバック**: Gateway → Worker の順に前のリビジョンへ戻します。Garden 上のノードは残り、`sourceKey` は `su-experience:<threadId>` のまま変わらないため、再適用時に二重作成は起きません。`update_memory_node` の追加は既存データを書き換えないので、DecisionGarden 側は単独で戻せます。保全済みの旧日次報告（archived/private）には触れません。
 
 > **Status — 2026-09-06:** Worker と D1 は本番に deploy 済み、Discord Application「スー」は AI駆動開発サーバーにインストール済みで、slash command も登録済みです。**Gateway の常駐（社内LLMでの回答）と test channel での E2E はこれから**です。  
 > 現在地の詳細: [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md)
@@ -253,7 +269,7 @@ Worker が `POST /api/mcp`（JSON-RPC、`Authorization: Bearer <SU_MCP_TOKEN>`�
 | `su_status` | 直近の返答、待機中の注文、未解決 incident |
 | `su_incidents` / `su_resolve_incident` | incident 一覧・解決 |
 | `su_feedback_recent` | 直近のフィードバック |
-| `su_run_digest` | 運営統計を保存（経験解析はGatewayの別経路） |
+| `su_run_digest` | **非推奨**。運営統計を読むだけで、Gardenへの書き込みも日次報告の作成も行わない |
 
 ```bash
 curl -s https://<worker>/api/mcp -H "authorization: Bearer $SU_MCP_TOKEN" -H 'content-type: application/json' \

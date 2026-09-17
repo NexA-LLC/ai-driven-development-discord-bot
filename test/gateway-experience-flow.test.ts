@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "discord.js";
 
-const mocks = vi.hoisted(() => ({ client: { user: { id: "su" }, on: vi.fn(), once: vi.fn(), login: vi.fn(), channels: { fetch: vi.fn() } }, requests: [] as Array<Record<string, any>>, connpassJson: JSON.stringify({ results_start: 1, results_returned: 0, results_available: 0, events: [] }) }));
+const mocks = vi.hoisted(() => ({ client: { user: { id: "su" }, on: vi.fn(), once: vi.fn(), login: vi.fn(), channels: { fetch: vi.fn() } }, requests: [] as Array<Record<string, any>>, workerCalls: [] as Array<{ path: string; body: any }>, pullResponse: { status: "ok", notes: [] as any[] }, connpassJson: JSON.stringify({ results_start: 1, results_returned: 0, results_available: 0, events: [] }) }));
 vi.mock("discord.js", async () => ({ ...await vi.importActual("discord.js"), Client: class { constructor() { return mocks.client; } } }));
 vi.mock("../src/gateway/voice-chat.js", () => ({ VoiceChat: class {} }));
 vi.mock("../src/gateway/conversation-audit.js", () => ({ auditConversation: vi.fn() }));
@@ -35,7 +35,12 @@ beforeAll(async () => {
       expect((options.headers as Record<string, string>)["x-api-key"]).toBe("connpass-fixture");
       return new Response(mocks.connpassJson, { headers: { "content-type": "application/json" } });
     }
-    if (String(url).includes("worker.test")) return Response.json({ ok: true, synced: true });
+    if (String(url).includes("worker.test")) {
+      const path = new URL(String(url)).pathname;
+      mocks.workerCalls.push({ path, body: JSON.parse((options.body as string) || "{}") });
+      if (path === "/internal/experiences/pull") return Response.json(mocks.pullResponse);
+      return Response.json({ ok: true, synced: true });
+    }
     const request = JSON.parse(options.body as string); mocks.requests.push(request);
     const extraction = request.messages[0].content.includes("スー宛の実際の会話");
     return Response.json({ choices: [{ message: { role: "assistant", content: extraction ? JSON.stringify([{ sourceId: "original", quote, interpretation: "クイズと投票を分けて説明する", kind: "discovery" }]) : "正解のない4択は投票として伝えます。" } }] });
