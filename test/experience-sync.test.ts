@@ -19,7 +19,7 @@ const rpc = (result: unknown) => Response.json({ result });
 const structured = (value: unknown) => rpc({ structuredContent: value });
 const saved = () => structured({ operation: "created", memoryNode: { id: "node-1", gardenId: "garden", sourceKey } });
 const listed = (nodes: unknown[]) => structured({ memoryNodes: nodes });
-const gardenNode = (overrides: Record<string, unknown> = {}) => ({ id: "node-1", sourceKey, kind: "knowledge", state: "active",
+const gardenNode = (overrides: Record<string, unknown> = {}) => ({ id: "node-1", gardenId: "garden", sourceKey, kind: "knowledge", state: "active",
   visibility: "garden", source: "ai-driven-development-discord-bot/gateway experience", body: "出来事: もとの本文", updatedAt: "2026-09-17T00:00:00.000Z", ...overrides });
 const args = (fetcher: ReturnType<typeof vi.fn>) => fetcher.mock.calls.map(c => JSON.parse((c[1] as RequestInit).body as string).params);
 
@@ -35,19 +35,69 @@ it("creates one Garden node for the first revision and never files an experience
   expect(JSON.stringify(call.arguments)).toContain("正解のない4択");
   expect(JSON.stringify(call.arguments)).not.toContain("sourceId");
 });
+// DecisionGarden contract (webapp-decisiongarden update_memory_node): required expectedUpdatedAt,
+// strict arg set, immutable provenance/lifecycle, and a memoryNode receipt echoing the stored content.
+const updateReceipt = (operation: "updated" | "unchanged", body: string, overrides: Record<string, unknown> = {}) =>
+  structured({ operation, expectedUpdatedAtMatched: operation === "updated",
+    memoryNode: { ...gardenNode(), body, title: "スーの経験: 正解のない4択の呼び方", ...overrides } });
+
 it("updates the same node in place for a later revision, guarded by expectedUpdatedAt", async () => {
+  const sent: string[] = [];
   const fetcher = vi.fn()
     .mockResolvedValueOnce(listed([gardenNode({ sourceKey: "su-experience:" + "b".repeat(64) }), gardenNode()]))
-    .mockResolvedValueOnce(structured({ operation: "updated", memoryNode: { id: "node-1" } }));
+    .mockImplementationOnce(async (_url: unknown, options: RequestInit) => {
+      const call = JSON.parse(options.body as string).params.arguments;
+      sent.push(call.body);
+      return updateReceipt("updated", call.body);
+    });
   vi.stubGlobal("fetch", fetcher);
   const result = await worker.fetch(request(data({ revision: 2, observation: "投票と呼ぶのが一番わかりやすい" })), env as never, {} as never);
   expect(await result.json()).toEqual({ synced: true, operation: "updated" });
   const calls = args(fetcher);
   expect(calls.map(c => c.name)).toEqual(["list_memory_nodes", "update_memory_node"]);
   expect(calls[1].arguments).toMatchObject({ nodeId: "node-1", expectedUpdatedAt: "2026-09-17T00:00:00.000Z" });
-  expect(calls[1].arguments.body).toContain("投票と呼ぶのが一番わかりやすい");
+  expect(sent[0]).toContain("投票と呼ぶのが一番わかりやすい");
+  // Strict schema: provenance and lifecycle fields are rejected by the Garden, so they are never sent.
+  expect(Object.keys(calls[1].arguments).sort()).toEqual(["body", "expectedUpdatedAt", "nodeId", "title"]);
   // save_memory_node is create-only; it is never used to fake an update.
   expect(calls.some(c => c.name === "save_memory_node")).toBe(false);
+});
+it("accepts operation=unchanged as the applied-retry answer, and rejects a mismatched update receipt", async () => {
+  // A retry of an update that already landed: stale token, no write, still genuinely synced.
+  let body = "";
+  const ok = vi.fn().mockResolvedValueOnce(listed([gardenNode()]))
+    .mockImplementationOnce(async (_url: unknown, options: RequestInit) => {
+      body = JSON.parse(options.body as string).params.arguments.body;
+      return structured({ operation: "unchanged", expectedUpdatedAtMatched: false,
+        memoryNode: { ...gardenNode(), body, title: "スーの経験: 正解のない4択の呼び方" } });
+    });
+  vi.stubGlobal("fetch", ok);
+  expect(await (await worker.fetch(request(data({ revision: 2 })), env as never, {} as never)).json())
+    .toEqual({ synced: true, operation: "unchanged" });
+
+  // An acknowledgement that does not prove our content is stored is not a completed sync.
+  for (const bad of [
+    structured({ operation: "updated" }),
+    structured({ operation: "updated", memoryNode: { ...gardenNode(), body: "誰かが書き換えた別の本文", title: "別" } }),
+    structured({ operation: "updated", memoryNode: { ...gardenNode(), gardenId: "other", body } }),
+    structured({ memoryNode: { ...gardenNode(), body } }),
+  ]) {
+    const fetcher = vi.fn().mockResolvedValueOnce(listed([gardenNode()])).mockResolvedValueOnce(bad);
+    vi.stubGlobal("fetch", fetcher);
+    const result = await worker.fetch(request(data({ revision: 2 })), env as never, {} as never);
+    expect(result.status).toBe(502);
+    expect(await result.json()).toEqual({ synced: false, status: "failed" });
+  }
+});
+it("holds on a missing scope or Garden write role instead of retrying it as a transient failure", async () => {
+  for (const denial of ["forbidden", "insufficient_scope", "personal_token_required", "provenance_immutable"]) {
+    const fetcher = vi.fn().mockResolvedValueOnce(listed([gardenNode()]))
+      .mockResolvedValueOnce(rpc({ isError: true, content: [{ text: denial }] }));
+    vi.stubGlobal("fetch", fetcher);
+    const result = await worker.fetch(request(data({ revision: 2 })), env as never, {} as never);
+    expect(result.status).toBe(403);
+    expect(await result.json()).toEqual({ synced: false, status: "not_permitted" });
+  }
 });
 it("reports an older Garden without an update tool as waiting, not as a completed sync", async () => {
   for (const unsupported of [
@@ -66,7 +116,7 @@ it("surfaces source_key_conflict and version conflict instead of a silent no_cha
   const conflict = rpc({ isError: true, content: [{ text: "source_key_conflict" }] });
   const fetcher = vi.fn().mockResolvedValueOnce(conflict)
     .mockResolvedValueOnce(listed([gardenNode()]))
-    .mockResolvedValueOnce(rpc({ isError: true, content: [{ text: "seed_version_conflict" }] }));
+    .mockResolvedValueOnce(rpc({ isError: true, content: [{ text: "updated_at_conflict" }] }));
   vi.stubGlobal("fetch", fetcher);
   for (const body of [data(), data({ revision: 4 })]) {
     const result = await worker.fetch(request(body), env as never, {} as never);

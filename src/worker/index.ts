@@ -1294,7 +1294,7 @@ async function handleInternalFeedback(request: Request, env: Env): Promise<Respo
 // ---------------------------------------------------------------------------
 
 /** Distinguishes "this server cannot do it yet" and "someone else changed it" from a plain failure. */
-export type McpFailureKind = "unsupported" | "conflict" | "not_found" | "other";
+export type McpFailureKind = "unsupported" | "conflict" | "not_permitted" | "not_found" | "other";
 export class McpToolError extends Error {
   constructor(readonly kind: McpFailureKind, message: string) {
     super(message);
@@ -1303,7 +1303,10 @@ export class McpToolError extends Error {
 }
 function classifyMcpFailure(text: string): McpFailureKind {
   if (/unknown[_ ]tool|tool[_ ]not[_ ]found|method not found|not implemented|unsupported/i.test(text)) return "unsupported";
-  if (/source_key_conflict|seed_version_conflict|conflict|expectedUpdatedAt/i.test(text)) return "conflict";
+  // DecisionGarden's compare-and-set answer, plus the create-only replay guard.
+  if (/updated_at_conflict|source_key_conflict|seed_version_conflict|conflict|expectedUpdatedAt/i.test(text)) return "conflict";
+  // A missing scope or a viewer role will not clear on a fast retry.
+  if (/forbidden|personal_token_required|insufficient_scope|provenance_immutable|lifecycle_not_updatable|unauthorized/i.test(text)) return "not_permitted";
   if (/not_found/i.test(text)) return "not_found";
   return "other";
 }
@@ -1566,6 +1569,7 @@ async function syncPublicExperience(env: Env, item: PublicExperience): Promise<R
     const kind = error instanceof McpToolError ? error.kind : "other";
     if (kind === "unsupported") return json({ synced: false, status: "update_unsupported" });
     if (kind === "conflict") return json({ synced: false, status: "conflict" }, 409);
+    if (kind === "not_permitted") return json({ synced: false, status: "not_permitted" }, 403);
     return json({ synced: false, status: "failed" }, 502);
   };
   try {
@@ -1578,10 +1582,19 @@ async function syncPublicExperience(env: Env, item: PublicExperience): Promise<R
       });
       return json({ synced: true, operation: "created" });
     }
-    await mcpCall(dg.url, dg.token, "update_memory_node", {
-      nodeId: existing.id, ...content, expectedUpdatedAt: existing.updatedAt,
-    });
-    return json({ synced: true, operation: "updated" });
+    // Only the mutable fields; gardenId/kind/source/sourceKey and state/visibility are rejected by the Garden.
+    const receipt = await mcpCall(dg.url, dg.token, "update_memory_node", {
+      nodeId: existing.id, expectedUpdatedAt: existing.updatedAt, ...content,
+    }) as { operation?: unknown; memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown; title?: unknown; body?: unknown } } | null;
+    const node = receipt?.memoryNode;
+    // "unchanged" is the Garden's honest answer to a retry of an update that already landed, so it
+    // counts as synced; the receipt still has to prove the stored content is the content we sent.
+    if ((receipt?.operation !== "updated" && receipt?.operation !== "unchanged") || !node
+      || node.id !== existing.id || node.gardenId !== dg.gardenId || node.sourceKey !== sourceKey
+      || node.title !== content.title || node.body !== content.body) {
+      throw new McpToolError("other", "MCP update receipt missing or mismatched");
+    }
+    return json({ synced: true, operation: receipt.operation });
   } catch (error) { return fail(error); }
 }
 

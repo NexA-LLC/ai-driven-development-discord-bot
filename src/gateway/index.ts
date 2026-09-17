@@ -536,7 +536,8 @@ export async function experienceTick(): Promise<void> {
     // An older Garden without an update tool is reported as waiting, never as a completed sync.
     const status = result?.status;
     if (status === "update_unsupported") console.warn(`experience ${memory.threadId.slice(0, 8)} rev${memory.revision}: Garden has no update tool yet; waiting`);
-    return status === "update_unsupported" || status === "conflict" || status === "not_configured" ? status : "failed";
+    if (status === "not_permitted") console.warn(`experience ${memory.threadId.slice(0, 8)} rev${memory.revision}: Garden write access missing; waiting`);
+    return status === "update_unsupported" || status === "not_permitted" || status === "conflict" || status === "not_configured" ? status : "failed";
   }, memory => publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId),
     async threadId => (await postSigned<{ retracted: boolean }>("/internal/experiences/retract", { threadId })).retracted === true);
   await pullEditorNotes();

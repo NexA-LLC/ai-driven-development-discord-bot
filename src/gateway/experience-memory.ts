@@ -31,11 +31,13 @@ const stateSchema = z.object({ memories: z.array(memorySchema).max(200), jobs: z
 export type AnalysisStatus = z.infer<typeof jobSchema>["status"];
 export type CompleteExperience = (messages: AgentMessage[]) => Promise<string>;
 /** Sync outcomes the Worker can report. Only "synced" settles a revision. */
-export type SyncOutcome = "synced" | "update_unsupported" | "conflict" | "not_configured" | "failed";
+export type SyncOutcome = "synced" | "update_unsupported" | "not_permitted" | "conflict" | "not_configured" | "failed";
 const sensitive = /(?:Bearer\s|password\s*[:=]|api[_-]?key\s*[:=]|秘密|パスワード|sk-[a-z0-9]{8})/i;
 const HOLD_MS: Record<Exclude<SyncOutcome, "synced">, number> = {
-  // A server without the update tool needs a deploy, not a fast retry. Nothing is ever marked synced.
-  update_unsupported: 6 * 3600_000, not_configured: 6 * 3600_000, conflict: 3600_000, failed: 900_000,
+  // A missing tool, a missing config or a missing permission needs a human, not a fast retry.
+  // Nothing here is ever marked synced.
+  update_unsupported: 6 * 3600_000, not_configured: 6 * 3600_000, not_permitted: 6 * 3600_000,
+  conflict: 3600_000, failed: 900_000,
 };
 
 const extractionPolicy = `スー宛の実際の会話から、面白い発見・考えが変わった点・興味・未完の話を最大3件選ぶ。苦情に限定しない。

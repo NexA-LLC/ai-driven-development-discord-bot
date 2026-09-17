@@ -10,11 +10,13 @@
 
 記憶の単位は日付ではなく thread。新しい候補は、**同じguild・同じchannel**の既存記憶とだけ突き合わせ、内容語（かな以外を含むbigramと英数語）の共有数4以上かつ短い方に対する比率0.2以上のときだけ同じ thread の更新とする。LLMの同一話題判断だけでは統合しない。更新時は `revision` を進め、直前の引用・解釈を最大5件の履歴として残す（古い言い回しでも後から呼び戻せる）。内容が同一なら no-op。閾値を外して別threadになった場合の損失は「ノードが1件増える」だけで、誤って結合しても同一channel内に閉じ、根拠は履歴に残る。
 
-公開可能と運営が指定したチャンネルだけ、@everyoneの閲覧権限・deny上書き・現在の根拠を再確認し、既存署名付きWorker経路 `/internal/experiences/sync` を呼ぶ。`sourceKey=su-experience:<threadId>` は thread 単位で固定。**revision 1 は create-only の `save_memory_node`、revision 2 以降は `update_memory_node`**（`expectedUpdatedAt` 付き）を使う。`save_memory_node` を update 代わりに使わない。
+公開可能と運営が指定したチャンネルだけ、@everyoneの閲覧権限・deny上書き・現在の根拠を再確認し、既存署名付きWorker経路 `/internal/experiences/sync` を呼ぶ。`sourceKey=su-experience:<threadId>` は thread 単位で固定。**revision 1 は create-only の `save_memory_node`、revision 2 以降は `update_memory_node`** を使う。`save_memory_node` に同じ sourceKey で別 body を投げる代用はしない。
+
+DecisionGarden 側の確定 contract は `update_memory_node({nodeId, expectedUpdatedAt, title?, body?, evidence?})`。`expectedUpdatedAt` は `get_memory_node` / `list_memory_nodes` の値そのままで必須。`gardenId` / `kind` / `source` / `sourceKey` は `provenance_immutable`、`state` / `visibility` は `lifecycle_not_updatable` で拒否されるので送らない（未知フィールドも拒否）。CAS 不一致は `updated_at_conflict` で何も書かない。ただし保存済み内容が要求内容と一致する場合だけは「適用済みの再試行」として `operation:"unchanged"` / `expectedUpdatedAtMatched:false` を返すので、Bot はこれも同期成功として扱う（timeout 後の再送が二重書き込みにならない）。成功応答の `memoryNode` は `id` / `gardenId` / `sourceKey` / `title` / `body` / `updatedAt` を含み、Bot は送った title と body が実際に保存されたことまで照合してから synced にする。
 
 公開本文は定型文ではなく「出来事 / 受け止め方 / 残る問い」を短く保持する。公開前に Discord ID・URL・メールアドレス・コードブロック・敬称付きの氏名・長い数字列を置換し、秘密パターンを含む候補は公開しない。置換で具体性が残らない場合はその旨を書き、文章を捏造しない。事実は引用由来の「出来事」、解釈は「受け止め方」に分けて書く。
 
-HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `conflict`（`source_key_conflict` や版ずれ）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` と `not_configured` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
+HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `not_permitted`（scope や Garden write 権限の不足）/ `conflict`（`updated_at_conflict` や `source_key_conflict`）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` / `not_configured` / `not_permitted` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
 
 記憶が期限切れ・根拠削除で消えたときは、新しい報告を作らずに `/internal/experiences/retract` から `set_memory_node_lifecycle` で archived + private に下げる（可逆・冪等）。毎分のtickは、公開待ちがなくても最大5件の記憶の根拠存在を確認し、消えた根拠を回収する。
 
