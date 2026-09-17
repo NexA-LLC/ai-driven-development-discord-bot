@@ -16,11 +16,13 @@ connpass API v2 からAI駆動開発グループ（`subdomain=aid`）のイベ�
 
 #### 導入順・未反映時の挙動・ロールバック
 
-1. **DecisionGarden（先）** — Knowledge/TODO の本文を更新する `update_memory_node({nodeId, expectedUpdatedAt, title?, body?, evidence?})` が必要です（`mcp:write` + Garden write、`gardenId`/`kind`/`source`/`sourceKey` と `state`/`visibility` は指定不可、未知フィールドは拒否）。CAS 不一致は `updated_at_conflict` で何も書きません。ただし保存済み内容が要求内容と同じ場合は「適用済みの再試行」として `operation:"unchanged"` を返すため、Bot はこれを同期成功として扱います。既存の `save_memory_node` は create-only のままで、意味は変えません。未反映でも Bot は落ちません。
-2. **Worker（次）** — `/internal/experiences/sync`（revision 1 は `save_memory_node`、revision 2 以降は `update_memory_node`）、`/internal/experiences/retract`、`/internal/experiences/pull`、`/internal/maintenance/run` が入ります。`/internal/digest/run` は同じ保守処理への互換エイリアスとして残り、`deprecatedAlias: true` を返します。
+1. **DecisionGarden（先）** — 関連PR: [NexA-LLC/webapp-decisiongarden#21](https://github.com/NexA-LLC/webapp-decisiongarden/pull/21)（`update_memory_node` の追加と、archived な Knowledge の読み取り互換修正）。Knowledge/TODO の本文を更新する `update_memory_node({nodeId, expectedUpdatedAt, title?, body?, evidence?})` が必要です（`mcp:write` + Garden write、`gardenId`/`kind`/`source`/`sourceKey` と `state`/`visibility` は指定不可、未知フィールドは拒否）。CAS 不一致は `updated_at_conflict` で何も書きません。ただし保存済み内容が要求内容と同じ場合は「適用済みの再試行」として `operation:"unchanged"` を返すため、Bot はこれを同期成功として扱います。既存の `save_memory_node` は create-only のままで、意味は変えません。未反映でも Bot は落ちません。
+2. **Worker（次）** — `/internal/experiences/sync`（revision 1 は `save_memory_node`、revision 2 以降は `update_memory_node`）、`/internal/experiences/retract`、`/internal/experiences/pull`、`/internal/maintenance/run` が入ります。Garden へのアクセスは、作成時に受け取った node id で `get_memory_node` を1件ずつ呼ぶ形に限定され、Garden 全体の一覧取得は行いません。`/internal/digest/run` は同じ保守処理への互換エイリアスとして残り、`deprecatedAlias: true` を返します。
 3. **Gateway（最後）** — 夜間保守の呼び先が `/internal/maintenance/run` に変わり、`MAINTENANCE_HOUR_JST`（未設定なら `DIGEST_HOUR_JST`）で動きます。`experiences.json` は既存ファイルのまま読めます（新しい項目は既定値で補完）。
 
 **未反映時の挙動**: DecisionGarden が旧版だと、初回作成は成功し、2回目以降の更新は `update_unsupported` として**同期待ち**になります。権限不足（`forbidden` / `insufficient_scope` など）は `not_permitted`、Garden 側で人が編集していた場合は `conflict`、公開済みノードが消えていた場合は `absent` として同様に保留します。いずれも成功扱いにはせず、6時間ごとに再試行し、`syncedRevision` は進めません。人の編集を上書きすることはありません。Worker が旧版だと Gateway の保守呼び出しは互換エイリアス経由で通ります。DecisionGarden 自体が未設定・不調でも会話は継続します。
+
+**移行**: node id を記録する前に公開されたコピーは更新も取り下げもできないため、`node_unknown` として保留しログに出します（Garden 全体を検索して探すことはしません）。該当は手動で archived+private にするか、30日の失効を待ってください。新規の経験は作成時に node id を受け取るので影響しません。
 
 **ロールバック**: Gateway → Worker の順に前のリビジョンへ戻します。Garden 上のノードは残り、`sourceKey` は `su-experience:<threadId>` のまま変わらないため、再適用時に二重作成は起きません。`update_memory_node` の追加は既存データを書き換えないので、DecisionGarden 側は単独で戻せます。保全済みの旧日次報告（archived/private）には触れません。
 

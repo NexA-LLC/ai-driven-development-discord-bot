@@ -9,7 +9,7 @@ import { allowsConversationInChannel, conversationContext, conversationReference
 import { ExperienceStore, experienceReference, type ExperienceMemory, type SyncOutcome } from "./experience-memory.js";
 import { ConnpassFeed, eventReference } from "./connpass-feed.js";
 import { deliverMusing } from "./musing.js";
-import { publicExperience } from "../shared/public-experience.js";
+import { publicExperience, publicExperienceBody } from "../shared/public-experience.js";
 import { startTyping } from "./typing.js";
 import { seedQuizReactions } from "../shared/quiz-reactions.js";
 import { isQuizPrompt, parseRequestedQuiz, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
@@ -17,7 +17,7 @@ import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { auditConversation } from "./conversation-audit.js";
 import { inbox } from "./inbox.js";
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
   ChannelType,
@@ -114,6 +114,8 @@ const maintenanceHourJst = readPositiveInteger("MAINTENANCE_HOUR_JST", readPosit
 let lastMaintenanceDate = readSlot("digest-date");
 // How often human edits made in the Garden are read back for known experience threads.
 const experiencePullMs = readPositiveInteger("EXPERIENCE_PULL_SECONDS", 3600) * 1_000;
+// Nodes read back per pull. The Worker caps this server-side too; the whole Garden is never read.
+const experiencePullBatch = 20;
 let lastExperiencePullAt = 0;
 let sweepCursor = 0;
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
@@ -513,6 +515,9 @@ async function recallExperiences(message: Message, query: string): Promise<Exper
 client.on(Events.MessageDelete, message => { try { experiences.removeSource(message.id); } catch { console.error("experience deletion failed"); } });
 client.on(Events.MessageBulkDelete, messages => { for (const message of messages.values()) { try { experiences.removeSource(message.id); } catch { console.error("experience deletion failed"); } } });
 
+/** Lets a read-back tell the text we published from a text a person rewrote. */
+const bodyHash = (body: string): string => createHash("sha256").update(body).digest("hex");
+
 /** Operator-approved public channel inside the primary guild. Publication needs this and a review. */
 const publishableChannel = (memory: ExperienceMemory): boolean =>
   publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId);
@@ -541,23 +546,30 @@ export async function experienceTick(): Promise<void> {
     const publishable = publicExperience(memory);
     // No cleared summary means nothing may be published; never fall back to a generic node.
     if (!publishable) return { outcome: "failed" };
-    // The baseline is our own last-write token. The Worker compares it and refuses rather than
+    // The node id addresses exactly one Garden node, so nothing else in the Garden is ever read.
+    // The baseline is our own last-write token: the Worker compares it and refuses rather than
     // overwriting when a person has edited the node since; it is never a freshly read token.
-    const payload = { ...publishable, ...(memory.syncedUpdatedAt ? { baselineUpdatedAt: memory.syncedUpdatedAt } : {}) };
+    const payload = { ...publishable,
+      ...(memory.syncedUpdatedAt ? { baselineUpdatedAt: memory.syncedUpdatedAt } : {}),
+      ...(memory.gardenNodeId ? { nodeId: memory.gardenNodeId } : {}) };
     // A conflict or a Garden failure answers with a non-2xx; the status still has to be read, not thrown away.
-    const result = (await postSignedOutcome<{ synced?: boolean; status?: SyncOutcome; updatedAt?: string }>("/internal/experiences/sync", payload)).body;
-    if (result?.synced === true) return { outcome: "synced", updatedAt: result.updatedAt ?? null };
+    const result = (await postSignedOutcome<{ synced?: boolean; status?: SyncOutcome; updatedAt?: string; nodeId?: string }>("/internal/experiences/sync", payload)).body;
+    if (result?.synced === true) {
+      return { outcome: "synced", updatedAt: result.updatedAt ?? null, nodeId: result.nodeId ?? null,
+        bodyHash: bodyHash(publicExperienceBody(publishable).body) };
+    }
     const status = result?.status;
     const waiting: Record<string, string> = {
       // An older Garden without an update tool is reported as waiting, never as a completed sync.
       update_unsupported: "Garden has no update tool yet", not_permitted: "Garden write access missing",
       conflict: "someone edited this node in the Garden", absent: "the Garden node is gone",
       awaiting_readback: "no baseline yet; reading the Garden copy back first",
+      node_unknown: "published before node ids were tracked; archive or re-create it by hand",
     };
     if (status && waiting[status]) console.warn(`experience ${memory.threadId.slice(0, 8)} rev${memory.revision}: ${waiting[status]}; waiting`);
     return { outcome: status && (waiting[status] || status === "not_configured") ? status as SyncOutcome : "failed" };
   }, publishableChannel,
-    async threadId => (await postSigned<{ retracted: boolean }>("/internal/experiences/retract", { threadId })).retracted === true);
+    async entry => (await postSigned<{ retracted: boolean }>("/internal/experiences/retract", entry)).retracted === true);
   // A publish blocked only on a missing baseline is unblocked by reading the Garden copy now.
   await pullEditorNotes(Date.now(), experiences.awaitingReadback());
 }
@@ -579,15 +591,19 @@ async function sweepDeletedEvidence(): Promise<void> {
 async function pullEditorNotes(now = Date.now(), force = false): Promise<void> {
   if (!force && now - lastExperiencePullAt < experiencePullMs) return;
   lastExperiencePullAt = now;
-  const threadIds = experiences.threadIds(now).slice(0, 50);
-  if (!threadIds.length) return;
+  // Only nodes we created, one bounded batch: the rest of the Garden is never read.
+  const nodes = experiences.publishedNodes(experiencePullBatch, now);
+  if (!nodes.length) return;
+  const known = new Set(nodes.map(n => n.threadId));
   try {
     const result = await postSigned<{ status: string; covered?: string[]; notes?: Array<{ threadId: string; body: string; updatedAt: string }> }>(
-      "/internal/experiences/pull", { threadIds });
+      "/internal/experiences/pull", { nodes });
     // Only an authoritative answer may clear a cached note; a partial or failed read clears nothing.
     if (result.status !== "ok" || !Array.isArray(result.notes) || !Array.isArray(result.covered)) return;
-    const covered = result.covered.filter(id => threadIds.includes(id));
-    experiences.applyEditorNotes(result.notes.filter(n => covered.includes(n.threadId)), covered, now);
+    const covered = result.covered.filter(id => known.has(id));
+    experiences.applyEditorNotes(
+      result.notes.filter(n => covered.includes(n.threadId)).map(n => ({ ...n, bodyHash: bodyHash(n.body) })),
+      covered, now);
   } catch { /* The Garden is optional context; conversation continues without it. */ }
 }
 

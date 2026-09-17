@@ -218,35 +218,48 @@ export default {
       let parsed;
       // The Gateway's own last-write token travels alongside, not inside, the strict public payload.
       let baseline: string | null = null;
+      let nodeId: string | null = null;
       try {
-        const { baselineUpdatedAt, ...experience } = JSON.parse(rawBody) as Record<string, unknown>;
+        const { baselineUpdatedAt, nodeId: node, ...experience } = JSON.parse(rawBody) as Record<string, unknown>;
         if (typeof baselineUpdatedAt === "string" && baselineUpdatedAt.trim()) baseline = baselineUpdatedAt;
+        if (typeof node === "string" && node.trim()) nodeId = node;
         parsed = publicExperienceSchema.safeParse(experience);
       }
       catch { return json({ error: "invalid_experience" }, 400); }
       if (!parsed.success || parsed.data.at > Date.now() || parsed.data.at < Date.now() - 30 * 86400_000) return json({ error: "invalid_experience" }, 400);
-      return syncPublicExperience(env, parsed.data, baseline);
+      return syncPublicExperience(env, parsed.data, baseline, nodeId);
     }
 
     if (request.method === "POST" && url.pathname === "/internal/experiences/retract") {
       const rawBody = await request.text();
       if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
       let threadId = "";
-      try { threadId = String((JSON.parse(rawBody || "{}") as { threadId?: unknown }).threadId ?? ""); } catch { /* invalid below */ }
+      let retractNodeId: string | null = null;
+      try {
+        const body = JSON.parse(rawBody || "{}") as { threadId?: unknown; nodeId?: unknown };
+        threadId = String(body.threadId ?? "");
+        if (typeof body.nodeId === "string" && body.nodeId.trim()) retractNodeId = body.nodeId;
+      } catch { /* invalid below */ }
       if (!/^[a-f0-9]{64}$/.test(threadId)) return json({ error: "invalid_thread" }, 400);
-      return retractPublicExperience(env, threadId);
+      return retractPublicExperience(env, threadId, retractNodeId);
     }
 
     if (request.method === "POST" && url.pathname === "/internal/experiences/pull") {
       const rawBody = await request.text();
       if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
-      let threadIds: string[] = [];
+      let wanted: Array<{ threadId: string; nodeId: string }> = [];
       try {
-        const value = (JSON.parse(rawBody || "{}") as { threadIds?: unknown }).threadIds;
-        threadIds = Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v)).slice(0, 50) : [];
+        const value = (JSON.parse(rawBody || "{}") as { nodes?: unknown }).nodes;
+        // One bounded batch of known nodes. The whole Garden is never read to find them.
+        wanted = Array.isArray(value) ? value
+          .filter((v): v is { threadId: string; nodeId: string } => !!v && typeof v === "object"
+            && /^[a-f0-9]{64}$/.test(String((v as { threadId?: unknown }).threadId ?? ""))
+            && UUID.test(String((v as { nodeId?: unknown }).nodeId ?? "")))
+          .map(v => ({ threadId: v.threadId, nodeId: v.nodeId }))
+          .slice(0, EXPERIENCE_PULL_BATCH) : [];
       } catch { /* empty request below */ }
-      if (!threadIds.length) return json({ status: "empty_request", notes: [] }, 400);
-      return pullPublicExperiences(env, threadIds);
+      if (!wanted.length) return json({ status: "empty_request", covered: [], notes: [] }, 400);
+      return pullPublicExperiences(env, wanted);
     }
 
     // /internal/maintenance/run replaces the daily digest. /internal/digest/run stays as a compatible alias.
@@ -1561,12 +1574,15 @@ async function handleInquiryStatusCommand(
 // ---------------------------------------------------------------------------
 
 const EXPERIENCE_SOURCE = "ai-driven-development-discord-bot/gateway experience";
+/** Nodes read back per pull. One request per node, so this bounds the work per tick. */
+export const EXPERIENCE_PULL_BATCH = 20;
 
 /**
- * One Garden node per experience thread. save_memory_node is create-only and idempotent, so a later
- * revision must go through an update tool; a server without one is reported as waiting, never as synced.
+ * One Garden node per experience thread, addressed by the node id we were given when we created it.
+ * save_memory_node is create-only and idempotent, so a later revision must go through an update tool;
+ * a server without one is reported as waiting, never as synced.
  */
-async function syncPublicExperience(env: Env, item: PublicExperience, baselineUpdatedAt: string | null): Promise<Response> {
+async function syncPublicExperience(env: Env, item: PublicExperience, baselineUpdatedAt: string | null, nodeId: string | null): Promise<Response> {
   const dg = decisiongarden(env);
   if (!dg) return json({ synced: false, status: "not_configured" });
   const sourceKey = publicExperienceSourceKey(item.id);
@@ -1579,101 +1595,110 @@ async function syncPublicExperience(env: Env, item: PublicExperience, baselineUp
     return json({ synced: false, status: "failed" }, 502);
   };
   try {
-    const listing = item.revision > 1 || baselineUpdatedAt ? await listMemoryNodes(dg) : null;
-    const existing = listing?.nodes.find(n => n.sourceKey === sourceKey) ?? null;
-    if (!existing) {
-      // A node we once published cannot be recreated from here: someone removed it on purpose,
-      // and an incomplete listing is not evidence of removal either.
-      if (baselineUpdatedAt) return json({ synced: false, status: listing?.complete ? "absent" : "failed" }, listing?.complete ? 200 : 502);
-      await mcpCall(dg.url, dg.token, "save_memory_node", {
+    if (!nodeId) {
+      // Nothing was ever published for this thread, so create it and remember the id we get back.
+      // A memory that predates id tracking cannot be updated safely and says so instead of guessing.
+      if (item.revision > 1 && baselineUpdatedAt) return json({ synced: false, status: "node_unknown" });
+      const receipt = await mcpCall(dg.url, dg.token, "save_memory_node", {
         gardenId: dg.gardenId, sourceKey, source: EXPERIENCE_SOURCE,
         // Open questions stay knowledge. スー never files an operational TODO into the Garden.
         kind: "knowledge", state: "active", visibility: "garden", ...content,
-      });
-      return json({ synced: true, operation: "created" });
+      }) as { memoryNode?: { id?: unknown } } | null;
+      const created = receipt?.memoryNode?.id;
+      if (typeof created !== "string" || !UUID.test(created)) throw new McpToolError("other", "MCP save receipt has no usable node id");
+      return json({ synced: true, operation: "created", nodeId: created });
     }
+    if (!UUID.test(nodeId)) throw new McpToolError("other", "node id is not a UUID");
+    const existing = await getMemoryNode(dg, nodeId, sourceKey);
+    // Only a direct read saying the node is not there means it is gone. Nothing else implies absence.
+    if (!existing) return json({ synced: false, status: "absent" });
     // Without a baseline from our own last write there is nothing to compare a human edit against,
     // so the read-back path has to run first. Overwriting with a freshly read token would erase it.
     if (!baselineUpdatedAt) return json({ synced: false, status: "awaiting_readback" });
     // The node moved since we last wrote it: a person edited it. Never resolve that by overwriting.
     if (existing.updatedAt !== baselineUpdatedAt) return json({ synced: false, status: "conflict" }, 409);
-    if (!UUID.test(existing.id)) throw new McpToolError("other", "MCP node id is not a UUID");
     // Only the mutable fields; gardenId/kind/source/sourceKey and state/visibility are rejected by the Garden.
     const receipt = await mcpCall(dg.url, dg.token, "update_memory_node", {
-      nodeId: existing.id, expectedUpdatedAt: baselineUpdatedAt, ...content,
+      nodeId, expectedUpdatedAt: baselineUpdatedAt, ...content,
     }) as { operation?: unknown; memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown; title?: unknown; body?: unknown; updatedAt?: unknown } } | null;
     const node = receipt?.memoryNode;
     // "unchanged" is the Garden's honest answer to a retry of an update that already landed, so it
     // counts as synced; the receipt still has to prove the stored content is the content we sent.
     if ((receipt?.operation !== "updated" && receipt?.operation !== "unchanged") || !node
-      || node.id !== existing.id || node.gardenId !== dg.gardenId || node.sourceKey !== sourceKey
+      || node.id !== nodeId || node.gardenId !== dg.gardenId || node.sourceKey !== sourceKey
       || node.title !== content.title || node.body !== content.body
       || typeof node.updatedAt !== "string" || !node.updatedAt) {
       throw new McpToolError("other", "MCP update receipt missing or mismatched");
     }
     // The receipt's timestamp becomes the next baseline, so the following write can still spot an edit.
-    return json({ synced: true, operation: receipt.operation, updatedAt: node.updatedAt });
+    return json({ synced: true, operation: receipt.operation, updatedAt: node.updatedAt, nodeId });
   } catch (error) { return fail(error); }
 }
 
 /** Expired or deleted evidence archives the public copy. Reversible, never a hard delete. */
-async function retractPublicExperience(env: Env, threadId: string): Promise<Response> {
+async function retractPublicExperience(env: Env, threadId: string, nodeId: string | null): Promise<Response> {
   const dg = decisiongarden(env);
   if (!dg) return json({ retracted: false, status: "not_configured" });
+  // Without the node id there is nothing to address, and hunting for it would mean reading the
+  // whole Garden. These are pre-tracking copies and are reported for manual handling instead.
+  if (!nodeId || !UUID.test(nodeId)) return json({ retracted: false, status: "node_unknown" });
   try {
-    const listing = await listMemoryNodes(dg);
-    const existing = listing.nodes.find(n => n.sourceKey === publicExperienceSourceKey(threadId)) ?? null;
-    if (!existing) {
-      // Missing from a truncated listing is not proof the node is gone; stay queued instead.
-      if (!listing.complete) return json({ retracted: false, status: "incomplete_listing" }, 502);
-      return json({ retracted: true, status: "absent" });
-    }
-    if (!UUID.test(existing.id)) throw new McpToolError("other", "MCP node id is not a UUID");
-    await mcpCall(dg.url, dg.token, "set_memory_node_lifecycle", { nodeId: existing.id, state: "archived", visibility: "private" });
+    const existing = await getMemoryNode(dg, nodeId, publicExperienceSourceKey(threadId));
+    if (!existing) return json({ retracted: true, status: "absent" });
+    await mcpCall(dg.url, dg.token, "set_memory_node_lifecycle", { nodeId, state: "archived", visibility: "private" });
     return json({ retracted: true, status: "archived" });
   } catch (error) {
     return json({ retracted: false, status: error instanceof McpToolError && error.kind === "unsupported" ? "update_unsupported" : "failed" }, 502);
   }
 }
 
-/** Reads back human edits for known experience threads only. Never returns archived or foreign nodes. */
-async function pullPublicExperiences(env: Env, threadIds: string[]): Promise<Response> {
+/** Reads back human edits for known nodes only, one bounded batch at a time. */
+async function pullPublicExperiences(env: Env, wanted: Array<{ threadId: string; nodeId: string }>): Promise<Response> {
   const dg = decisiongarden(env);
-  if (!dg) return json({ status: "not_configured", notes: [] });
-  const wanted = new Map(threadIds.map(id => [publicExperienceSourceKey(id), id]));
-  try {
-    const listing = await listMemoryNodes(dg);
-    // A partial listing cannot prove a note is gone, so the caller must not clear anything from it.
-    if (!listing.complete) return json({ status: "incomplete_listing", covered: [], notes: [] }, 502);
-    const notes = listing.nodes
-      .filter(n => wanted.has(n.sourceKey) && n.state === "active" && n.kind === "knowledge" && n.source === EXPERIENCE_SOURCE && n.visibility === "garden")
-      .map(n => ({ threadId: wanted.get(n.sourceKey)!, body: truncate(n.body, 2_000), updatedAt: n.updatedAt }));
-    // covered says which threads this answer is authoritative for: anything in it without a note
-    // has been archived, made private, or deleted, and its cached note must be dropped.
-    return json({ status: "ok", covered: threadIds, notes });
-  } catch (error) {
-    return json({ status: error instanceof McpToolError && error.kind === "unsupported" ? "unsupported" : "failed", covered: [], notes: [] }, 502);
+  if (!dg) return json({ status: "not_configured", covered: [], notes: [] });
+  const notes: Array<{ threadId: string; body: string; updatedAt: string }> = [];
+  const covered: string[] = [];
+  for (const { threadId, nodeId } of wanted) {
+    try {
+      const node = await getMemoryNode(dg, nodeId, publicExperienceSourceKey(threadId));
+      // Read succeeded, so this thread's answer is authoritative: present means note, absent means gone.
+      covered.push(threadId);
+      if (node) notes.push({ threadId, body: truncate(node.body, 2_000), updatedAt: node.updatedAt });
+    } catch (error) {
+      // A thread we could not read is left out of covered, so the caller clears nothing for it.
+      if (error instanceof McpToolError && error.kind === "unsupported") return json({ status: "unsupported", covered: [], notes: [] }, 502);
+    }
   }
+  if (!covered.length) return json({ status: "failed", covered: [], notes: [] }, 502);
+  return json({ status: "ok", covered, notes });
 }
 
 type GardenMemoryNode = { id: string; sourceKey: string; kind: string; state: string; visibility: string; source: string; body: string; updatedAt: string };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// The confirmed contract returns every node in one answer. If a future server starts paging,
-// these markers appear and "absent from the page" stops meaning "absent from the Garden".
-const PAGINATION_KEYS = ["nextCursor", "cursor", "hasMore", "nextPageToken", "truncated", "total"] as const;
 
-async function listMemoryNodes(dg: { url: string; token: string; gardenId: string }): Promise<{ nodes: GardenMemoryNode[]; complete: boolean }> {
-  const result = await mcpCall(dg.url, dg.token, "list_memory_nodes", { gardenId: dg.gardenId, kind: "knowledge" }) as Record<string, unknown> | null;
-  const nodes = result?.memoryNodes;
-  if (!Array.isArray(nodes)) throw new McpToolError("other", "MCP list_memory_nodes returned no list");
-  const complete = !!result && !PAGINATION_KEYS.some(key => result[key] !== undefined);
-  return {
-    complete,
-    nodes: nodes.filter((n): n is GardenMemoryNode => !!n && typeof n === "object"
-      && typeof (n as GardenMemoryNode).id === "string" && typeof (n as GardenMemoryNode).sourceKey === "string")
-      .map(n => ({ ...n, body: String(n.body ?? ""), updatedAt: String(n.updatedAt ?? ""), source: String(n.source ?? ""), state: String(n.state ?? ""), kind: String(n.kind ?? ""), visibility: String(n.visibility ?? "") })),
-  };
+/**
+ * Reads one known node. Returns null only when the Garden says it is not there, so absence is a
+ * direct answer rather than something inferred from a list. Everything that identifies the node is
+ * checked: a node that is not ours, not in our Garden, or no longer active and garden-visible is
+ * treated as not found rather than used.
+ */
+async function getMemoryNode(dg: { url: string; token: string; gardenId: string }, nodeId: string, sourceKey: string): Promise<GardenMemoryNode | null> {
+  let result;
+  try {
+    result = await mcpCall(dg.url, dg.token, "get_memory_node", { nodeId }) as
+      { garden?: { id?: unknown }; memoryNode?: Record<string, unknown> } | null;
+  } catch (error) {
+    if (error instanceof McpToolError && error.kind === "not_found") return null;
+    throw error;
+  }
+  const node = result?.memoryNode;
+  if (!node || result?.garden?.id !== dg.gardenId) return null;
+  const value = (key: string) => String(node[key] ?? "");
+  if (value("id") !== nodeId || value("sourceKey") !== sourceKey || value("kind") !== "knowledge"
+    || value("source") !== EXPERIENCE_SOURCE || value("state") !== "active" || value("visibility") !== "garden") return null;
+  return { id: nodeId, sourceKey, kind: "knowledge", state: "active", visibility: "garden",
+    source: EXPERIENCE_SOURCE, body: value("body"), updatedAt: value("updatedAt") };
 }
 
 // ---------------------------------------------------------------------------

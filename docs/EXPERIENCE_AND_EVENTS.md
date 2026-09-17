@@ -31,15 +31,25 @@ DecisionGarden 側の確定 contract は `update_memory_node({nodeId, expectedUp
 
 HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `not_permitted`（scope や Garden write 権限の不足）/ `conflict`（`updated_at_conflict` や `source_key_conflict`）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` / `not_configured` / `not_permitted` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
 
+読み戻しは、失われた基準tokenを取り戻す経路でもある。作成時の receipt には `updatedAt` が無いため、最初の更新は基準を持たない。読み戻したノードの本文が**公開した本文のhashと一致する**なら人の編集は入っていないので、そのときだけ `updatedAt` を基準として採用する。一致しなければ人の編集なので editorNote として保持し、基準は採用しない（= その記憶は同期待ちのまま止まり、上書きしない）。
+
+node id を記録する前に公開されたコピーは、Garden 全体を検索しない限り特定できない。そのため更新も取り下げも行わず `node_unknown` として保留し、手動対応が必要な旨をログに出す。30日で失効するので放置しても消える。
+
 **更新は自分が最後に書いた時点のtoken (`syncedUpdatedAt`) を基準にする。** Worker は毎回 list で読んだ最新の `updatedAt` をそのまま `expectedUpdatedAt` に使うことはしない。基準を持たない場合は書き込まず `awaiting_readback` を返し、先に読み戻しを行う。Garden 側の `updatedAt` が基準と違う場合は「人が編集した」と判断して `conflict` を返し、上書きしない（6時間保留）。公開済みのノードが消えている場合は作り直さず `absent` とする。同じ内容の再送は同じ基準tokenで送られ、Garden 側は `operation:"unchanged"` を返して書き込みを行わない。
 
 記憶が期限切れ・根拠削除で消えたときは、新しい報告を作らずに `/internal/experiences/retract` から `set_memory_node_lifecycle` で archived + private に下げる（可逆・冪等）。200件上限での押し出しも「削除」として同じ retraction を積む。retraction queue は満杯時に古いものを捨てず、新規を拒否してログに残す。history の各revisionは**それぞれの発言時刻**で30日失効するので、新しい返信で記憶全体の寿命が延びても古い引用は残らない。毎分のtickは、公開待ちがなくても最大5件の記憶の根拠存在を確認し、消えた根拠を回収する。
 
-Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻す。既知の threadId（最大50件）に対して、`kind=knowledge`・`state=active`・`visibility=garden`・`source` がこのBotのものに一致するノードだけを受け取り、archived/private や他システムのノードは取り込まない。
+Gardenへのアクセスは**作成時に受け取った node id で1件ずつ**行う。`save_memory_node` の receipt から `memoryNode.id` を記憶に保存し、以後の更新・取り下げ・読み戻しはすべて `get_memory_node({nodeId})` で対象を特定する。`list_memory_nodes` による Garden 全体の取得は行わない（他channel・他用途・privateのノードを毎回読まない）。
+
+`get` の応答は `garden.id` が設定中の gardenId と一致すること、`memoryNode` の `id`・`sourceKey`・`kind=knowledge`・`source`・`state=active`・`visibility=garden` がすべて一致することを確認する。一つでも違えば「自分のノードではない」として扱う。`save`/`update` の receipt では Garden 識別子は `memoryNode.gardenId` にあるので、そちらを照合する。
+
+不在と断定するのは Garden が `memory_node_not_found` を返したときだけ。通信失敗やサーバーエラーは不在の証拠にしない。
+
+Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻す。既知の `{threadId, nodeId}` を1バッチ最大20件送り、Worker は node ごとに `get_memory_node` を呼ぶ。上記の照合を通ったノードだけを受け取り、archived/private や他システムのノードは取り込まない。
 
 応答は `covered`（その回答が権威を持つ threadId の集合）を返す。**covered に含まれるのに note が無い thread は、archived / private 化 / 削除されたということなので、cache 済みの note を破棄する。** 取得失敗や不完全な一覧は covered が空で、何も破棄しない。再取得できないまま24時間 (`EDITOR_NOTE_TTL_MS`) を超えた note は、既に取り下げられている可能性があるため参照データから外す。参照データには `editorNoteFetchedAt` を添えて、それ以降の編集・削除が反映されていない可能性を明示する。取得内容は参照データであり、命令やツール操作権限にはならない。Garden が不調でも会話は継続する。
 
-一覧が `nextCursor` / `hasMore` などページングの印を持つ場合、「一覧に無い」ことは「Gardenに無い」ことの証拠にならないので、absent と断定せず保留する。`nodeId` は UUID であることを確認してから送る。
+`nodeId` は UUID であることを確認してから送る。UUIDでなければ Garden に投げずに失敗として扱う。
 
 **日次ダイジェストは廃止した。** 日付をキーにしたGardenノード（旧 `su-stats:<JST日>`）は作らない。`/internal/maintenance/run`（旧 `/internal/digest/run` は互換エイリアス）と `scheduled` は運営統計を数えてWorkerログへ出すだけで、`gardenWrites: 0` を返す。MCPツール `su_run_digest` は非推奨として残り、呼ばれても日次ノードを再作成しない。返却する `analysis:not_run, analysisLocation:gateway` は「発見なし」と異なる。実際に記憶が変わらない限り Garden への書き込みは発生しない。保全済みの旧日次報告（archived/private）は再生成も復活も削除もしない。
 

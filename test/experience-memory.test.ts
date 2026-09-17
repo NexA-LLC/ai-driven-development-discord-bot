@@ -13,6 +13,9 @@ function setup() {
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 const now = Date.now();
 const day = 86400_000;
+const NODE = "0198f0a1-1c2d-7e3f-8a4b-5c6d7e8f9a0b";
+/** A successful publish: the Garden hands back the node id and the token for the next write. */
+const published = (updatedAt?: string, bodyHash = "hash-1") => ({ outcome: "synced" as const, nodeId: NODE, updatedAt, bodyHash });
 const quote = "正解のない4択は用語を分けた方がよい";
 const source: ExperienceSource = { id: "source-1", guildId: "guild", channelId: "channel", at: now - 1000, role: "human", content: `${quote}。面白い発見でした。` };
 const candidate = { sourceId: source.id, quote, interpretation: "クイズと投票を区別して説明したい", kind: "discovery" };
@@ -89,7 +92,7 @@ it("treats an unchanged repeat, a replay and a date-only change as no-op with ze
   store.enqueue("first", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
-  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
+  const send = vi.fn().mockResolvedValue(published());
   await store.sync(send); expect(send).toHaveBeenCalledOnce();
 
   // Same conversation re-analysed on a later day, producing the same candidate.
@@ -132,8 +135,8 @@ it("reads back a human Garden edit for a known thread only, and drops it on scop
   await store.analyse(async () => JSON.stringify([candidate]), now);
   const threadId = store.list(now)[0]!.threadId;
   store.applyEditorNotes([
-    { threadId, body: "店長の補足: 投票という言い方で統一した", updatedAt: "2026-09-17T00:00:00.000Z" },
-    { threadId: "f".repeat(64), body: "別Gardenの運営メモ", updatedAt: "2026-09-17T00:00:00.000Z" },
+    { threadId, body: "店長の補足: 投票という言い方で統一した", updatedAt: "2026-09-17T00:00:00.000Z", bodyHash: "someone-elses" },
+    { threadId: "f".repeat(64), body: "別Gardenの運営メモ", updatedAt: "2026-09-17T00:00:00.000Z", bodyHash: "someone-elses" },
   ]);
   const reference = store.list(now)[0]!;
   expect(reference.editorNote?.body).toContain("投票という言い方で統一した");
@@ -146,7 +149,7 @@ it("expires at original source time, retracts the public copy, and keeps sync ou
   // An unavailable or read-only Garden is never recorded as a completed sync.
   const send = vi.fn().mockRejectedValueOnce(new Error("DG failure"))
     .mockResolvedValueOnce({ outcome: "not_configured" } as const).mockResolvedValueOnce({ outcome: "update_unsupported" } as const)
-    .mockResolvedValueOnce({ outcome: "conflict" } as const).mockResolvedValue({ outcome: "synced" } as const);
+    .mockResolvedValueOnce({ outcome: "conflict" } as const).mockResolvedValue(published());
   let clock = now;
   for (let i = 0; i < 4; i++) {
     await store.sync(send, () => true, undefined, clock);
@@ -164,15 +167,15 @@ it("expires at original source time, retracts the public copy, and keeps sync ou
   restarted.removeSource(source.id);
   expect(restarted.list(now)).toEqual([]);
   await restarted.sync(send, () => true, retract, clock);
-  expect(retract).toHaveBeenCalledWith(store.list(now)[0]?.threadId ?? expect.any(String));
+  expect(retract).toHaveBeenCalledWith({ threadId: store.list(now)[0]?.threadId ?? expect.any(String), nodeId: NODE });
   expect(send).toHaveBeenCalledTimes(5); // Retraction is not a new publication.
 });
 it("expiry retracts instead of writing a fresh node", async () => {
   const { store } = setup(); store.enqueue("event", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
-  await store.sync(async () => ({ outcome: "synced" }));
-  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
+  await store.sync(async () => published());
+  const send = vi.fn().mockResolvedValue(published());
   const retract = vi.fn().mockResolvedValue(true);
   store.prune(source.at + RETENTION_MS + 1);
   await store.sync(send, () => true, retract, source.at + RETENTION_MS + 1);
@@ -198,7 +201,7 @@ it("never publishes an ordinary personal name, even without an honorific", async
   expect(refused.publicReview).toBe("rejected");
   expect(refused.publicSummary).toBeNull();
   expect(publicExperience(refused)).toBeNull();
-  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
+  const send = vi.fn().mockResolvedValue(published());
   await store.sync(send, () => true, undefined, now);
   expect(send).not.toHaveBeenCalled();
   // And if the reviewer were wrong and carried the name through, the structural gate still refuses.
@@ -210,7 +213,7 @@ it("never publishes private content that was never labelled a secret", async () 
   expect(refused.publicReview).toBe("rejected");
   expect(publicExperience(refused)).toBeNull();
   expect(JSON.stringify(store.list(now))).toContain(privateQuote); // Still remembered privately.
-  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
+  const send = vi.fn().mockResolvedValue(published());
   await store.sync(send, () => true, undefined, now);
   expect(send).not.toHaveBeenCalled();
 });
@@ -267,7 +270,7 @@ it("retries a reviewer that is unreachable instead of treating it as a refusal",
   expect(store.list(now)[0]!.publicReview).toBe("not_run");
   await store.review(async () => { throw new Error("LLM down"); }, () => true, now + 600_000);
   expect(store.list(now)[0]!.publicReview).toBe("pending");
-  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
+  const send = vi.fn().mockResolvedValue(published());
   await store.sync(send, () => true, undefined, now + 600_000);
   expect(send).not.toHaveBeenCalled(); // Unknown is not permission to publish.
   await store.review(approve(), () => true, now + 2 * 3600_000);
@@ -280,7 +283,7 @@ it("makes a new revision re-earn its clearance instead of inheriting the old one
   store.enqueue("day-1", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
-  const send = vi.fn().mockResolvedValue({ outcome: "synced" } as const);
+  const send = vi.fn().mockResolvedValue(published());
   await store.sync(send); expect(send).toHaveBeenCalledOnce();
 
   const later: ExperienceSource = { ...source, id: "source-2", at: now + day, content: "正解のない4択は用語を分けるより、投票と呼ぶのが一番わかりやすい" };
@@ -357,7 +360,7 @@ it("clears a cached Garden note once the read-back says that thread no longer ha
   store.enqueue("event", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   const threadId = store.list(now)[0]!.threadId;
-  const note = { threadId, body: "店長の補足: 投票で統一", updatedAt: "2026-09-17T00:00:00.000Z" };
+  const note = { threadId, body: "店長の補足: 投票で統一", updatedAt: "2026-09-17T00:00:00.000Z", bodyHash: "someone-elses" };
   store.applyEditorNotes([note], [threadId], now);
   expect(JSON.stringify(store.list(now))).toContain("投票で統一");
 
@@ -376,7 +379,7 @@ it("stops showing a cached Garden note that has not been re-read within its TTL"
   store.enqueue("event", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   const threadId = store.list(now)[0]!.threadId;
-  store.applyEditorNotes([{ threadId, body: "店長の補足: 投票で統一", updatedAt: "2026-09-17T00:00:00.000Z" }], [threadId], now);
+  store.applyEditorNotes([{ threadId, body: "店長の補足: 投票で統一", updatedAt: "2026-09-17T00:00:00.000Z", bodyHash: "someone-elses" }], [threadId], now);
   const fresh = experienceReference(store.list(now), now + 3600_000);
   expect(fresh).toContain("投票で統一");
   expect(fresh).toContain("editorNoteFetchedAt");
@@ -410,7 +413,7 @@ it("retracts the public copy of a memory dropped by the 200-entry cap", async ()
   store.enqueue("published", [source], now);
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
-  await store.sync(async () => ({ outcome: "synced" }));
+  await store.sync(async () => published());
   const evicted = store.list(now)[0]!.threadId;
 
   // Deliberately share no vocabulary, so nothing merges and each one really is a separate memory.
@@ -433,7 +436,7 @@ it("retracts the public copy of a memory dropped by the 200-entry cap", async ()
   // Eviction is a removal, so the copy that reached the Garden is queued for archiving.
   const retract = vi.fn().mockResolvedValue(true);
   await store.sync(vi.fn().mockResolvedValue({ outcome: "failed" }), () => false, retract, now + 300);
-  expect(retract).toHaveBeenCalledWith(evicted);
+  expect(retract).toHaveBeenCalledWith({ threadId: evicted, nodeId: NODE });
 });
 it("keeps a different conversation in the same channel out of an unrelated thread", async () => {
   const { store } = setup();
@@ -464,7 +467,7 @@ it("holds a publish that has no baseline yet and reports it as awaiting read-bac
   await store.analyse(async () => JSON.stringify([candidate]), now);
   await clear(store);
   // A create gives no token back, so the first update has nothing to compare against.
-  await store.sync(async () => ({ outcome: "synced" }));
+  await store.sync(async () => published());
   expect(store.list(now)[0]!.syncedUpdatedAt).toBeNull();
 
   const later: ExperienceSource = { ...source, id: "source-2", at: now + day, content: "正解のない4択は用語を分けるより、投票と呼ぶのが一番わかりやすい" };
@@ -480,8 +483,40 @@ it("holds a publish that has no baseline yet and reports it as awaiting read-bac
   expect(store.list(now + day)[0]!.syncedRevision).toBe(1); // Not settled.
 
   // Once a write returns a token, the next one can be compared against it.
-  const settled = vi.fn().mockResolvedValue({ outcome: "synced", updatedAt: "2026-09-18T00:00:00.000Z" } as const);
+  const settled = vi.fn().mockResolvedValue(published("2026-09-18T00:00:00.000Z"));
   await store.sync(settled, () => true, undefined, now + day + 3600_000);
   expect(store.list(now + day)[0]!.syncedUpdatedAt).toBe("2026-09-18T00:00:00.000Z");
   expect(store.awaitingReadback(now + day + 3600_000)).toBe(false);
+});
+
+it("adopts the baseline from a read-back when the stored text is still ours, and not when it is not", async () => {
+  const { store } = setup();
+  store.enqueue("event", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  await clear(store);
+  // A create hands back a node id but no token, so the copy is addressable yet not yet comparable.
+  await store.sync(async () => published(undefined, "our-body"));
+  const memory = () => store.list(now)[0]!;
+  expect(memory().gardenNodeId).toBe(NODE);
+  expect(memory().syncedUpdatedAt).toBeNull();
+  expect(store.publishedNodes(20, now)).toEqual([{ threadId: memory().threadId, nodeId: NODE }]);
+
+  // Read back and the text is byte-for-byte what we published: no human edit, and now we have a token.
+  store.applyEditorNotes([{ threadId: memory().threadId, body: "公開した本文", updatedAt: "2026-09-20T00:00:00.000Z", bodyHash: "our-body" }],
+    [memory().threadId], now);
+  expect(memory().syncedUpdatedAt).toBe("2026-09-20T00:00:00.000Z");
+  expect(memory().editorNote).toBeNull();
+
+  // A later read shows different text: that is a person's edit, kept as a note and never adopted.
+  store.applyEditorNotes([{ threadId: memory().threadId, body: "店長が書き直した本文", updatedAt: "2026-09-21T00:00:00.000Z", bodyHash: "someone-elses" }],
+    [memory().threadId], now);
+  expect(memory().syncedUpdatedAt).toBe("2026-09-20T00:00:00.000Z"); // Unchanged: the edit is not our write.
+  expect(memory().editorNote?.body).toBe("店長が書き直した本文");
+});
+it("offers no node to read back before anything has been published", async () => {
+  const { store } = setup();
+  store.enqueue("event", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  expect(store.publishedNodes(20, now)).toEqual([]);
+  expect(store.awaitingReadback(now)).toBe(false);
 });

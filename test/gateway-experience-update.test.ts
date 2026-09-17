@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
   // The publication reviewer: a separate pass that rewrites the memory instead of copying it.
   review: JSON.stringify({ publishable: true, summary: { observation: "唯一の正解を決めない四択の呼び方について意見をもらった",
     takeaway: "投票と呼ぶほうが誤解が少ないのかもしれないと考えている", openQuestion: "どう呼べば誤解されにくいのか" } }),
-  syncResponse: () => Response.json({ synced: true, operation: "created" }),
+  syncResponse: () => Response.json({ synced: true, operation: "created", nodeId: NODE_ID }),
 }));
 vi.mock("discord.js", async () => ({ ...await vi.importActual("discord.js"), Client: class { constructor() { return mocks.client; } } }));
 vi.mock("../src/gateway/voice-chat.js", () => ({ VoiceChat: class {} }));
@@ -21,6 +21,7 @@ vi.mock("../src/gateway/conversation-audit.js", () => ({ auditConversation: vi.f
 vi.mock("../src/gateway/typing.js", () => ({ startTyping: () => () => {} }));
 
 let gateway: typeof import("../src/gateway/index.js");
+const NODE_ID = "0198f0a1-1c2d-7e3f-8a4b-5c6d7e8f9a0b";
 const day1 = Date.parse("2026-09-16T02:00:00Z");
 const day2 = day1 + 86400_000;
 const quoteA = "正解のない4択は用語を分けた方がよい";
@@ -154,7 +155,7 @@ it("keeps a conflict and an unsupported update honest across the Worker transpor
     expect(syncCalls().length).toBe(before + 1);
     clock += hold + 60_000; vi.setSystemTime(clock);
   }
-  mocks.syncResponse = () => Response.json({ synced: true, operation: "created" });
+  mocks.syncResponse = () => Response.json({ synced: true, operation: "created", nodeId: NODE_ID });
   const before = syncCalls().length;
   await gateway.experienceTick();
   expect(syncCalls().length).toBe(before + 1);
@@ -206,7 +207,7 @@ it("carries its own last-write token and stops publishing when the Garden report
     interpretation: "クエン酸を試したい", kind: "interest" }]);
   mocks.review = JSON.stringify({ publishable: true, summary: { observation: "湯を沸かす道具の注ぎ口の掃除の仕方を教わった",
     takeaway: "酸を使う方法を試してみたい", openQuestion: "どのくらいの間隔で掃除するのがよいのか" } });
-  mocks.syncResponse = () => { sent.push("create"); return Response.json({ synced: true, operation: "created" }); };
+  mocks.syncResponse = () => { sent.push("create"); return Response.json({ synced: true, operation: "created", nodeId: NODE_ID }); };
   await gateway.onMessageImpl(message("kettle", "やかんの注ぎ口を掃除する方法を教わった", clock - 1000));
   await gateway.experienceTick();
   const created = syncCalls().at(-1)!.body;
@@ -227,7 +228,7 @@ it("carries its own last-write token and stops publishing when the Garden report
 
   // Once a write hands back a token, every later attempt carries it.
   clock += 3600_000; vi.setSystemTime(clock);
-  mocks.syncResponse = () => Response.json({ synced: true, operation: "updated", updatedAt: "2026-09-30T00:00:00.000Z" });
+  mocks.syncResponse = () => Response.json({ synced: true, operation: "updated", updatedAt: "2026-09-30T00:00:00.000Z", nodeId: NODE_ID });
   await gateway.experienceTick();
   expect(syncCalls().at(-1)!.body.baselineUpdatedAt).toBeUndefined(); // This attempt still had none.
 
@@ -250,4 +251,25 @@ it("carries its own last-write token and stops publishing when the Garden report
   clock += 3600_000; vi.setSystemTime(clock);
   await gateway.experienceTick();
   expect(syncCalls()).toHaveLength(before);
+});
+
+it("asks the Worker only for the nodes it created, never for the Garden as a whole", async () => {
+  const pulls = mocks.worker.filter(c => c.path === "/internal/experiences/pull");
+  expect(pulls.length).toBeGreaterThan(0);
+  for (const pull of pulls) {
+    // Bounded by node id. No gardenId, no "give me everything" shape.
+    expect(Array.isArray(pull.body.nodes)).toBe(true);
+    expect(pull.body.threadIds).toBeUndefined();
+    expect(pull.body.gardenId).toBeUndefined();
+    expect(pull.body.nodes.length).toBeLessThanOrEqual(20);
+    for (const node of pull.body.nodes) {
+      expect(node.nodeId).toBe(NODE_ID);
+      expect(node.threadId).toMatch(/^[a-f0-9]{64}$/);
+    }
+  }
+  // Retraction is addressed the same way.
+  for (const retract of mocks.worker.filter(c => c.path === "/internal/experiences/retract")) {
+    expect(retract.body).toMatchObject({ nodeId: NODE_ID });
+    expect(retract.body.threadId).toMatch(/^[a-f0-9]{64}$/);
+  }
 });

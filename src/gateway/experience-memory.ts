@@ -44,17 +44,25 @@ const memorySchema = candidateSchema.extend({
   // The Garden updatedAt as it stood right after our own last successful write. Without it there
   // is no way to tell a human edit from our own, so an update is withheld until a read-back sets it.
   syncedUpdatedAt: z.string().nullable().default(null),
+  // The Garden node this thread owns, learned from the create receipt. Without it the copy can only
+  // be addressed by reading the whole Garden, which is exactly what this avoids.
+  gardenNodeId: z.string().nullable().default(null),
+  // Hash of the body we last published, so a read-back can tell our own text from a human edit.
+  publishedBodyHash: z.string().nullable().default(null),
   scopeKey: z.string().default(""),
 });
 export type ExperienceMemory = z.infer<typeof memorySchema>;
 const jobSchema = z.object({ id: z.string(), sources: z.array(sourceSchema).max(8), at: z.number(), attempts: z.number(), nextAttemptAt: z.number(), status: z.enum(["pending", "not_run", "failed", "success_empty", "success_no_change", "success_found"]) });
-const stateSchema = z.object({ memories: z.array(memorySchema).max(200), jobs: z.array(jobSchema).max(100), retractions: z.array(z.string()).max(100).default([]) });
+const retractionSchema = z.object({ threadId: z.string(), nodeId: z.string().nullable().default(null) });
+export type Retraction = z.infer<typeof retractionSchema>;
+const stateSchema = z.object({ memories: z.array(memorySchema).max(200), jobs: z.array(jobSchema).max(100),
+  retractions: z.array(retractionSchema).max(100).default([]) });
 export type AnalysisStatus = z.infer<typeof jobSchema>["status"];
 export type CompleteExperience = (messages: AgentMessage[]) => Promise<string>;
 /** Sync outcomes the Worker can report. Only "synced" settles a revision. */
-export type SyncOutcome = "synced" | "awaiting_readback" | "absent" | "update_unsupported" | "not_permitted" | "conflict" | "not_configured" | "failed";
+export type SyncOutcome = "synced" | "awaiting_readback" | "absent" | "node_unknown" | "update_unsupported" | "not_permitted" | "conflict" | "not_configured" | "failed";
 /** What a publish attempt learned. updatedAt is the Garden token to compare the next write against. */
-export type SyncResult = { outcome: SyncOutcome; updatedAt?: string | null };
+export type SyncResult = { outcome: SyncOutcome; updatedAt?: string | null; nodeId?: string | null; bodyHash?: string | null };
 const sensitive = /(?:Bearer\s|password\s*[:=]|api[_-]?key\s*[:=]|秘密|パスワード|sk-[a-z0-9]{8})/i;
 const HOLD_MS: Record<Exclude<SyncOutcome, "synced">, number> = {
   // A missing tool, a missing config or a missing permission needs a human, not a fast retry.
@@ -62,6 +70,8 @@ const HOLD_MS: Record<Exclude<SyncOutcome, "synced">, number> = {
   update_unsupported: 6 * 3600_000, not_configured: 6 * 3600_000, not_permitted: 6 * 3600_000,
   // A human edited the node, or it was removed: both need a person, not a retry loop.
   conflict: 6 * 3600_000, absent: 6 * 3600_000,
+  // Published before node ids were tracked: it cannot be updated safely and needs a person.
+  node_unknown: 24 * 3600_000,
   // Short: the read-back that supplies the missing baseline runs on the very next tick.
   awaiting_readback: 300_000, failed: 900_000,
 };
@@ -148,7 +158,9 @@ export class ExperienceStore {
   private retract(memories: ExperienceMemory[]): void {
     for (const memory of memories) {
       // Only a copy that actually reached the Garden needs archiving there.
-      if (memory.syncedRevision > 0 && !this.state.value.retractions.includes(memory.threadId)) this.state.value.retractions.push(memory.threadId);
+      if (memory.syncedRevision <= 0 || this.state.value.retractions.some(r => r.threadId === memory.threadId)) continue;
+      if (!memory.gardenNodeId) console.error(`published copy ${memory.threadId.slice(0, 8)} predates node id tracking; archive it by hand`);
+      this.state.value.retractions.push({ threadId: memory.threadId, nodeId: memory.gardenNodeId });
     }
     // Oldest-first is wrong here: an un-retracted public copy is the thing that must not be lost,
     // so the queue keeps the earliest entries and refuses new ones once full.
@@ -172,7 +184,7 @@ export class ExperienceStore {
   threadIds(now = Date.now()): string[] { return [...new Set(this.list(now).map(m => m.threadId))]; }
   /** True while a publish is blocked only because no baseline token is known yet. */
   awaitingReadback(now = Date.now()): boolean {
-    return this.list(now).some(m => m.syncedRevision < m.revision && m.syncedRevision > 0 && m.syncedUpdatedAt === null);
+    return this.list(now).some(m => m.syncedRevision < m.revision && m.syncedRevision > 0 && m.syncedUpdatedAt === null && !!m.gardenNodeId);
   }
   removeSource(id: string): void {
     if (!this.available) return;
@@ -238,7 +250,7 @@ export class ExperienceStore {
                 at: source.at, expiresAt: source.at + RETENTION_MS, synced: false, lastMusedAt: 0, musingHeldUntil: 0,
                 revision: 1, updatedAt: now, syncedRevision: 0, syncHeldUntil: 0, history: [], editorNote: null,
                 publicSummary: null, publicReview: "pending", reviewHeldUntil: 0,
-                syncedUpdatedAt: null, scopeKey: source.scopeKey });
+                syncedUpdatedAt: null, gardenNodeId: null, publishedBodyHash: null, scopeKey: source.scopeKey });
             }
             changed = true;
           }
@@ -312,7 +324,7 @@ export class ExperienceStore {
    * rather than left feeding the model content a person deliberately took down. Nothing is cleared
    * from a failed or partial read, because absence there proves nothing.
    */
-  applyEditorNotes(notes: Array<{ threadId: string; body: string; updatedAt: string }>, covered: string[] = [], now = Date.now()): void {
+  applyEditorNotes(notes: Array<{ threadId: string; body: string; updatedAt: string; bodyHash: string }>, covered: string[] = [], now = Date.now()): void {
     if (!this.available) return;
     const byThread = new Map(notes.map(n => [n.threadId, n]));
     const scope = new Set(covered);
@@ -320,8 +332,16 @@ export class ExperienceStore {
     for (const memory of this.state.value.memories) {
       const note = byThread.get(memory.threadId);
       if (note) {
-        memory.editorNote = { body: note.body.slice(0, 2000), updatedAt: note.updatedAt.slice(0, 64), fetchedAt: now };
-        touched = true;
+        // Still exactly what we published: no human edit, and the read gives us the baseline token
+        // that a create receipt could not. Anything else is someone's edit and is kept as a note.
+        const ours = !!memory.publishedBodyHash && note.bodyHash === memory.publishedBodyHash;
+        if (ours) {
+          if (memory.syncedUpdatedAt !== note.updatedAt) { memory.syncedUpdatedAt = note.updatedAt; touched = true; }
+          if (memory.editorNote) { memory.editorNote = null; touched = true; }
+        } else {
+          memory.editorNote = { body: note.body.slice(0, 2000), updatedAt: note.updatedAt.slice(0, 64), fetchedAt: now };
+          touched = true;
+        }
       } else if (scope.has(memory.threadId) && memory.editorNote) {
         memory.editorNote = null;
         touched = true;
@@ -329,15 +349,21 @@ export class ExperienceStore {
     }
     if (touched) this.state.save();
   }
+  /** Known nodes worth reading back, newest first, bounded by the caller's batch size. */
+  publishedNodes(limit: number, now = Date.now()): Array<{ threadId: string; nodeId: string }> {
+    return this.list(now).filter(m => m.gardenNodeId)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map(m => ({ threadId: m.threadId, nodeId: m.gardenNodeId! })).slice(0, limit);
+  }
   /** Publishes only revisions the Garden has not accepted yet. No memory change means no Garden write. */
   async sync(send: (memory: ExperienceMemory) => Promise<SyncResult>, eligible: (memory: ExperienceMemory) => boolean = () => true,
-    retract?: (threadId: string) => Promise<boolean>, now = Date.now()): Promise<void> {
+    retract?: (entry: Retraction) => Promise<boolean>, now = Date.now()): Promise<void> {
     if (!this.available) return;
-    for (const threadId of [...this.state.value.retractions].slice(0, 10)) {
+    for (const entry of [...this.state.value.retractions].slice(0, 10)) {
       if (!retract) break;
       try {
-        if (!await retract(threadId)) continue;
-        this.state.value.retractions = this.state.value.retractions.filter(t => t !== threadId);
+        if (!await retract(entry)) continue;
+        this.state.value.retractions = this.state.value.retractions.filter(r => r.threadId !== entry.threadId);
         this.state.save();
       } catch { /* Keep queued; archiving is idempotent. */ }
     }
@@ -358,6 +384,8 @@ export class ExperienceStore {
         // Remember what the Garden looked like straight after our write, so the next one can tell
         // a human edit from our own. A create gives no token, so the read-back supplies it.
         if (result.updatedAt) current.syncedUpdatedAt = result.updatedAt;
+        if (result.nodeId) current.gardenNodeId = result.nodeId;
+        if (result.bodyHash) current.publishedBodyHash = result.bodyHash;
       } else { current.syncHeldUntil = now + HOLD_MS[result.outcome]; }
       this.state.save();
     }
