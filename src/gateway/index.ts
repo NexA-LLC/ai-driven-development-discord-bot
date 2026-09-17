@@ -6,7 +6,7 @@ import { postChannelMessage } from "./channel-post.js";
 import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agent.js";
 import { readMentionedChannels } from "./channel-context.js";
 import { allowsConversationInChannel, conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
-import { ExperienceStore, experienceReference, type ExperienceMemory } from "./experience-memory.js";
+import { ExperienceStore, experienceReference, type ExperienceMemory, type SyncOutcome } from "./experience-memory.js";
 import { ConnpassFeed, eventReference } from "./connpass-feed.js";
 import { deliverMusing } from "./musing.js";
 import { publicExperience } from "../shared/public-experience.js";
@@ -108,10 +108,14 @@ const musingsHoursJst = (process.env.MUSINGS_HOURS_JST ?? process.env.MUSINGS_HO
   .map((v) => Number(v.trim()))
   .filter((v) => Number.isInteger(v) && v >= 0 && v <= 23);
 const museOnStart = readBoolean("MUSE_ON_START", false);
-// Daily improvement digest (Worker /internal/digest/run). The account has no
-// spare Workers cron trigger, so the Gateway is the clock.
-const digestHourJst = readPositiveInteger("DIGEST_HOUR_JST", 3);
-let lastDigestDate = readSlot("digest-date");
+// Nightly maintenance (Worker /internal/maintenance/run). The account has no spare
+// Workers cron trigger, so the Gateway is the clock. It creates no daily report.
+const maintenanceHourJst = readPositiveInteger("MAINTENANCE_HOUR_JST", readPositiveInteger("DIGEST_HOUR_JST", 3));
+let lastMaintenanceDate = readSlot("digest-date");
+// How often human edits made in the Garden are read back for known experience threads.
+const experiencePullMs = readPositiveInteger("EXPERIENCE_PULL_SECONDS", 3600) * 1_000;
+let lastExperiencePullAt = 0;
+let sweepCursor = 0;
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
 
@@ -178,7 +182,7 @@ client.once(Events.ClientReady, async (readyClient) => {
   }
   void replayInboxForever();
   setInterval(() => { if (client.isReady() && !lifecycle.draining) inbox.heartbeat(); }, 5000);
-  void digestForever();
+  void maintenanceForever();
   void experienceForever();
   if (llmApiUrl) {
     void pollJobsForever();
@@ -511,6 +515,7 @@ client.on(Events.MessageBulkDelete, messages => { for (const message of messages
 
 export async function experienceTick(): Promise<void> {
   experiences.prune();
+  await sweepDeletedEvidence();
   if (connpassEnabled) await connpass.refresh();
   await experiences.analyse(llmApiUrl ? async messages => {
     const response = await fetch(llmApiUrl, { method: "POST", headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
@@ -520,13 +525,48 @@ export async function experienceTick(): Promise<void> {
     return body.choices?.[0]?.message?.content ?? "";
   } : undefined);
   await experiences.sync(async memory => {
-    if (!await verifyExperience(memory)) return false;
+    // A copy is only publishable while its evidence still exists in a channel everyone can read.
+    if (!await verifyExperience(memory)) return "failed";
     const channel = await client.channels.fetch(memory.channelId) as TextChannel;
     const read = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
-    if (!channel.permissionsFor(channel.guild.roles.everyone)?.has(read) || channel.permissionOverwrites.cache.some(o => o.deny.any(read))) return false;
-    const result = await postSigned<{ synced: boolean }>("/internal/experiences/sync", publicExperience(memory));
-    return result.synced === true;
-  }, memory => publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId));
+    if (!channel.permissionsFor(channel.guild.roles.everyone)?.has(read) || channel.permissionOverwrites.cache.some(o => o.deny.any(read))) return "failed";
+    // A conflict or a Garden failure answers with a non-2xx; the status still has to be read, not thrown away.
+    const result = (await postSignedOutcome<{ synced?: boolean; status?: SyncOutcome }>("/internal/experiences/sync", publicExperience(memory))).body;
+    if (result?.synced === true) return "synced";
+    // An older Garden without an update tool is reported as waiting, never as a completed sync.
+    const status = result?.status;
+    if (status === "update_unsupported") console.warn(`experience ${memory.threadId.slice(0, 8)} rev${memory.revision}: Garden has no update tool yet; waiting`);
+    return status === "update_unsupported" || status === "conflict" || status === "not_configured" ? status : "failed";
+  }, memory => publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId),
+    async threadId => (await postSigned<{ retracted: boolean }>("/internal/experiences/retract", { threadId })).retracted === true);
+  await pullEditorNotes();
+}
+
+/**
+ * Maintenance only: re-check a few memories per tick so evidence deleted while nothing was
+ * being published is still noticed. verifyExperience drops the memory and queues its retraction.
+ */
+async function sweepDeletedEvidence(): Promise<void> {
+  const memories = experiences.list();
+  if (!memories.length) return;
+  const offset = sweepCursor % memories.length;
+  const batch = [...memories.slice(offset), ...memories.slice(0, offset)].slice(0, 5);
+  sweepCursor = (offset + batch.length) % memories.length;
+  for (const memory of batch) await verifyExperience(memory);
+}
+
+/** Bounded read-back of human edits: known threads only, and only as reference material. */
+async function pullEditorNotes(now = Date.now()): Promise<void> {
+  if (now - lastExperiencePullAt < experiencePullMs) return;
+  lastExperiencePullAt = now;
+  const threadIds = experiences.threadIds(now).slice(0, 50);
+  if (!threadIds.length) return;
+  try {
+    const result = await postSigned<{ status: string; notes?: Array<{ threadId: string; body: string; updatedAt: string }> }>(
+      "/internal/experiences/pull", { threadIds });
+    if (result.status !== "ok" || !Array.isArray(result.notes)) return;
+    experiences.applyEditorNotes(result.notes.filter(n => threadIds.includes(n.threadId)));
+  } catch { /* The Garden is optional context; conversation continues without it. */ }
 }
 
 async function experienceForever(): Promise<void> {
@@ -610,22 +650,25 @@ function startReadinessServer(): void {
   );
 }
 
-/** Once a day around DIGEST_HOUR_JST, ask the Worker to run the improvement digest. */
-async function digestForever(): Promise<void> {
+/**
+ * Once a day around MAINTENANCE_HOUR_JST, ask the Worker for nightly maintenance.
+ * This no longer produces a daily report: it only reads operational counts and posts nothing.
+ */
+async function maintenanceForever(): Promise<void> {
   for (;;) {
     if (lifecycle.draining) { await sleep(1000); continue; }
     try {
       const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1_000);
       const today = nowJst.toISOString().slice(0, 10);
-      if (nowJst.getUTCHours() >= digestHourJst && lastDigestDate !== today) {
-        await lifecycle.run(() => postSigned("/internal/digest/run", { hours: 24 }));
+      if (nowJst.getUTCHours() >= maintenanceHourJst && lastMaintenanceDate !== today) {
+        await lifecycle.run(() => postSigned("/internal/maintenance/run", { hours: 24 }));
         writeSlot("digest-date", today);
-        lastDigestDate = today;
-        console.log(`digest requested for ${today}`);
+        lastMaintenanceDate = today;
+        console.log(`nightly maintenance requested for ${today}`);
       }
     } catch (error) {
-      console.error("digest request failed", error);
-      await reportIncident("digest_failed", "warning", "日次の改善ダイジェストの実行に失敗", String(error));
+      console.error("nightly maintenance failed", error);
+      await reportIncident("maintenance_failed", "warning", "夜間の保守処理の実行に失敗", String(error));
     }
     await sleep(5 * 60 * 1_000);
   }
@@ -1101,10 +1144,28 @@ async function alertModerators(content: string): Promise<void> {
   });
 }
 
+/** Same signed call, but the caller sees the status instead of an exception. */
+async function postSignedOutcome<T = unknown>(path: string, payload: unknown): Promise<{ status: number; body: T | null }> {
+  const response = await signedRequest(path, payload);
+  try { return { status: response.status, body: (await response.json()) as T }; }
+  catch { return { status: response.status, body: null }; }
+}
+
 async function postSigned<T = unknown>(
   path: string,
   payload: unknown,
 ): Promise<T> {
+  const response = await signedRequest(path, payload);
+  if (!response.ok) {
+    const responseText = await response.text();
+    throw new Error(
+      `Worker ${path} returned ${response.status}: ${responseText.slice(0, 500)}`,
+    );
+  }
+  return (await response.json()) as T;
+}
+
+async function signedRequest(path: string, payload: unknown): Promise<Response> {
   const timestamp = Math.floor(Date.now() / 1_000).toString();
   const body = JSON.stringify(payload);
   const signature = createHmac("sha256", sharedSecret)
@@ -1122,14 +1183,7 @@ async function postSigned<T = unknown>(
     signal: AbortSignal.timeout(30000),
   });
 
-  if (!response.ok) {
-    const responseText = await response.text();
-    throw new Error(
-      `Worker ${path} returned ${response.status}: ${responseText.slice(0, 500)}`,
-    );
-  }
-
-  return (await response.json()) as T;
+  return response;
 }
 
 function requiredEnv(name: string): string {

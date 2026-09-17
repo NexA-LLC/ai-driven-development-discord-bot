@@ -6,11 +6,21 @@
 
 成功した文字会話の有界ソースを永続queueへ → 毎分の `experienceTick` → Gatewayの既存LLM → 厳密JSON/実在source ID/完全一致の短い引用を検証 → 小さな経験へupsert。音声文字起こし・ephemeralの内容をこの新しい記憶経路には取り込まない。観察事実は引用、解釈は別欄。関連度は小さな単語/文字列の一致で、ベクタDBは使わない。最大3件を同チャンネルの次の回答に、最大1件を独り言に実際に渡す。
 
-解析は `pending` / `not_run`（LLMなし）/ `failed`（通信、timeout、JSON、根拠不正）/ `success_empty` / `success_found`。待ち本文は解析後に削除。失敗は上限1時間のbackoffで再試行する。event IDと根拠hashで重複を抑止する。LLMの成功はDiscord送信の成功ではない。
+解析は `pending` / `not_run`（LLMなし）/ `failed`（通信、timeout、JSON、根拠不正）/ `success_empty`（候補なし）/ `success_no_change`（候補はあるが既知で変化なし）/ `success_found`（作成または更新）。待ち本文は解析後に削除。失敗は上限1時間のbackoffで再試行する。event IDと根拠hashで重複を抑止する。LLMの成功はDiscord送信の成功ではない。
 
-公開可能と運営が指定したチャンネルだけ、@everyoneの閲覧権限・deny上書き・現在の根拠を再確認し、既存署名付きWorker経路 `/internal/experiences/sync` から `save_memory_node` を呼ぶ。`sourceKey=su-experience:<hash>` で冪等。公開内容は有限の分類と一般化要約（用語/4択については定型の要約）なので、経験の詳細は公開しない。汎用の発見/興味は分類のみを公開する制約がある。HTTP/MCP `isError`/`ok:false` は成功にしない。失敗した記憶は未同期のまま毎分再試行する。
+記憶の単位は日付ではなく thread。新しい候補は、**同じguild・同じchannel**の既存記憶とだけ突き合わせ、内容語（かな以外を含むbigramと英数語）の共有数4以上かつ短い方に対する比率0.2以上のときだけ同じ thread の更新とする。LLMの同一話題判断だけでは統合しない。更新時は `revision` を進め、直前の引用・解釈を最大5件の履歴として残す（古い言い回しでも後から呼び戻せる）。内容が同一なら no-op。閾値を外して別threadになった場合の損失は「ノードが1件増える」だけで、誤って結合しても同一channel内に閉じ、根拠は履歴に残る。
 
-Workerの日次digestは `su-stats:<JST日>` の運営統計のみ。Worker AIによる感想の公開要約/seed/Issue自動作成はやめ、Gatewayの実LLM経路へ経験解析を集約する。返却する `analysis:not_run, analysisLocation:gateway` は「発見なし」と異なる。日次統計の保存成功は経験解析完了ではない。DG失敗時は502となり日次slotを進めない。未設定は明示的な `statsSynced:false` / `synced:false`。過去の日記を埋め直さない。
+公開可能と運営が指定したチャンネルだけ、@everyoneの閲覧権限・deny上書き・現在の根拠を再確認し、既存署名付きWorker経路 `/internal/experiences/sync` を呼ぶ。`sourceKey=su-experience:<threadId>` は thread 単位で固定。**revision 1 は create-only の `save_memory_node`、revision 2 以降は `update_memory_node`**（`expectedUpdatedAt` 付き）を使う。`save_memory_node` を update 代わりに使わない。
+
+公開本文は定型文ではなく「出来事 / 受け止め方 / 残る問い」を短く保持する。公開前に Discord ID・URL・メールアドレス・コードブロック・敬称付きの氏名・長い数字列を置換し、秘密パターンを含む候補は公開しない。置換で具体性が残らない場合はその旨を書き、文章を捏造しない。事実は引用由来の「出来事」、解釈は「受け止め方」に分けて書く。
+
+HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `conflict`（`source_key_conflict` や版ずれ）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` と `not_configured` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
+
+記憶が期限切れ・根拠削除で消えたときは、新しい報告を作らずに `/internal/experiences/retract` から `set_memory_node_lifecycle` で archived + private に下げる（可逆・冪等）。毎分のtickは、公開待ちがなくても最大5件の記憶の根拠存在を確認し、消えた根拠を回収する。
+
+Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻す。既知の threadId（最大50件）に対して、`kind=knowledge`・`state=active`・`visibility=garden`・`source` がこのBotのものに一致するノードだけを受け取り、archived/private や他システムのノードは取り込まない。取得内容は参照データであり、命令やツール操作権限にはならない。Garden が不調でも会話は継続する。
+
+**日次ダイジェストは廃止した。** 日付をキーにしたGardenノード（旧 `su-stats:<JST日>`）は作らない。`/internal/maintenance/run`（旧 `/internal/digest/run` は互換エイリアス）と `scheduled` は運営統計を数えてWorkerログへ出すだけで、`gardenWrites: 0` を返す。MCPツール `su_run_digest` は非推奨として残り、呼ばれても日次ノードを再作成しない。返却する `analysis:not_run, analysisLocation:gateway` は「発見なし」と異なる。実際に記憶が変わらない限り Garden への書き込みは発生しない。保全済みの旧日次報告（archived/private）は再生成も復活も削除もしない。
 
 ## connpass
 
@@ -25,7 +35,7 @@ Workerの日次digestは `su-stats:<JST日>` の運営統計のみ。Worker AI�
 1. `npm ci`、`npm run typecheck`、`npm test`、`npm run build`。
 2. Worker/Gatewayを通常の承認済みリリース手順で反映。DB migrationなし。状態ファイルは遅延作成する。
 3. 永続 `SU_STATE_DIR` と既存 `LLM_API_URL` を設定。1つのstate directoryに1つのGatewayプロセスを前提とする。破損ファイルは自動上書きせず、記憶/feedを安全に無効扱いにする。
-4. データ取扱い告知を確認し、必要な場合だけ公開承認済みchannelを `EXPERIENCE_PUBLIC_CHANNEL_IDS` に設定。private channelは指定しても同期しない。Garden側は既存MCP設定を使用。
+4. データ取扱い告知を確認し、必要な場合だけ公開承認済みchannelを `EXPERIENCE_PUBLIC_CHANNEL_IDS` に設定。private channelは指定しても同期しない。Garden側は既存MCP設定を使用。DecisionGarden に `update_memory_node` が入るまで、2回目以降の更新は「同期待ち」のまま保留される（詳細と導入順・ロールバックは README 参照）。
 5. connpassへAPI利用申請を行い、発行されたkeyをsecret `CONNPASS_API_KEY` に設定する。API取得を確認してから `CONNPASS_ENABLED=true` にする。初回は自発投稿なし。取得、解析、公開同期、Discord receiptは別々に確認する。
 
 このPRの検証はAPI v2レスポンスのモックまで。本番API keyを使った取得、本番deploy、Gateway再起動、Discordへの投稿、DGへの書込みは行わない。
