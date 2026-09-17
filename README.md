@@ -12,7 +12,7 @@ connpass API v2 からAI駆動開発グループ（`subdomain=aid`）のイベ�
 
 記憶は日付ではなく話題で束ねます。同じチャンネルで同じ話が続いた場合は新しいノードを作らず、同一 thread を根拠付きで更新し（`revision` が増え、以前の引用は履歴として残ります）、変化がなければ何も書きません。未解決の問いはTODOではなく knowledge として保持します。日次ダイジェストは廃止しました。
 
-本番有効化には、このWorker/Gatewayの反映、永続 `SU_STATE_DIR`、既存のGateway用LLM設定が必要です。DB migrationはありません。DecisionGardenへの経験共有は `EXPERIENCE_PUBLIC_CHANNEL_IDS` に運営が承認した公開チャンネルを指定した場合のみで、公開用の限定された要約と記憶参照キーを送ります。稼働統計はGardenではなく運営ログにのみ出ます。この変更のローカル検証だけでは本番反映・Discord送信を意味しません。
+本番有効化には、このWorker/Gatewayの反映、永続 `SU_STATE_DIR`、既存のGateway用LLM設定が必要です。DB migrationはありません。DecisionGardenへの経験共有は `EXPERIENCE_PUBLIC_CHANNEL_IDS` に運営が承認した公開チャンネルを指定した場合のみです。さらにそのうえで、記憶ごとに公開判定を通す必要があります。公開されるのは原文の引用ではなく、人物名・内密の内容がないと判定されたうえで書き直された短い要約だけで、判定を通らなかった記憶はノードを作らずprivateのまま残ります。稼働統計はGardenではなく運営ログにのみ出ます。この変更のローカル検証だけでは本番反映・Discord送信を意味しません。
 
 #### 導入順・未反映時の挙動・ロールバック
 

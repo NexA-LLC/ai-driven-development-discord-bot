@@ -14,7 +14,14 @@
 
 DecisionGarden 側の確定 contract は `update_memory_node({nodeId, expectedUpdatedAt, title?, body?, evidence?})`。`expectedUpdatedAt` は `get_memory_node` / `list_memory_nodes` の値そのままで必須。`gardenId` / `kind` / `source` / `sourceKey` は `provenance_immutable`、`state` / `visibility` は `lifecycle_not_updatable` で拒否されるので送らない（未知フィールドも拒否）。CAS 不一致は `updated_at_conflict` で何も書かない。ただし保存済み内容が要求内容と一致する場合だけは「適用済みの再試行」として `operation:"unchanged"` / `expectedUpdatedAtMatched:false` を返すので、Bot はこれも同期成功として扱う（timeout 後の再送が二重書き込みにならない）。成功応答の `memoryNode` は `id` / `gardenId` / `sourceKey` / `title` / `body` / `updatedAt` を含み、Bot は送った title と body が実際に保存されたことまで照合してから synced にする。
 
-公開本文は定型文ではなく「出来事 / 受け止め方 / 残る問い」を短く保持する。公開前に Discord ID・URL・メールアドレス・コードブロック・敬称付きの氏名・長い数字列を置換し、秘密パターンを含む候補は公開しない。置換で具体性が残らない場合はその旨を書き、文章を捏造しない。事実は引用由来の「出来事」、解釈は「受け止め方」に分けて書く。
+**公開本文は原文のコピーではない。** 記憶は既定でprivateで、抽出とは別の「公開判定」を通った候補だけが公開対象になる。判定は二重で、どちらか一方でも拒めば公開しない:
+
+- 意味の判定（LLM）: 実在の人物名（敬称の有無を問わない。日本語の姓名も含む）、誰の発言か特定できる内容、内密・未公表・公開されると困りうる話題、一般化すると何も残らない話は publishable=false。迷ったら false。通った場合だけ、原文の言い回しを使わずに書き直した「出来事 / 受け止め方 / 残る問い」を出力する。
+- 構造の判定（コード `safePublicSummary`）: Discord ID・URL・メールアドレス・コードブロック・敬称付き氏名・長い数字列・秘密パターンを**検出したら修正せず拒否**する（置換で誤魔化さない）。原文と12文字以上一致する連続部分があれば「引用」とみなして拒否する。長さは各項目4〜160文字。
+
+安全な具体性が残らない候補は、**定型文のGardenノードを作らずに公開をskipする**（`publicReview: "rejected"`）。記憶自体はprivateのまま残り、会話の読み戻しには使う。LLMが不達・不正JSONのときは `not_run` / `pending` で保留し、「不明」を公開許可にはしない。記憶が更新されて revision が上がると clearance は無効になり、新しい本文で判定をやり直す。
+
+限界として、敬称のない氏名や文脈依存の機微はコード側の正規表現では判定できず、LLM判定に依存する。コードが保証するのは「識別子を含まない」「原文の逐語コピーではない」「判定未了なら公開しない」までで、意味の安全性は判定モデルの精度に依存する。
 
 HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `not_permitted`（scope や Garden write 権限の不足）/ `conflict`（`updated_at_conflict` や `source_key_conflict`）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` / `not_configured` / `not_permitted` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
 

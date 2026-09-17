@@ -513,32 +513,43 @@ async function recallExperiences(message: Message, query: string): Promise<Exper
 client.on(Events.MessageDelete, message => { try { experiences.removeSource(message.id); } catch { console.error("experience deletion failed"); } });
 client.on(Events.MessageBulkDelete, messages => { for (const message of messages.values()) { try { experiences.removeSource(message.id); } catch { console.error("experience deletion failed"); } } });
 
+/** Operator-approved public channel inside the primary guild. Publication needs this and a review. */
+const publishableChannel = (memory: ExperienceMemory): boolean =>
+  publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId);
+
+const experienceLlm = async (messages: AgentMessage[]): Promise<string> => {
+  const response = await fetch(llmApiUrl, { method: "POST", headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
+    body: JSON.stringify({ model: llmModel || undefined, messages, temperature: 0.1, max_tokens: 1500 }), signal: AbortSignal.timeout(llmTimeoutMs) });
+  if (!response.ok) throw new Error("Experience LLM failed");
+  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  return body.choices?.[0]?.message?.content ?? "";
+};
+
 export async function experienceTick(): Promise<void> {
   experiences.prune();
   await sweepDeletedEvidence();
   if (connpassEnabled) await connpass.refresh();
-  await experiences.analyse(llmApiUrl ? async messages => {
-    const response = await fetch(llmApiUrl, { method: "POST", headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
-      body: JSON.stringify({ model: llmModel || undefined, messages, temperature: 0.1, max_tokens: 1500 }), signal: AbortSignal.timeout(llmTimeoutMs) });
-    if (!response.ok) throw new Error("Experience LLM failed");
-    const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-    return body.choices?.[0]?.message?.content ?? "";
-  } : undefined);
+  await experiences.analyse(llmApiUrl ? experienceLlm : undefined);
+  // Publication review runs before sync, and only for memories an operator already allowed to be public.
+  await experiences.review(llmApiUrl ? experienceLlm : undefined, publishableChannel);
   await experiences.sync(async memory => {
     // A copy is only publishable while its evidence still exists in a channel everyone can read.
     if (!await verifyExperience(memory)) return "failed";
     const channel = await client.channels.fetch(memory.channelId) as TextChannel;
     const read = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
     if (!channel.permissionsFor(channel.guild.roles.everyone)?.has(read) || channel.permissionOverwrites.cache.some(o => o.deny.any(read))) return "failed";
+    const publishable = publicExperience(memory);
+    // No cleared summary means nothing may be published; never fall back to a generic node.
+    if (!publishable) return "failed";
     // A conflict or a Garden failure answers with a non-2xx; the status still has to be read, not thrown away.
-    const result = (await postSignedOutcome<{ synced?: boolean; status?: SyncOutcome }>("/internal/experiences/sync", publicExperience(memory))).body;
+    const result = (await postSignedOutcome<{ synced?: boolean; status?: SyncOutcome }>("/internal/experiences/sync", publishable)).body;
     if (result?.synced === true) return "synced";
     // An older Garden without an update tool is reported as waiting, never as a completed sync.
     const status = result?.status;
     if (status === "update_unsupported") console.warn(`experience ${memory.threadId.slice(0, 8)} rev${memory.revision}: Garden has no update tool yet; waiting`);
     if (status === "not_permitted") console.warn(`experience ${memory.threadId.slice(0, 8)} rev${memory.revision}: Garden write access missing; waiting`);
     return status === "update_unsupported" || status === "not_permitted" || status === "conflict" || status === "not_configured" ? status : "failed";
-  }, memory => publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId),
+  }, publishableChannel,
     async threadId => (await postSigned<{ retracted: boolean }>("/internal/experiences/retract", { threadId })).retracted === true);
   await pullEditorNotes();
 }

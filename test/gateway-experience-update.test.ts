@@ -10,6 +10,9 @@ const mocks = vi.hoisted(() => ({
   client: { user: { id: "su" }, on: vi.fn(), once: vi.fn(), login: vi.fn(), channels: { fetch: vi.fn() } },
   llm: [] as Array<Record<string, any>>, worker: [] as Array<{ path: string; body: any }>,
   extraction: "[]", pull: { status: "ok", notes: [] as Array<{ threadId: string; body: string; updatedAt: string }> },
+  // The publication reviewer: a separate pass that rewrites the memory instead of copying it.
+  review: JSON.stringify({ publishable: true, summary: { observation: "唯一の正解を決めない四択の呼び方について意見をもらった",
+    takeaway: "投票と呼ぶほうが誤解が少ないのかもしれないと考えている", openQuestion: "どう呼べば誤解されにくいのか" } }),
   syncResponse: () => Response.json({ synced: true, operation: "created" }),
 }));
 vi.mock("discord.js", async () => ({ ...await vi.importActual("discord.js"), Client: class { constructor() { return mocks.client; } } }));
@@ -52,8 +55,10 @@ beforeAll(async () => {
       return Response.json({ ok: true });
     }
     const request = JSON.parse(options.body as string); mocks.llm.push(request);
-    const extracting = request.messages[0].content.includes("スー宛の実際の会話");
-    return Response.json({ choices: [{ message: { role: "assistant", content: extracting ? mocks.extraction : "わかりました。" } }] });
+    const system = request.messages[0].content as string;
+    const content = system.includes("スー宛の実際の会話") ? mocks.extraction
+      : system.includes("公開Gardenに出してよいか判定") ? mocks.review : "わかりました。";
+    return Response.json({ choices: [{ message: { role: "assistant", content } }] });
   }));
   gateway = await import("../src/gateway/index.js");
 });
@@ -66,7 +71,8 @@ it("creates one interest, updates the same memory the next day, and publishes on
   expect(syncCalls()).toHaveLength(1);
   const first = syncCalls()[0]!.body;
   expect(first).toMatchObject({ revision: 1, topic: "quiz_terminology" });
-  expect(first.observation).toContain("用語を分けた方がよい");
+  expect(first.observation).toContain("唯一の正解を決めない四択の呼び方");
+  expect(first.observation).not.toContain(quoteA); // Published text is a retelling, never the original.
   expect(first.openQuestion).toBeTruthy(); // An unresolved interest stays a question, not a TODO.
 
   // Same conversation, nothing new: no analysis result means no Garden write at all.
@@ -79,6 +85,8 @@ it("creates one interest, updates the same memory the next day, and publishes on
   // The next day continues the same topic: the same thread is updated, not duplicated.
   vi.setSystemTime(day2);
   mocks.extraction = JSON.stringify([{ sourceId: "day-2", quote: quoteB, interpretation: "分け方より呼び方を変える方が伝わると考え直した", kind: "changed_mind" }]);
+  mocks.review = JSON.stringify({ publishable: true, summary: { observation: "呼び分けるより投票と言う方が伝わるという話になった",
+    takeaway: "前の考えを改めるほうがよさそうだと感じている" } });
   await gateway.onMessageImpl(message("day-2", quoteB, day2 - 1000));
   await gateway.experienceTick();
   expect(syncCalls()).toHaveLength(2);
@@ -86,7 +94,8 @@ it("creates one interest, updates the same memory the next day, and publishes on
   expect(second.id).toBe(first.id);          // One thread identity across days.
   expect(second.revision).toBe(2);
   expect(second.topic).toBe("changed_mind");
-  expect(second.observation).toContain("投票と呼ぶのが一番わかりやすい");
+  expect(second.observation).toContain("投票と言う方が伝わる");
+  expect(second.observation).not.toContain(quoteB);
   expect(second.observation).not.toBe(first.observation);
 });
 
@@ -129,6 +138,8 @@ it("keeps a conflict and an unsupported update honest across the Worker transpor
   let clock = day2 + 86400_000;
   mocks.extraction = JSON.stringify([{ sourceId: "fresh", quote: "登山靴の防水手入れを教えてもらった",
     interpretation: "撥水剤の塗り直しを試したい", kind: "interest" }]);
+  mocks.review = JSON.stringify({ publishable: true, summary: { observation: "雨に強くするための靴の手入れ方法を教わった",
+    takeaway: "撥水の塗り直しを自分でも試してみたい", openQuestion: "どのくらいの頻度で塗り直すのがよいのか" } });
   vi.setSystemTime(clock);
   await gateway.onMessageImpl(message("fresh", "登山靴の防水手入れを教えてもらった", clock - 1000));
   for (const { response, hold } of outcomes) {
