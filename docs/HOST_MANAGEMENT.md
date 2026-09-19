@@ -74,3 +74,8 @@ the final answer. An ambiguous timeout/reset is not immediately retried because 
 the prompt; the circuit cools down before the durable Discord item is resumed. User-visible LLM failures create an
 incident improvement issue on their first occurrence. Requests carry `x-nexa-client` and `x-nexa-request-id` so the
 Gateway and model-host logs can be correlated without logging prompt content.
+
+When a previously open incident is resolved, the Worker posts one recovery notice to the operator channel with the
+incident kind, source, occurrence count and elapsed time. A repeated resolve of an already-resolved incident is silent.
+Gateway success paths explicitly resolve recoverable LLM wait/failure, model availability, Discord reconnect, nightly
+maintenance, welcome, musing and follow-up incidents, so the operator channel distinguishes current failures from history.

@@ -237,6 +237,7 @@ client.on(Events.ShardDisconnect, (event) => {
 });
 client.on(Events.ShardResume, () => {
   console.log("discord shard resumed");
+  void resolveIncident("discord_disconnected");
 });
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => lifecycle.run(async () => {
@@ -308,6 +309,7 @@ client.on(Events.GuildMemberAdd, async (member) => lifecycle.run(async () => {
       requesterUserId: member.id,
       replyText: text,
     });
+    await resolveIncidentImpl("welcome_failed");
   } catch (error) {
     console.error("welcome failed", error);
     await reportIncident("welcome_failed", "warning", "新規参加者への挨拶に失敗", String(error));
@@ -603,8 +605,11 @@ export async function onMessageImpl(message: Message, recovery?: InboxItem): Pro
       ok,
       replyText: text,
     });
-    if (ok && recoveryNoticeMessageId && slowMentionIds.size === 0) {
-      await resolveIncidentImpl("mention_llm_waiting");
+    if (ok) {
+      await resolveIncidentImpl("mention_llm_failed");
+      if (recoveryNoticeMessageId && slowMentionIds.size === 0) {
+        await resolveIncidentImpl("mention_llm_waiting");
+      }
     }
     if (ok && inbox.deadLetterSize > 0) {
       const requeued = inbox.requeueDeadLetters(20);
@@ -866,6 +871,7 @@ async function maintenanceForever(): Promise<void> {
       const today = nowJst.toISOString().slice(0, 10);
       if (nowJst.getUTCHours() >= maintenanceHourJst && lastMaintenanceDate !== today) {
         await lifecycle.run(() => postSigned("/internal/maintenance/run", { hours: 24 }));
+        await resolveIncidentImpl("maintenance_failed");
         writeSlot("digest-date", today);
         lastMaintenanceDate = today;
         console.log(`nightly maintenance requested for ${today}`);
@@ -888,6 +894,7 @@ async function museForever(): Promise<void> {
       const slot = `${nowJst.toISOString().slice(0, 10)}T${hour}`;
       if (musingsChannelId && musingsHoursJst.includes(hour) && lastMusingSlot !== slot) {
         await postMusing(hour, false);
+        await resolveIncidentImpl("musing_failed");
         writeSlot("musing-slot", slot);
         lastMusingSlot = slot;
       }
@@ -996,6 +1003,7 @@ async function preflightConfiguredModel(): Promise<void> {
       return;
     }
     modelPreflightError = null;
+    await resolveIncidentImpl("llm_model_unavailable");
   } catch (error) {
     console.warn("LLM model preflight failed", error);
   }
@@ -1217,6 +1225,8 @@ async function processJobImpl(job: AiJob): Promise<void> {
     ok: true,
     replyText: text,
   });
+  await resolveIncidentImpl("llm_unreachable");
+  await resolveIncidentImpl("followup_failed");
   await postSigned("/internal/jobs/complete", { id: job.id, ok: true });
 }
 
@@ -1556,5 +1566,7 @@ const processJob = (...args: Parameters<typeof processJobImpl>): ReturnType<type
 const processCommand = (...args: Parameters<typeof processCommandImpl>): ReturnType<typeof processCommandImpl> => lifecycle.run(() => processCommandImpl(...args));
 
 const reportIncident = (...args: Parameters<typeof reportIncidentImpl>): ReturnType<typeof reportIncidentImpl> => lifecycle.run(() => reportIncidentImpl(...args));
+
+const resolveIncident = (...args: Parameters<typeof resolveIncidentImpl>): ReturnType<typeof resolveIncidentImpl> => lifecycle.run(() => resolveIncidentImpl(...args));
 
 await client.login(token);

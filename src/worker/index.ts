@@ -1119,7 +1119,36 @@ function formatIncidentForOps(
   return lines.join("\n");
 }
 
-async function notifyOps(env: Env, content: string): Promise<boolean> {
+interface ResolvedIncident {
+  id: string;
+  kind: string;
+  source: string;
+  summary: string;
+  count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+function formatIncidentDuration(firstSeenAt: string, resolvedAt: string): string {
+  const elapsedMs = Math.max(0, new Date(resolvedAt).getTime() - new Date(firstSeenAt).getTime());
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 1) return "1分未満";
+  if (minutes < 60) return `${minutes}分`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder === 0 ? `${hours}時間` : `${hours}時間${remainder}分`;
+}
+
+export function formatIncidentRecoveryForOps(incident: ResolvedIncident, resolvedAt: string): string {
+  return [
+    `✅ **店長さん、復帰しました** — ${incident.summary}`,
+    `種別: \`${incident.kind}\` / 発生元: ${incident.source} / 検知回数: ${incident.count}`,
+    `状態: \`resolved\` / 継続: ${formatIncidentDuration(incident.first_seen_at, resolvedAt)}`,
+    "現在、このincidentは解決済みです。",
+  ].join("\n");
+}
+
+async function notifyOps(env: Env, content: string, nonce?: string): Promise<boolean> {
   if (!env.OPS_CHANNEL_ID) {
     return false;
   }
@@ -1131,7 +1160,11 @@ async function notifyOps(env: Env, content: string): Promise<boolean> {
         authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ content: truncate(content, 1_900), allowed_mentions: { parse: [] } }),
+      body: JSON.stringify({
+        content: truncate(content, 1_900),
+        allowed_mentions: { parse: [] },
+        ...(nonce ? { nonce, enforce_nonce: true } : {}),
+      }),
     },
   );
   if (!response.ok) {
@@ -1267,11 +1300,26 @@ async function handleInternalIncidentResolve(request: Request, env: Env): Promis
       typeof body.source !== "string" || !body.source || body.source.length > 100) {
     return json({ error: "kind_and_source_are_required" }, 400);
   }
+  const dedupeKey = `${body.source}:${body.kind}`;
+  const incident = await env.DB.prepare(
+    `SELECT id, kind, source, summary, count, first_seen_at, last_seen_at
+       FROM su_incidents
+      WHERE dedupe_key = ? AND status = 'open'
+      ORDER BY last_seen_at DESC LIMIT 1`,
+  ).bind(dedupeKey).first<ResolvedIncident>();
+  if (!incident) return json({ ok: true, resolved: 0 });
+
+  const resolvedAt = new Date().toISOString();
+  if (env.OPS_CHANNEL_ID) {
+    const nonce = incident.id.replaceAll("-", "").slice(0, 24);
+    const notified = await notifyOps(env, formatIncidentRecoveryForOps(incident, resolvedAt), nonce);
+    if (!notified) return json({ error: "recovery_notification_failed" }, 502);
+  }
   const result = await env.DB.prepare(
     `UPDATE su_incidents
         SET status = 'resolved', resolved_at = ?
-      WHERE dedupe_key = ? AND status = 'open'`,
-  ).bind(new Date().toISOString(), `${body.source}:${body.kind}`).run();
+      WHERE id = ? AND status = 'open'`,
+  ).bind(resolvedAt, incident.id).run();
   return json({ ok: true, resolved: result.meta.changes });
 }
 
