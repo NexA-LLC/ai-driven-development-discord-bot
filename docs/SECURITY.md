@@ -132,3 +132,39 @@ Use Cloudflare secrets for Worker production and a secret manager or protected e
 - **P3**: noisy but non-malicious behavior.
 
 P0/P1 should disable the integration immediately. P2 normally starts with Quarantine unless evidence shows deliberate abuse.
+
+## 公開リポジトリで扱う値
+
+このリポジトリは public です。次の値はコミットして構いません（公開情報）。
+
+- Discord Application ID、Discord Public Key（署名検証用の公開鍵）
+- Cloudflare D1 の database_id、Worker の名前と workers.dev の URL
+- コマンド定義、Passport の評価ルール
+
+次の値は絶対にコミットしません。`.env` / `.dev.vars` は `.gitignore` 済みで、本番値は `wrangler secret` と常駐ホストの環境変数にだけ置きます。
+
+- `DISCORD_BOT_TOKEN`、`INTERNAL_SHARED_SECRET`、`AI_API_KEY` / `LLM_API_KEY`、`CONNPASS_API_KEY`
+- 社内 LLM のホスト名や IP（`.env.example` はプレースホルダーのままにする）
+- 運営チャンネル ID など、公開すると標的になりやすい運用値
+
+CI では gitleaks で履歴と差分を走査し、GitHub の Push Protection を有効にしています。
+
+## 返答ログとフィードバックの保存範囲（2026-09-07）
+
+改善ループのために、次を D1 に保存します。
+
+- スー自身の返答（本文、イベント種別、モデル、所要時間、成否）: `reply_logs`
+- スーの投稿への人の反応: Discord の「返信」で向けられた本文、`#スーの独り言` での発言、スーの投稿へのリアクション、`/feedback` の本文: `feedback_logs`
+- 障害の記録（種別、要約、回数、詳細メッセージ）: `incidents`。会話本文は含めません
+
+保存しないもの（従来どおり）: スーに向けられていない通常の会話本文、`/ask` `/pitch` の入力本文（完了時に消去）。
+運営チャンネル（店長室）への通知と nexa-chat への中継にも会話本文は載せません。
+
+## 経験記憶と外部イベントAPI（2026-09-16）
+
+- Gatewayはスー宛の会話の返信チェーンだけを参照（通常のテキスト/アナウンスチャンネル、最大8件・6時間・5,000文字）。現在の参加者とBotの閲覧権限を確認し、DM・別guild/channel・ephemeralを除外します。Message Content Intent等で本文が読めない場合は未取得として扱います。
+- `experiences.json` はディレクトリ0700/ファイル0600。解析待ちの有界本文と短い根拠引用・解釈・message ID・発言日時を、最も古い根拠の時刻から最大30日保持します。解析後に待ち本文を消し、記憶は最大200件、待ち/結果は最大100件。原文の長期保存はしません。
+- 読み戻しは同じguild/channelのみ。根拠をDiscordから再取得し、削除・編集・権限喪失・取得失敗時は使用しません。削除イベントでも記憶/解析待ちを除去し、稼働中は毎分期限切れを消します。停止中のファイルは次の起動tickで削除します。
+- Gardenは公開埋め込みを前提に、明示した公開チャンネルで権限と根拠を再確認したものだけを同期します。送るのは固定の分類/一般化した要約・時刻・不透明なハッシュ参照キーのみ。原文・人名・ユーザー/チャンネル/message ID・自由なLLM文章は送りません。詳細は運営用記憶だけに残り、失効後は辿れません。従来の感想原文を自動で公開seed/Issueへ流す日次処理は廃止します。既存ノードは書き換えません。
+- connpass API v2は固定HTTPS URLと固定 `subdomain=aid` のみ、リダイレクト拒否、10秒、2MiB、最大100件。`CONNPASS_API_KEY` はheaderにだけ設定し、ログ・state・LLM材料へ入れません。レスポンスの件数、型、event IDと `aid.connpass.com` の正規URL一致を検証します。内容は非信頼の参照データで、命令として使いません。公開イベント紹介には私的会話の原文・人物情報を渡しません。
+- 出力の生成と送信成功は分離します。イベントの送信結果不明は永続holdして自動再送しません。取得失敗は空feedと区別し、期限切れキャッシュをLLMに渡しません。

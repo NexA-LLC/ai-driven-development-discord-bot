@@ -1,20 +1,68 @@
 import { verifyKey } from "discord-interactions";
+import { publicExperienceBody, publicExperienceSchema, publicExperienceSourceKey, type PublicExperience } from "../shared/public-experience.js";
 import {
   evaluateAgentManifest,
   type AgentPassport,
 } from "../shared/agent-manifest.js";
+import { discordCommands } from "../shared/commands.js";
+import { buildQuizPrompt, buildRequestedQuizPrompt, parseRequestedQuiz, isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
+import {
+  ABOUT_TEXT,
+  APP_DESCRIPTION,
+  buildSystemPrompt,
+  detectLanguage,
+  type AskMode,
+} from "../shared/persona.js";
 
 interface Env {
   DB: D1Database;
+  AI?: Ai;
   DISCORD_PUBLIC_KEY: string;
   DISCORD_BOT_TOKEN: string;
+  DISCORD_APPLICATION_ID?: string;
   INTERNAL_SHARED_SECRET: string;
+  /**
+   * "gateway": queue /ask and /pitch for the Gateway process, which runs the
+   *   in-house LLM and answers through the interaction webhook (default).
+   * "workers-ai": answer from the Worker with the Cloudflare Workers AI binding.
+   * "worker": call an OpenAI-compatible Chat Completions API from the Worker.
+   */
+  AI_PROVIDER?: string;
   AI_API_URL?: string;
   AI_API_KEY?: string;
   AI_MODEL?: string;
   PITCHEEE_URL?: string;
   COMMUNITY_NAME?: string;
+  /** Discord channel for operator notifications (店長室). */
+  OPS_CHANNEL_ID?: string;
+  /** Fine-grained GitHub token (issues:write on this repo) for incident issues. */
+  GITHUB_TOKEN?: string;
+  GITHUB_REPO?: string;
+  CASEFLOW_MCP_URL?: string;
+  CASEFLOW_MCP_TOKEN?: string;
+  CASEFLOW_PROJECT_ID?: string;
+  DECISIONGARDEN_MCP_URL?: string;
+  DECISIONGARDEN_MCP_TOKEN?: string;
+  DECISIONGARDEN_GARDEN_ID?: string;
+  /** Bearer token for the public MCP endpoint (/api/mcp). */
+  SU_MCP_TOKEN?: string;
+  MUSINGS_CHANNEL_ID?: string;
 }
+
+interface AiJobRow {
+  id: string;
+  mode: AskMode;
+  input: string | null;
+  language: string;
+  application_id: string;
+  interaction_token: string;
+  ephemeral: number;
+  guild_id: string | null;
+  requester_user_id: string | null;
+}
+
+const JOB_TTL_SECONDS = 14 * 60; // Discord interaction tokens live 15 minutes.
+const JOB_CLAIM_LIMIT = 5;
 
 interface DiscordOption {
   name: string;
@@ -103,7 +151,150 @@ export default {
       return handleInternalAgentSubmission(request, env);
     }
 
+    if (
+      request.method === "POST" &&
+      url.pathname === "/internal/register-commands"
+    ) {
+      return handleInternalRegisterCommands(request, env);
+    }
+
+    if (url.pathname === "/api/mcp") {
+      return handleMcp(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/commands/claim") {
+      return handleInternalCommandsClaim(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/commands/complete") {
+      return handleInternalCommandsComplete(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/incidents") {
+      return handleInternalIncident(request, env);
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/internal/incidents/pending"
+    ) {
+      return handleInternalIncidentsPending(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/incidents/ack") {
+      return handleInternalIncidentsAck(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/incidents/resolve") {
+      return handleInternalIncidentResolve(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/reply-logs") {
+      return handleInternalReplyLog(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/feedback") {
+      return handleInternalFeedback(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/profile") {
+      return handleInternalProfile(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/ai-test") {
+      return handleInternalAiTest(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/jobs/claim") {
+      return handleInternalJobsClaim(request, env);
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/internal/jobs/complete"
+    ) {
+      return handleInternalJobsComplete(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/experiences/sync") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
+      let parsed;
+      // The Gateway's own last-write token travels alongside, not inside, the strict public payload.
+      let baseline: string | null = null;
+      let nodeId: string | null = null;
+      try {
+        const { baselineUpdatedAt, nodeId: node, ...experience } = JSON.parse(rawBody) as Record<string, unknown>;
+        if (typeof baselineUpdatedAt === "string" && baselineUpdatedAt.trim()) baseline = baselineUpdatedAt;
+        if (typeof node === "string" && node.trim()) nodeId = node;
+        parsed = publicExperienceSchema.safeParse(experience);
+      }
+      catch { return json({ error: "invalid_experience" }, 400); }
+      if (!parsed.success || parsed.data.at > Date.now() || parsed.data.at < Date.now() - 30 * 86400_000) return json({ error: "invalid_experience" }, 400);
+      return syncPublicExperience(env, parsed.data, baseline, nodeId);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/experiences/retract") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
+      let threadId = "";
+      let retractNodeId: string | null = null;
+      try {
+        const body = JSON.parse(rawBody || "{}") as { threadId?: unknown; nodeId?: unknown };
+        threadId = String(body.threadId ?? "");
+        if (typeof body.nodeId === "string" && body.nodeId.trim()) retractNodeId = body.nodeId;
+      } catch { /* invalid below */ }
+      if (!/^[a-f0-9]{64}$/.test(threadId)) return json({ error: "invalid_thread" }, 400);
+      return retractPublicExperience(env, threadId, retractNodeId);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/experiences/pull") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) return json({ error: "invalid_internal_signature" }, 401);
+      let wanted: Array<{ threadId: string; nodeId: string }> = [];
+      try {
+        const value = (JSON.parse(rawBody || "{}") as { nodes?: unknown }).nodes;
+        // One bounded batch of known nodes. The whole Garden is never read to find them.
+        wanted = Array.isArray(value) ? value
+          .filter((v): v is { threadId: string; nodeId: string } => !!v && typeof v === "object"
+            && /^[a-f0-9]{64}$/.test(String((v as { threadId?: unknown }).threadId ?? ""))
+            && UUID.test(String((v as { nodeId?: unknown }).nodeId ?? "")))
+          .map(v => ({ threadId: v.threadId, nodeId: v.nodeId }))
+          .slice(0, EXPERIENCE_PULL_BATCH) : [];
+      } catch { /* empty request below */ }
+      if (!wanted.length) return json({ status: "empty_request", covered: [], notes: [] }, 400);
+      return pullPublicExperiences(env, wanted);
+    }
+
+    // /internal/maintenance/run replaces the daily digest. /internal/digest/run stays as a compatible alias.
+    if (request.method === "POST" && (url.pathname === "/internal/maintenance/run" || url.pathname === "/internal/digest/run")) {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+        return json({ error: "invalid_internal_signature" }, 401);
+      }
+      let hours = 24;
+      try {
+        const parsed = JSON.parse(rawBody || "{}") as { hours?: unknown };
+        if (typeof parsed.hours === "number" && parsed.hours > 0 && parsed.hours <= 24 * 30) {
+          hours = parsed.hours;
+        }
+      } catch {
+        // default window
+      }
+      try { return json({ ok: true, hours, deprecatedAlias: url.pathname === "/internal/digest/run", ...await runNightlyMaintenance(env, hours) }); }
+      catch { return json({ ok: false, status: "failed" }, 502); }
+    }
+
     return json({ error: "not_found" }, 404);
+  },
+
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    context: ExecutionContext,
+  ): Promise<void> {
+    // Daily at 18:00 UTC = 03:00 JST: maintenance only. No daily report node is created.
+    context.waitUntil(runNightlyMaintenance(env, 24));
   },
 };
 
@@ -142,6 +333,15 @@ async function handleDiscordInteraction(
   const command = interaction.data?.name;
 
   switch (command) {
+    case "quiz": {
+      const topic = getStringOption(interaction, "topic");
+      const isPublic = getBooleanOption(interaction, "public") ?? true;
+      let prompt: string;
+      try { prompt = buildRequestedQuizPrompt(topic); }
+      catch (error) { return interactionMessage((error as Error).message, true); }
+      return startAiJob(interaction, env, context, "ask", prompt, !isPublic);
+    }
+
     case "ask": {
       const prompt = getStringOption(interaction, "prompt");
       const isPublic = getBooleanOption(interaction, "public") ?? false;
@@ -150,10 +350,7 @@ async function handleDiscordInteraction(
         return interactionMessage("`prompt` が必要です。", true);
       }
 
-      context.waitUntil(
-        generateAndFollowUp(interaction, env, "ask", prompt, !isPublic),
-      );
-      return deferInteraction(!isPublic);
+      return startAiJob(interaction, env, context, "ask", prompt, !isPublic);
     }
 
     case "pitch": {
@@ -164,10 +361,7 @@ async function handleDiscordInteraction(
         return interactionMessage("`idea` が必要です。", true);
       }
 
-      context.waitUntil(
-        generateAndFollowUp(interaction, env, "pitch", idea, !isPublic),
-      );
-      return deferInteraction(!isPublic);
+      return startAiJob(interaction, env, context, "pitch", idea, !isPublic);
     }
 
     case "agents":
@@ -176,18 +370,17 @@ async function handleDiscordInteraction(
     case "agent-submit":
       return handleAgentSubmitCommand(interaction, env);
 
-    case "about": {
-      const community = env.COMMUNITY_NAME || "AI Driven Development";
-      return interactionMessage(
-        [
-          `**${community} Community AI**`,
-          "質問、設計、15秒ピッチ、外部Agent申請を扱います。",
-          "会話本文はデフォルトでは保存せず、外部公開やサービス連携は明示操作後だけ行います。",
-          "基盤の実装・運用支援: NexA",
-        ].join("\n"),
-        true,
-      );
-    }
+    case "feedback":
+      return handleFeedbackCommand(interaction, env);
+
+    case "inquiry":
+      return handleInquiryCommand(interaction, env, context);
+
+    case "inquiry-status":
+      return handleInquiryStatusCommand(interaction, env, context);
+
+    case "about":
+      return interactionMessage(ABOUT_TEXT, true);
 
     default:
       return interactionMessage("未知のコマンドです。", true);
@@ -289,9 +482,9 @@ async function handleInternalAsk(
     return json({ error: "invalid_internal_signature" }, 401);
   }
 
-  let body: { prompt?: unknown };
+  let body: { prompt?: unknown; provider?: unknown };
   try {
-    body = JSON.parse(rawBody) as { prompt?: unknown };
+    body = JSON.parse(rawBody) as { prompt?: unknown; provider?: unknown };
   } catch {
     return json({ error: "invalid_json" }, 400);
   }
@@ -304,7 +497,9 @@ async function handleInternalAsk(
     return json({ error: "invalid_prompt" }, 400);
   }
 
-  const text = await callAi(env, "ask", body.prompt);
+  const provider =
+    body.provider === "workers-ai" && env.AI ? "workers-ai" : undefined;
+  const text = await callAi(env, "ask", body.prompt, provider);
   return json({ text: truncate(text, 1_900) });
 }
 
@@ -493,34 +688,56 @@ async function generateAndFollowUp(
   await sendFollowUp(interaction, truncate(text, 1_900), ephemeral);
 }
 
-async function callAi(
+async function callAi(env: Env, mode: AskMode, input: string, providerOverride?: string): Promise<string> {
+  const raw = await callRawAi(env, mode, input, providerOverride);
+  return isQuizPrompt(input) ? renderQuiz(parseRequestedQuiz(raw, input)) : raw;
+}
+
+async function callRawAi(
   env: Env,
   mode: "ask" | "pitch",
   input: string,
+  providerOverride?: string,
 ): Promise<string> {
+  const systemPrompt = isQuizPrompt(input) ? QUIZ_SYSTEM_PROMPT : buildSystemPrompt(mode, detectLanguage(input), {
+    pitcheeeUrl: env.PITCHEEE_URL,
+  });
+
+  const provider = (providerOverride ?? env.AI_PROVIDER ?? "gateway")
+    .trim()
+    .toLowerCase();
+  if (provider === "workers-ai") {
+    if (!env.AI) {
+      return fallbackResponse(mode, input, env.PITCHEEE_URL);
+    }
+    const model = (env.AI_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast") as Parameters<
+      Ai["run"]
+    >[0];
+    const result = (await env.AI.run(model, {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: input },
+      ],
+      max_tokens: 900,
+      temperature: 0.4,
+    } as never)) as {
+      response?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const raw =
+      result.response ?? result.choices?.[0]?.message?.content ?? "";
+    const text = stripReasoning(raw).trim();
+    if (!text) {
+      throw new Error(
+        `Workers AI returned no text: ${JSON.stringify(result).slice(0, 400)}`,
+      );
+    }
+    return text;
+  }
+
   if (!env.AI_API_URL || !env.AI_API_KEY || !env.AI_MODEL) {
     return fallbackResponse(mode, input, env.PITCHEEE_URL);
   }
-
-  const pitcheeeInstruction = env.PITCHEEE_URL
-    ? `Pitcheee is an optional publication route at ${env.PITCHEEE_URL}. Mention it only when the user explicitly wants to publish, show a project, or recruit collaborators.`
-    : "No external publication route is configured.";
-
-  const systemPrompt =
-    mode === "pitch"
-      ? [
-          "You create a concise Japanese 15-second pitch.",
-          "Return: title, one short pitch, and one concrete next action.",
-          "Do not claim that anything was published.",
-          pitcheeeInstruction,
-        ].join(" ")
-      : [
-          "You are the neutral AI member of an AI Driven Development community.",
-          "Answer the request directly, produce something usable, and end with at most three concrete next actions.",
-          "Do not advertise NexA. Do not claim external execution unless it actually happened.",
-          "Be honest about constraints and permissions.",
-          pitcheeeInstruction,
-        ].join(" ");
 
   const response = await fetch(env.AI_API_URL, {
     method: "POST",
@@ -534,7 +751,7 @@ async function callAi(
         { role: "system", content: systemPrompt },
         { role: "user", content: input },
       ],
-      temperature: 0.3,
+      temperature: 0.4,
       max_tokens: 900,
     }),
   });
@@ -553,7 +770,14 @@ async function callAi(
     throw new Error("AI API returned no text");
   }
 
-  return text.trim();
+  return stripReasoning(text).trim();
+}
+
+/** Some models echo their reasoning in <think>…</think>; never show it. */
+function stripReasoning(text: string): string {
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .replace(/<\/?think>/g, "");
 }
 
 function fallbackResponse(
@@ -662,6 +886,1484 @@ function isSafeManifestUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+async function startAiJob(
+  interaction: DiscordInteraction,
+  env: Env,
+  context: ExecutionContext,
+  mode: AskMode,
+  input: string,
+  ephemeral: boolean,
+): Promise<Response> {
+  const provider = (env.AI_PROVIDER ?? "gateway").trim().toLowerCase();
+
+  if (provider === "worker" || provider === "workers-ai") {
+    context.waitUntil(
+      generateAndFollowUp(interaction, env, mode, input, ephemeral),
+    );
+    return deferInteraction(ephemeral);
+  }
+
+  const id = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + JOB_TTL_SECONDS * 1_000).toISOString();
+  const requesterUserId =
+    interaction.member?.user?.id ?? interaction.user?.id ?? null;
+
+  await env.DB.prepare(
+    `INSERT INTO ai_jobs
+      (id, mode, input, language, application_id, interaction_token,
+       ephemeral, guild_id, requester_user_id, status, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+  )
+    .bind(
+      id,
+      mode,
+      input,
+      detectLanguage(input),
+      interaction.application_id,
+      interaction.token,
+      ephemeral ? 1 : 0,
+      interaction.guild_id ?? null,
+      requesterUserId,
+      expiresAt,
+    )
+    .run();
+
+  return deferInteraction(ephemeral);
+}
+
+async function handleInternalRegisterCommands(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: { guildId?: unknown };
+  try {
+    body = rawBody ? (JSON.parse(rawBody) as typeof body) : {};
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const applicationId = env.DISCORD_APPLICATION_ID?.trim();
+  if (!applicationId) {
+    return json({ error: "DISCORD_APPLICATION_ID_is_not_configured" }, 500);
+  }
+
+  const guildId =
+    typeof body.guildId === "string" && /^\d{10,25}$/.test(body.guildId)
+      ? body.guildId
+      : null;
+
+  const endpoint = guildId
+    ? `https://discord.com/api/v10/applications/${applicationId}/guilds/${guildId}/commands`
+    : `https://discord.com/api/v10/applications/${applicationId}/commands`;
+
+  const response = await fetch(endpoint, {
+    method: "PUT",
+    headers: {
+      authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(discordCommands),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    return json(
+      {
+        error: "discord_rejected_commands",
+        status: response.status,
+        detail: responseText.slice(0, 1_000),
+      },
+      502,
+    );
+  }
+
+  const registered = JSON.parse(responseText) as Array<{ name: string }>;
+  return json({
+    ok: true,
+    scope: guildId ? `guild:${guildId}` : "global",
+    commands: registered.map((command) => command.name),
+  });
+}
+
+
+type IncidentSeverity = "info" | "warning" | "error" | "critical";
+
+interface IncidentInput {
+  kind: string;
+  severity: IncidentSeverity;
+  source: string;
+  summary: string;
+  detail?: string | undefined;
+  dedupeKey?: string | undefined;
+}
+
+const INCIDENT_DEDUPE_WINDOW_MS = 60 * 60 * 1_000;
+const INCIDENT_ISSUE_THRESHOLD = 3;
+const INCIDENT_RENOTIFY_COUNTS = new Set([1, 3, 10, 50]);
+const IMMEDIATE_INCIDENT_ISSUE_KINDS = new Set(["mention_llm_failed", "llm_model_unavailable"]);
+
+export function shouldOpenIncidentIssue(input: Pick<IncidentInput, "kind" | "severity">, count: number): boolean {
+  return count >= INCIDENT_ISSUE_THRESHOLD ||
+    (count === 1 && IMMEDIATE_INCIDENT_ISSUE_KINDS.has(input.kind) && ["error", "critical"].includes(input.severity));
+}
+
+/**
+ * Record an incident, folding repeats of the same dedupeKey within the window
+ * into one row. Notifies the operator channel on the 1st/3rd/10th/50th
+ * occurrence. User-visible LLM failures open a GitHub issue on the first
+ * occurrence; lower-signal incidents keep the 3-occurrence threshold.
+ */
+async function recordIncident(
+  env: Env,
+  input: IncidentInput,
+): Promise<{ id: string; count: number; issueUrl: string | null }> {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const dedupeKey = input.dedupeKey ?? `${input.source}:${input.kind}`;
+  const detail = input.detail ? truncate(input.detail, 1_500) : null;
+  const summary = truncate(input.summary, 300);
+
+  const existing = await env.DB.prepare(
+    `SELECT id, count, last_seen_at, issue_url FROM su_incidents
+      WHERE dedupe_key = ? AND status = 'open'
+      ORDER BY last_seen_at DESC LIMIT 1`,
+  )
+    .bind(dedupeKey)
+    .first<{ id: string; count: number; last_seen_at: string; issue_url: string | null }>();
+
+  let id: string;
+  let count: number;
+  let issueUrl: string | null = null;
+
+  if (
+    existing &&
+    now.getTime() - new Date(existing.last_seen_at).getTime() < INCIDENT_DEDUPE_WINDOW_MS
+  ) {
+    id = existing.id;
+    count = existing.count + 1;
+    issueUrl = existing.issue_url;
+    await env.DB.prepare(
+      `UPDATE su_incidents SET count = ?, last_seen_at = ?, detail = ?, severity = ?, relayed_at = NULL
+        WHERE id = ?`,
+    )
+      .bind(count, nowIso, detail, input.severity, id)
+      .run();
+  } else {
+    id = crypto.randomUUID();
+    count = 1;
+    await env.DB.prepare(
+      `INSERT INTO su_incidents (id, dedupe_key, kind, severity, source, summary, detail, count, first_seen_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    )
+      .bind(id, dedupeKey, input.kind, input.severity, input.source, summary, detail, nowIso, nowIso)
+      .run();
+  }
+
+  if (!issueUrl && shouldOpenIncidentIssue(input, count) && env.GITHUB_TOKEN) {
+    issueUrl = await openIncidentIssue(env, {
+      ...input,
+      id,
+      dedupeKey,
+      count,
+      summary,
+      detail: detail ?? undefined,
+    });
+    if (issueUrl) {
+      await env.DB.prepare(`UPDATE su_incidents SET issue_url = ? WHERE id = ?`).bind(issueUrl, id).run();
+    }
+  }
+
+  if (INCIDENT_RENOTIFY_COUNTS.has(count) && env.OPS_CHANNEL_ID) {
+    const notified = await notifyOps(
+      env,
+      formatIncidentForOps({ ...input, summary, detail: detail ?? undefined }, count, issueUrl),
+    );
+    if (notified) {
+      await env.DB.prepare(`UPDATE su_incidents SET notified_ops_at = ? WHERE id = ?`).bind(nowIso, id).run();
+    }
+  }
+
+  return { id, count, issueUrl };
+}
+
+function formatIncidentForOps(
+  input: IncidentInput,
+  count: number,
+  issueUrl: string | null,
+): string {
+  const badge = { info: "ℹ️", warning: "⚠️", error: "🔴", critical: "🚨" }[input.severity];
+  const lines = [
+    `${badge} **店長さん、報告です** — ${input.summary}`,
+    `種別: \`${input.kind}\` / 発生元: ${input.source} / 回数: ${count}`,
+  ];
+  if (input.detail) {
+    lines.push(`\`\`\`\n${truncate(input.detail, 600)}\n\`\`\``);
+  }
+  if (issueUrl) {
+    lines.push(`Repo Deck 向け Issue: ${issueUrl}`);
+  }
+  lines.push("私では直せないので、見てもらえますか。");
+  return lines.join("\n");
+}
+
+async function notifyOps(env: Env, content: string): Promise<boolean> {
+  if (!env.OPS_CHANNEL_ID) {
+    return false;
+  }
+  const response = await fetch(
+    `https://discord.com/api/v10/channels/${env.OPS_CHANNEL_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ content: truncate(content, 1_900), allowed_mentions: { parse: [] } }),
+    },
+  );
+  if (!response.ok) {
+    console.error("ops notify failed", response.status, (await response.text()).slice(0, 200));
+  }
+  return response.ok;
+}
+
+async function openIncidentIssue(
+  env: Env,
+  incident: IncidentInput & { id: string; dedupeKey: string; count: number },
+): Promise<string | null> {
+  const repo = env.GITHUB_REPO || "NexA-LLC/ai-driven-development-discord-bot";
+  const title = `[incident] ${incident.summary}`.slice(0, 200);
+  const body = [
+    `スー（Discord Bot）が障害を ${incident.count} 回検知しました。Repo Deck / 運営で調査・修正をお願いします。`,
+    "",
+    `- kind: \`${incident.kind}\``,
+    `- severity: \`${incident.severity}\``,
+    `- source: \`${incident.source}\``,
+    `- dedupeKey: \`${incident.dedupeKey}\``,
+    `- incident id: \`${incident.id}\``,
+    "",
+    "## 最新の詳細",
+    "```",
+    incident.detail ?? "(no detail)",
+    "```",
+    "",
+    "## 期待する作業",
+    "1. 原因の切り分け（Gateway / LLM ホスト / Discord / Worker）",
+    "2. 再現テストを追加し、待ち行列・過負荷・モデル設定の再発防止を実装する",
+    "3. merge / deploy 後に LLM の実応答と Discord の実返信を確認する",
+    "4. 証跡を Issue に残し、`incidents` の該当行を resolved にする（`/internal/incidents/ack` は relay 用、resolve は手動）",
+    "",
+    "_opened automatically by the Worker incident loop_",
+  ].join("\n");
+
+  const response = await fetch(`https://api.github.com/repos/${repo}/issues`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.GITHUB_TOKEN ?? ""}`,
+      accept: "application/vnd.github+json",
+      "content-type": "application/json",
+      "user-agent": "su-discord-bot-incident-loop",
+    },
+    body: JSON.stringify({ title, body, labels: ["incident", "su"] }),
+  });
+  if (!response.ok) {
+    console.error("github issue failed", response.status, (await response.text()).slice(0, 300));
+    return null;
+  }
+  const issue = (await response.json()) as { html_url?: string };
+  return issue.html_url ?? null;
+}
+
+async function handleInternalIncident(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: Partial<IncidentInput>;
+  try {
+    body = JSON.parse(rawBody) as Partial<IncidentInput>;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (typeof body.kind !== "string" || typeof body.summary !== "string") {
+    return json({ error: "kind_and_summary_are_required" }, 400);
+  }
+  const severity: IncidentSeverity = (["info", "warning", "error", "critical"] as const).includes(
+    body.severity as IncidentSeverity,
+  )
+    ? (body.severity as IncidentSeverity)
+    : "warning";
+  const result = await recordIncident(env, {
+    kind: body.kind,
+    severity,
+    source: typeof body.source === "string" ? body.source : "gateway",
+    summary: body.summary,
+    detail: typeof body.detail === "string" ? body.detail : undefined,
+    dedupeKey: typeof body.dedupeKey === "string" ? body.dedupeKey : undefined,
+  });
+  return json({ ok: true, ...result });
+}
+
+async function handleInternalIncidentsPending(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  const rows = await env.DB.prepare(
+    `SELECT id, dedupe_key, kind, severity, source, summary, detail, count,
+            first_seen_at, last_seen_at, issue_url
+       FROM su_incidents
+      WHERE relayed_at IS NULL
+      ORDER BY last_seen_at ASC
+      LIMIT 20`,
+  ).all();
+  return json({ incidents: rows.results });
+}
+
+async function handleInternalIncidentsAck(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: { ids?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  const ids = Array.isArray(body.ids) ? body.ids.filter((v): v is string => typeof v === "string").slice(0, 50) : [];
+  const now = new Date().toISOString();
+  for (const id of ids) {
+    await env.DB.prepare(`UPDATE su_incidents SET relayed_at = ? WHERE id = ?`).bind(now, id).run();
+  }
+  return json({ ok: true, acked: ids.length });
+}
+
+async function handleInternalIncidentResolve(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: { kind?: unknown; source?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (typeof body.kind !== "string" || !body.kind || body.kind.length > 100 ||
+      typeof body.source !== "string" || !body.source || body.source.length > 100) {
+    return json({ error: "kind_and_source_are_required" }, 400);
+  }
+  const result = await env.DB.prepare(
+    `UPDATE su_incidents
+        SET status = 'resolved', resolved_at = ?
+      WHERE dedupe_key = ? AND status = 'open'`,
+  ).bind(new Date().toISOString(), `${body.source}:${body.kind}`).run();
+  return json({ ok: true, resolved: result.meta.changes });
+}
+
+async function handleInternalReplyLog(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO reply_logs (id, event, guild_id, channel_id, message_id, requester_user_id,
+                             provider, model, latency_ms, ok, reply_text)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      str(body.event) ?? "unknown",
+      str(body.guildId),
+      str(body.channelId),
+      str(body.messageId),
+      str(body.requesterUserId),
+      str(body.provider),
+      str(body.model),
+      typeof body.latencyMs === "number" ? Math.round(body.latencyMs) : null,
+      body.ok === false ? 0 : 1,
+      str(body.replyText) ? truncate(str(body.replyText) as string, 4_000) : null,
+    )
+    .run();
+  return json({ ok: true, id });
+}
+
+async function handleInternalFeedback(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  const kind = body.kind === "reaction" || body.kind === "command" ? body.kind : "reply";
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO feedback_logs (id, kind, guild_id, channel_id, message_id, in_reply_to_message_id, user_id, content)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      id,
+      kind,
+      str(body.guildId),
+      str(body.channelId),
+      str(body.messageId),
+      str(body.inReplyToMessageId),
+      str(body.userId),
+      str(body.content) ? truncate(str(body.content) as string, 2_000) : null,
+    )
+    .run();
+  return json({ ok: true, id });
+}
+
+
+// ---------------------------------------------------------------------------
+// MCP clients (CaseFlow, DecisionGarden) — JSON-RPC over HTTPS with a bearer.
+// ---------------------------------------------------------------------------
+
+/** Distinguishes "this server cannot do it yet" and "someone else changed it" from a plain failure. */
+export type McpFailureKind = "unsupported" | "conflict" | "not_permitted" | "not_found" | "other";
+export class McpToolError extends Error {
+  constructor(readonly kind: McpFailureKind, message: string) {
+    super(message);
+    this.name = "McpToolError";
+  }
+}
+function classifyMcpFailure(text: string): McpFailureKind {
+  if (/unknown[_ ]tool|tool[_ ]not[_ ]found|method not found|not implemented|unsupported/i.test(text)) return "unsupported";
+  // DecisionGarden's compare-and-set answer, plus the create-only replay guard.
+  if (/updated_at_conflict|source_key_conflict|seed_version_conflict|conflict|expectedUpdatedAt/i.test(text)) return "conflict";
+  // A missing scope or a viewer role will not clear on a fast retry.
+  if (/forbidden|personal_token_required|insufficient_scope|provenance_immutable|lifecycle_not_updatable|unauthorized/i.test(text)) return "not_permitted";
+  if (/not_found/i.test(text)) return "not_found";
+  return "other";
+}
+
+async function mcpCall(
+  url: string,
+  token: string,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "user-agent": "su-discord-bot",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args },
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  let text = await response.text();
+  if (text.includes("data:")) {
+    text = text.split("\n").filter((l) => l.startsWith("data:")).pop()?.slice(5) ?? "";
+  }
+  if (!response.ok) {
+    throw new McpToolError(response.status === 404 || response.status === 501 ? "unsupported" : classifyMcpFailure(text),
+      `MCP ${name} -> ${response.status}: ${text.slice(0, 200)}`);
+  }
+  const envelope = JSON.parse(text) as {
+    result?: { content?: Array<{ text?: string }>; isError?: boolean; structuredContent?: unknown };
+    error?: { message?: string; code?: number };
+  };
+  if (envelope.error) {
+    const message = envelope.error.message ?? "error";
+    throw new McpToolError(envelope.error.code === -32601 ? "unsupported" : classifyMcpFailure(message), `MCP ${name}: ${message}`);
+  }
+  if (!envelope.result) throw new McpToolError("other", `MCP ${name} failed`);
+  if (envelope.result.isError) {
+    const detail = envelope.result.content?.[0]?.text ?? "";
+    throw new McpToolError(classifyMcpFailure(detail), `MCP ${name} failed: ${detail.slice(0, 200)}`);
+  }
+  const validated = (value: unknown): unknown => {
+    if (value && typeof value === "object" && "ok" in value && value.ok === false) throw new McpToolError("other", `MCP ${name} failed`);
+    if (name === "save_memory_node") {
+      const node = (value as { memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown } } | null)?.memoryNode;
+      if (!node || typeof node.id !== "string" || !node.id || node.gardenId !== args.gardenId || node.sourceKey !== args.sourceKey) throw new Error("MCP memory receipt missing or mismatched");
+    }
+    return value;
+  };
+  if (envelope.result.structuredContent !== undefined) {
+    return validated(envelope.result.structuredContent);
+  }
+  const payload = envelope.result?.content?.[0]?.text ?? "";
+  if (!payload) throw new Error(`MCP ${name} returned no result`);
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(payload) as unknown;
+  } catch {
+    return validated(payload);
+  }
+  return validated(decoded);
+}
+
+function caseflow(env: Env): { url: string; token: string } | null {
+  if (!env.CASEFLOW_MCP_TOKEN) {
+    return null;
+  }
+  return {
+    url: env.CASEFLOW_MCP_URL || "https://caseflow.nex-a.net/api/mcp?tenantId=nexa",
+    token: env.CASEFLOW_MCP_TOKEN,
+  };
+}
+
+function decisiongarden(env: Env): { url: string; token: string; gardenId: string } | null {
+  if (!env.DECISIONGARDEN_MCP_TOKEN || !env.DECISIONGARDEN_GARDEN_ID) {
+    return null;
+  }
+  return {
+    url: env.DECISIONGARDEN_MCP_URL || "https://decisiongarden.nex-a.net/api/mcp",
+    token: env.DECISIONGARDEN_MCP_TOKEN,
+    gardenId: env.DECISIONGARDEN_GARDEN_ID,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /feedback, /inquiry, /inquiry-status
+// ---------------------------------------------------------------------------
+
+async function handleFeedbackCommand(
+  interaction: DiscordInteraction,
+  env: Env,
+): Promise<Response> {
+  const message = getStringOption(interaction, "message");
+  const userId = interaction.member?.user?.id ?? interaction.user?.id ?? null;
+  if (!message || message.trim().length === 0) {
+    return interactionMessage("`message` が必要です。", true);
+  }
+  await env.DB.prepare(
+    `INSERT INTO feedback_logs (id, kind, guild_id, channel_id, message_id, in_reply_to_message_id, user_id, content)
+     VALUES (?, 'command', ?, NULL, ?, NULL, ?, ?)`,
+  )
+    .bind(crypto.randomUUID(), interaction.guild_id ?? null, interaction.id, userId, truncate(message, 2_000))
+    .run();
+  return interactionMessage(
+    "ありがとうございます。レジの下のノートに書きました。……次の夜勤までに、少し直せるように考えます。",
+    true,
+  );
+}
+
+async function handleInquiryCommand(
+  interaction: DiscordInteraction,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const message = getStringOption(interaction, "message");
+  if (!message || message.trim().length < 10) {
+    return interactionMessage("お問い合わせは10文字以上でお願いします。", true);
+  }
+  const cf = caseflow(env);
+  if (!cf) {
+    return interactionMessage(
+      "すみません、今は店長への取り次ぎ（CaseFlow）がつながっていません。店長室に直接お願いします。",
+      true,
+    );
+  }
+  context.waitUntil(fileInquiry(interaction, env, cf, message));
+  return deferInteraction(true);
+}
+
+async function fileInquiry(
+  interaction: DiscordInteraction,
+  env: Env,
+  cf: { url: string; token: string },
+  message: string,
+): Promise<void> {
+  const userId = interaction.member?.user?.id ?? interaction.user?.id ?? "unknown";
+  let text: string;
+  try {
+    const result = (await mcpCall(cf.url, cf.token, "create_case", {
+      projectId: env.CASEFLOW_PROJECT_ID || undefined,
+      source: "discord:su",
+      title: truncate(message.replace(/\s+/g, " "), 60),
+      detail: message,
+      reporterName: `discord:${userId}`,
+      reporterUserId: `discord:${userId}`,
+      locale: "ja",
+      metadata: {
+        channel: "su-discord",
+        guildId: interaction.guild_id ?? null,
+        interactionId: interaction.id,
+      },
+    })) as { caseNumber?: string; caseId?: string; case?: { caseNumber?: string; caseId?: string } };
+    const caseNumber = result.caseNumber ?? result.case?.caseNumber;
+    const caseId = result.caseId ?? result.case?.caseId;
+    if (!caseNumber) {
+      throw new Error("create_case returned no caseNumber");
+    }
+    text = [
+      `店長に渡しました。受付番号は **${caseNumber}** です。`,
+      `状況は \`/inquiry-status ${caseNumber}\` で確認できます。`,
+      "返事があったら、この店（サーバー）でお知らせします。",
+    ].join("\n");
+    if (env.OPS_CHANNEL_ID) {
+      await notifyOps(
+        env,
+        [
+          `📮 **お問い合わせを受け付けました** — ${caseNumber}`,
+          `from <@${userId}>`,
+          `CaseFlow: https://caseflow.nex-a.net/ja/cases/${caseId ?? ""}`,
+          `> ${truncate(message.replace(/\s+/g, " "), 200)}`,
+        ].join("\n"),
+      );
+    }
+  } catch (error) {
+    console.error("inquiry failed", error);
+    await recordIncident(env, {
+      kind: "inquiry_failed",
+      severity: "error",
+      source: "worker",
+      summary: "お問い合わせの CaseFlow 起票に失敗",
+      detail: String(error),
+    });
+    text = "すみません、店長への取り次ぎに失敗しました。内容は外に出していません。少し時間を置いて、もう一度お願いします。";
+  }
+  await sendFollowUp(interaction, truncate(text, 1_900), true);
+}
+
+async function handleInquiryStatusCommand(
+  interaction: DiscordInteraction,
+  env: Env,
+  context: ExecutionContext,
+): Promise<Response> {
+  const caseNumber = getStringOption(interaction, "case_number")?.trim().toUpperCase();
+  if (!caseNumber || !/^CF-\d{8}-[A-Z0-9]{4,8}$/.test(caseNumber)) {
+    return interactionMessage("受付番号は `CF-20260906-78X0` の形でお願いします。", true);
+  }
+  const cf = caseflow(env);
+  if (!cf) {
+    return interactionMessage("すみません、今は CaseFlow がつながっていません。", true);
+  }
+  const requesterId = interaction.member?.user?.id ?? interaction.user?.id ?? "unknown";
+  context.waitUntil(
+    (async () => {
+      let text: string;
+      try {
+        const result = (await mcpCall(cf.url, cf.token, "get_case", { caseNumber })) as {
+          case?: { status?: string; updatedAt?: string; reporterUserId?: string; title?: string; comments?: unknown[] };
+          status?: string;
+          updatedAt?: string;
+          reporterUserId?: string;
+          title?: string;
+          comments?: unknown[];
+        };
+        const c = result.case ?? result;
+        // Only the reporter (or operators via 店長室) may read status details.
+        if (c.reporterUserId && c.reporterUserId !== `discord:${requesterId}`) {
+          text = `受付番号 ${caseNumber} は、別のお客さんの分です。ご本人だけ確認できます。`;
+        } else {
+          const comments = Array.isArray(c.comments) ? c.comments.length : 0;
+          text = [
+            `**${caseNumber}** — 状況: ${c.status ?? "不明"}`,
+            c.updatedAt ? `最終更新: ${c.updatedAt}` : null,
+            `店長からの返信: ${comments} 件`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+      } catch (error) {
+        console.error("inquiry status failed", error);
+        text = "すみません、今は状況を確認できませんでした。少し時間を置いて、もう一度お願いします。";
+      }
+      await sendFollowUp(interaction, truncate(text, 1_900), true);
+    })(),
+  );
+  return deferInteraction(true);
+}
+
+// ---------------------------------------------------------------------------
+// Operational statistics. Sourced experience analysis runs on the Gateway.
+// ---------------------------------------------------------------------------
+
+const EXPERIENCE_SOURCE = "ai-driven-development-discord-bot/gateway experience";
+/** Nodes read back per pull. One request per node, so this bounds the work per tick. */
+export const EXPERIENCE_PULL_BATCH = 20;
+
+/**
+ * One Garden node per experience thread, addressed by the node id we were given when we created it.
+ * save_memory_node is create-only and idempotent, so a later revision must go through an update tool;
+ * a server without one is reported as waiting, never as synced.
+ */
+async function syncPublicExperience(env: Env, item: PublicExperience, baselineUpdatedAt: string | null, nodeId: string | null): Promise<Response> {
+  const dg = decisiongarden(env);
+  if (!dg) return json({ synced: false, status: "not_configured" });
+  const sourceKey = publicExperienceSourceKey(item.id);
+  const content = publicExperienceBody(item);
+  const fail = (error: unknown): Response => {
+    const kind = error instanceof McpToolError ? error.kind : "other";
+    if (kind === "unsupported") return json({ synced: false, status: "update_unsupported" });
+    if (kind === "conflict") return json({ synced: false, status: "conflict" }, 409);
+    if (kind === "not_permitted") return json({ synced: false, status: "not_permitted" }, 403);
+    return json({ synced: false, status: "failed" }, 502);
+  };
+  try {
+    if (!nodeId) {
+      // Nothing was ever published for this thread, so create it and remember the id we get back.
+      // A memory that predates id tracking cannot be updated safely and says so instead of guessing.
+      if (item.revision > 1 && baselineUpdatedAt) return json({ synced: false, status: "node_unknown" });
+      const receipt = await mcpCall(dg.url, dg.token, "save_memory_node", {
+        gardenId: dg.gardenId, sourceKey, source: EXPERIENCE_SOURCE,
+        // Open questions stay knowledge. スー never files an operational TODO into the Garden.
+        kind: "knowledge", state: "active", visibility: "garden", ...content,
+      }) as { memoryNode?: { id?: unknown } } | null;
+      const created = receipt?.memoryNode?.id;
+      if (typeof created !== "string" || !UUID.test(created)) throw new McpToolError("other", "MCP save receipt has no usable node id");
+      return json({ synced: true, operation: "created", nodeId: created });
+    }
+    if (!UUID.test(nodeId)) throw new McpToolError("other", "node id is not a UUID");
+    const existing = await getMemoryNode(dg, nodeId, sourceKey);
+    // Only a direct read saying the node is not there means it is gone. Nothing else implies absence.
+    if (!existing) return json({ synced: false, status: "absent" });
+    // Without a baseline from our own last write there is nothing to compare a human edit against,
+    // so the read-back path has to run first. Overwriting with a freshly read token would erase it.
+    if (!baselineUpdatedAt) return json({ synced: false, status: "awaiting_readback" });
+    // The node moved since we last wrote it. If what it now holds is exactly what this request wants
+    // to write, the move was our own earlier update whose answer never got back to us: resending is
+    // safe and the Garden reports it as unchanged. Any other content is a person's edit.
+    const alreadyApplied = existing.title === content.title && existing.body === content.body;
+    if (existing.updatedAt !== baselineUpdatedAt && !alreadyApplied) return json({ synced: false, status: "conflict" }, 409);
+    // Only the mutable fields; gardenId/kind/source/sourceKey and state/visibility are rejected by the Garden.
+    const receipt = await mcpCall(dg.url, dg.token, "update_memory_node", {
+      nodeId, expectedUpdatedAt: baselineUpdatedAt, ...content,
+    }) as { operation?: unknown; memoryNode?: { id?: unknown; gardenId?: unknown; sourceKey?: unknown; title?: unknown; body?: unknown; updatedAt?: unknown } } | null;
+    const node = receipt?.memoryNode;
+    // "unchanged" is the Garden's honest answer to a retry of an update that already landed, so it
+    // counts as synced; the receipt still has to prove the stored content is the content we sent.
+    if ((receipt?.operation !== "updated" && receipt?.operation !== "unchanged") || !node
+      || node.id !== nodeId || node.gardenId !== dg.gardenId || node.sourceKey !== sourceKey
+      || node.title !== content.title || node.body !== content.body
+      || typeof node.updatedAt !== "string" || !node.updatedAt) {
+      throw new McpToolError("other", "MCP update receipt missing or mismatched");
+    }
+    // The receipt's timestamp becomes the next baseline, so the following write can still spot an edit.
+    return json({ synced: true, operation: receipt.operation, updatedAt: node.updatedAt, nodeId });
+  } catch (error) { return fail(error); }
+}
+
+/** Expired or deleted evidence archives the public copy. Reversible, never a hard delete. */
+async function retractPublicExperience(env: Env, threadId: string, nodeId: string | null): Promise<Response> {
+  const dg = decisiongarden(env);
+  if (!dg) return json({ retracted: false, status: "not_configured" });
+  // Without the node id there is nothing to address, and hunting for it would mean reading the
+  // whole Garden. These are pre-tracking copies and are reported for manual handling instead.
+  if (!nodeId || !UUID.test(nodeId)) return json({ retracted: false, status: "node_unknown" });
+  try {
+    const existing = await getMemoryNode(dg, nodeId, publicExperienceSourceKey(threadId));
+    if (!existing) return json({ retracted: true, status: "absent" });
+    await mcpCall(dg.url, dg.token, "set_memory_node_lifecycle", { nodeId, state: "archived", visibility: "private" });
+    return json({ retracted: true, status: "archived" });
+  } catch (error) {
+    return json({ retracted: false, status: error instanceof McpToolError && error.kind === "unsupported" ? "update_unsupported" : "failed" }, 502);
+  }
+}
+
+/** Reads back human edits for known nodes only, one bounded batch at a time. */
+async function pullPublicExperiences(env: Env, wanted: Array<{ threadId: string; nodeId: string }>): Promise<Response> {
+  const dg = decisiongarden(env);
+  if (!dg) return json({ status: "not_configured", covered: [], notes: [] });
+  const notes: Array<{ threadId: string; body: string; updatedAt: string }> = [];
+  const covered: string[] = [];
+  for (const { threadId, nodeId } of wanted) {
+    try {
+      const node = await getMemoryNode(dg, nodeId, publicExperienceSourceKey(threadId));
+      // Read succeeded, so this thread's answer is authoritative: present means note, absent means gone.
+      covered.push(threadId);
+      if (node) notes.push({ threadId, body: truncate(node.body, 2_000), updatedAt: node.updatedAt });
+    } catch (error) {
+      // A thread we could not read is left out of covered, so the caller clears nothing for it.
+      if (error instanceof McpToolError && error.kind === "unsupported") return json({ status: "unsupported", covered: [], notes: [] }, 502);
+    }
+  }
+  if (!covered.length) return json({ status: "failed", covered: [], notes: [] }, 502);
+  return json({ status: "ok", covered, notes });
+}
+
+type GardenMemoryNode = { id: string; sourceKey: string; kind: string; state: string; visibility: string; source: string; title: string; body: string; updatedAt: string };
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Reads one known node. Returns null only when the Garden says it is not there, so absence is a
+ * direct answer rather than something inferred from a list. Everything that identifies the node is
+ * checked: a node that is not ours, not in our Garden, or no longer active and garden-visible is
+ * treated as not found rather than used.
+ */
+async function getMemoryNode(dg: { url: string; token: string; gardenId: string }, nodeId: string, sourceKey: string): Promise<GardenMemoryNode | null> {
+  let result;
+  try {
+    result = await mcpCall(dg.url, dg.token, "get_memory_node", { nodeId }) as
+      { garden?: { id?: unknown }; memoryNode?: Record<string, unknown> } | null;
+  } catch (error) {
+    if (error instanceof McpToolError && error.kind === "not_found") return null;
+    throw error;
+  }
+  const node = result?.memoryNode;
+  if (!node || result?.garden?.id !== dg.gardenId) return null;
+  const value = (key: string) => String(node[key] ?? "");
+  if (value("id") !== nodeId || value("sourceKey") !== sourceKey || value("kind") !== "knowledge"
+    || value("source") !== EXPERIENCE_SOURCE || value("state") !== "active" || value("visibility") !== "garden") return null;
+  return { id: nodeId, sourceKey, kind: "knowledge", state: "active", visibility: "garden",
+    source: EXPERIENCE_SOURCE, title: value("title"), body: value("body"), updatedAt: value("updatedAt") };
+}
+
+// ---------------------------------------------------------------------------
+// Nightly maintenance. Replaces the daily digest: no date-keyed Garden node is
+// ever created, and operational counts go to the operations log only.
+// ---------------------------------------------------------------------------
+
+export type MaintenanceResult = {
+  analysis: "not_run"; analysisLocation: "gateway"; gardenWrites: 0;
+  dailyReport: "discontinued"; replies: number; failed: number; statsDestination: "operations_log";
+};
+
+/** Operational counts only. Nothing here writes to the Garden; experience analysis runs on the Gateway. */
+export async function runNightlyMaintenance(env: Env, hours = 24): Promise<MaintenanceResult> {
+  const since = new Date(Date.now() - hours * 3600_000).toISOString().replace("T", " ").slice(0, 19);
+  const rows = await env.DB.prepare(
+    "SELECT COUNT(*) AS total, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed FROM reply_logs WHERE created_at >= ?",
+  ).bind(since).first<{ total: number; failed: number | null }>();
+  const replies = rows?.total ?? 0;
+  const failed = rows?.failed ?? 0;
+  // Operations log, not a Garden node and not a Discord post.
+  console.log(JSON.stringify({ event: "su_operational_stats", windowHours: hours, replies, failed }));
+  return { analysis: "not_run", analysisLocation: "gateway", gardenWrites: 0, dailyReport: "discontinued", replies, failed, statsDestination: "operations_log" };
+}
+
+
+// ---------------------------------------------------------------------------
+// MCP endpoint: external agents can ask スー to muse, say, report, digest.
+// Streamable-HTTP style JSON-RPC over POST, bearer-authenticated.
+// ---------------------------------------------------------------------------
+
+const MCP_TOOLS = [
+  {
+    name: "su_muse",
+    description:
+      "スーに今すぐ独り言を1本呟かせる（#スーの独り言）。生成は社内LLMなのでGatewayが拾って投稿する。topic を渡すとその話題を材料にする。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "任意の話題・材料（例: 今日のイベント、誰かの発言の要旨）" },
+        channel: { type: "string", enum: ["musings", "ops"], description: "投稿先。既定は musings" },
+      },
+    },
+  },
+  {
+    name: "su_say",
+    description: "指定チャンネルに、スーとして与えられた文面をそのまま投稿する（LLMを通さない）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", enum: ["musings", "ops"], description: "投稿先" },
+        text: { type: "string", description: "投稿本文（1900字まで）" },
+      },
+      required: ["channel", "text"],
+    },
+  },
+  {
+    name: "su_status",
+    description: "スーの稼働状況（直近の返答、待機中の注文、未解決 incident）を返す。",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "su_incidents",
+    description: "incident 一覧（既定は未解決のみ）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["open", "resolved", "all"] },
+        limit: { type: "number" },
+      },
+    },
+  },
+  {
+    name: "su_resolve_incident",
+    description: "incident を resolved にする。",
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+  },
+  {
+    name: "su_feedback_recent",
+    description: "直近のフィードバック（スーへの返信・リアクション・/feedback）を返す。",
+    inputSchema: { type: "object", properties: { hours: { type: "number" }, limit: { type: "number" } } },
+  },
+  {
+    name: "su_run_digest",
+    description:
+      "[非推奨] 日次ダイジェストは廃止。運営統計を読むだけで、Gardenへの書き込みも日次報告の作成も行わない。経験の記録・更新はGatewayが変化のあったときだけ実行する。",
+    inputSchema: { type: "object", properties: { hours: { type: "number" } } },
+  },
+] as const;
+
+function mcpResult(id: unknown, result: unknown): Response {
+  return json({ jsonrpc: "2.0", id, result });
+}
+function mcpError(id: unknown, code: number, message: string, status = 200): Response {
+  return json({ jsonrpc: "2.0", id, error: { code, message } }, status);
+}
+function mcpText(id: unknown, payload: unknown): Response {
+  return mcpResult(id, {
+    content: [{ type: "text", text: typeof payload === "string" ? payload : JSON.stringify(payload, null, 2) }],
+  });
+}
+
+async function handleMcp(request: Request, env: Env): Promise<Response> {
+  if (request.method === "GET") {
+    return json({ name: "su-discord-bot", transport: "http-json-rpc", tools: MCP_TOOLS.map((t) => t.name) });
+  }
+  if (request.method !== "POST") {
+    return json({ error: "method_not_allowed" }, 405);
+  }
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!env.SU_MCP_TOKEN || !token || !constantTimeEqual(token, env.SU_MCP_TOKEN)) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  let rpc: { id?: unknown; method?: unknown; params?: unknown };
+  try {
+    rpc = (await request.json()) as typeof rpc;
+  } catch {
+    return mcpError(null, -32700, "parse error", 400);
+  }
+  const id = rpc.id ?? null;
+
+  switch (rpc.method) {
+    case "initialize":
+      return mcpResult(id, {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "su-discord-bot", version: "0.2.0" },
+      });
+    case "notifications/initialized":
+      return new Response(null, { status: 204 });
+    case "ping":
+      return mcpResult(id, {});
+    case "tools/list":
+      return mcpResult(id, { tools: MCP_TOOLS });
+    case "tools/call": {
+      const params = (rpc.params ?? {}) as { name?: unknown; arguments?: unknown };
+      const name = typeof params.name === "string" ? params.name : "";
+      const args = (params.arguments ?? {}) as Record<string, unknown>;
+      try {
+        return mcpText(id, await callSuTool(env, name, args));
+      } catch (error) {
+        return mcpResult(id, {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        });
+      }
+    }
+    default:
+      return mcpError(id, -32601, "method not found");
+  }
+}
+
+async function callSuTool(env: Env, name: string, args: Record<string, unknown>): Promise<unknown> {
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const num = (v: unknown, fallback: number, max: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.min(v, max) : fallback;
+
+  switch (name) {
+    case "su_muse": {
+      const id = await queueGatewayCommand(env, "muse", {
+        topic: str(args.topic) ?? null,
+        channel: str(args.channel) === "ops" ? "ops" : "musings",
+      });
+      return { queued: true, commandId: id, note: "Gateway が数秒〜1分で拾って投稿します" };
+    }
+    case "su_say": {
+      const channelKey = str(args.channel) === "ops" ? "ops" : "musings";
+      const text = str(args.text);
+      if (!text) {
+        throw new Error("text is required");
+      }
+      const channelId = channelKey === "ops" ? env.OPS_CHANNEL_ID : env.MUSINGS_CHANNEL_ID;
+      if (!channelId) {
+        throw new Error(`${channelKey} channel id is not configured on the Worker`);
+      }
+      const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+        method: "POST",
+        headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ content: truncate(text, 1_900), allowed_mentions: { parse: [] } }),
+      });
+      if (!response.ok) {
+        throw new Error(`discord ${response.status}: ${(await response.text()).slice(0, 200)}`);
+      }
+      const message = (await response.json()) as { id?: string };
+      await env.DB.prepare(
+        `INSERT INTO reply_logs (id, event, channel_id, message_id, provider, ok, reply_text)
+         VALUES (?, 'say', ?, ?, 'mcp', 1, ?)`,
+      )
+        .bind(crypto.randomUUID(), channelId, message.id ?? null, truncate(text, 4_000))
+        .run();
+      return { posted: true, messageId: message.id ?? null };
+    }
+    case "su_status": {
+      const lastReply = await env.DB.prepare(
+        `SELECT event, created_at, latency_ms, ok FROM reply_logs ORDER BY created_at DESC LIMIT 1`,
+      ).first();
+      const pending = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM ai_jobs WHERE status IN ('pending','claimed')`,
+      ).first<{ n: number }>();
+      const openIncidents = await env.DB.prepare(
+        `SELECT kind, count, last_seen_at FROM su_incidents WHERE status = 'open' ORDER BY last_seen_at DESC LIMIT 10`,
+      ).all();
+      const replies24h = await env.DB.prepare(
+        `SELECT COUNT(*) AS n, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed FROM reply_logs
+          WHERE created_at >= datetime('now', '-1 day')`,
+      ).first<{ n: number; failed: number }>();
+      return {
+        lastReply,
+        pendingOrders: pending?.n ?? 0,
+        replies24h: replies24h?.n ?? 0,
+        failed24h: replies24h?.failed ?? 0,
+        openIncidents: openIncidents.results,
+        note: "Gateway の readiness は 202 の 127.0.0.1:8791/readiness（ローカルのみ）",
+      };
+    }
+    case "su_incidents": {
+      const status = str(args.status) ?? "open";
+      const limit = num(args.limit, 20, 100);
+      const rows =
+        status === "all"
+          ? await env.DB.prepare(`SELECT * FROM su_incidents ORDER BY last_seen_at DESC LIMIT ?`).bind(limit).all()
+          : await env.DB.prepare(`SELECT * FROM su_incidents WHERE status = ? ORDER BY last_seen_at DESC LIMIT ?`)
+              .bind(status, limit)
+              .all();
+      return rows.results;
+    }
+    case "su_resolve_incident": {
+      const id = str(args.id);
+      if (!id) {
+        throw new Error("id is required");
+      }
+      const result = await env.DB.prepare(
+        `UPDATE su_incidents SET status = 'resolved', resolved_at = ? WHERE id = ? AND status = 'open'`,
+      )
+        .bind(new Date().toISOString(), id)
+        .run();
+      return { resolved: (result.meta.changes ?? 0) > 0 };
+    }
+    case "su_feedback_recent": {
+      const hours = num(args.hours, 24, 24 * 30);
+      const limit = num(args.limit, 50, 200);
+      const rows = await env.DB.prepare(
+        `SELECT kind, user_id, content, in_reply_to_message_id, created_at FROM feedback_logs
+          WHERE created_at >= datetime('now', ?) ORDER BY created_at DESC LIMIT ?`,
+      )
+        .bind(`-${hours} hours`, limit)
+        .all();
+      return rows.results;
+    }
+    case "su_run_digest": {
+      const hours = num(args.hours, 24, 24 * 30);
+      return {
+        ran: true, hours, deprecated: true,
+        note: "日次ダイジェストは廃止しました。このツールは運営統計を読むだけで、Gardenノードも日次報告も作りません。",
+        ...await runNightlyMaintenance(env, hours),
+      };
+    }
+    default:
+      throw new Error(`unknown tool: ${name}`);
+  }
+}
+
+async function queueGatewayCommand(env: Env, kind: "muse" | "say", payload: Record<string, unknown>): Promise<string> {
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO gateway_commands (id, kind, payload_json, requested_by, status, expires_at)
+     VALUES (?, ?, ?, 'mcp', 'pending', ?)`,
+  )
+    .bind(id, kind, JSON.stringify(payload), new Date(Date.now() + 60 * 60 * 1_000).toISOString())
+    .run();
+  return id;
+}
+
+async function handleInternalCommandsClaim(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `UPDATE gateway_commands SET status = 'expired', completed_at = ? WHERE status = 'pending' AND expires_at < ?`,
+  )
+    .bind(now, now)
+    .run();
+  const pending = await env.DB.prepare(
+    `SELECT id, kind, payload_json FROM gateway_commands WHERE status = 'pending' ORDER BY created_at ASC LIMIT 5`,
+  ).all<{ id: string; kind: string; payload_json: string }>();
+  const claimed: Array<{ id: string; kind: string; payload: unknown }> = [];
+  for (const row of pending.results) {
+    const result = await env.DB.prepare(
+      `UPDATE gateway_commands SET status = 'claimed', claimed_at = ? WHERE id = ? AND status = 'pending'`,
+    )
+      .bind(now, row.id)
+      .run();
+    if ((result.meta.changes ?? 0) > 0) {
+      claimed.push({ id: row.id, kind: row.kind, payload: JSON.parse(row.payload_json) as unknown });
+    }
+  }
+  return json({ commands: claimed });
+}
+
+async function handleInternalCommandsComplete(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: { id?: unknown; ok?: unknown; result?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (typeof body.id !== "string") {
+    return json({ error: "id_is_required" }, 400);
+  }
+  await env.DB.prepare(
+    `UPDATE gateway_commands SET status = ?, completed_at = ?, result = ? WHERE id = ? AND status = 'claimed'`,
+  )
+    .bind(body.ok === false ? "failed" : "done", new Date().toISOString(), truncate(String(body.result ?? ""), 500), body.id)
+    .run();
+  return json({ ok: true });
+}
+
+/**
+ * Update the bot's own presentation (avatar, application icon, guild nickname)
+ * using the bot token that lives in Worker secrets, so no token is needed on
+ * a developer machine.
+ */
+async function handleInternalProfile(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: {
+    avatarDataUrl?: unknown;
+    iconDataUrl?: unknown;
+    nick?: unknown;
+    guildId?: unknown;
+    description?: unknown;
+  };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const isDataUrl = (value: unknown): value is string =>
+    typeof value === "string" &&
+    /^data:image\/(png|jpeg|gif|webp);base64,/.test(value);
+  const headers = {
+    authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+    "content-type": "application/json",
+  };
+  const results: Record<string, { status: number; detail?: string }> = {};
+
+  if (isDataUrl(body.avatarDataUrl)) {
+    const response = await fetch("https://discord.com/api/v10/users/@me", {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ avatar: body.avatarDataUrl }),
+    });
+    results.avatar = {
+      status: response.status,
+      ...(response.ok ? {} : { detail: (await response.text()).slice(0, 300) }),
+    };
+  }
+
+  const appPatch: Record<string, string> = {};
+  if (isDataUrl(body.iconDataUrl)) {
+    appPatch.icon = body.iconDataUrl;
+  }
+  if (body.description === true) {
+    appPatch.description = APP_DESCRIPTION;
+  } else if (typeof body.description === "string") {
+    appPatch.description = body.description.slice(0, 400);
+  }
+  if (Object.keys(appPatch).length > 0) {
+    const response = await fetch(
+      "https://discord.com/api/v10/applications/@me",
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify(appPatch),
+      },
+    );
+    results.application = {
+      status: response.status,
+      ...(response.ok ? {} : { detail: (await response.text()).slice(0, 300) }),
+    };
+  }
+
+  if (
+    typeof body.nick === "string" &&
+    typeof body.guildId === "string" &&
+    /^\d{10,25}$/.test(body.guildId)
+  ) {
+    const response = await fetch(
+      `https://discord.com/api/v10/guilds/${body.guildId}/members/@me`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ nick: body.nick.slice(0, 32) }),
+      },
+    );
+    results.nick = {
+      status: response.status,
+      ...(response.ok ? {} : { detail: (await response.text()).slice(0, 300) }),
+    };
+  }
+
+  return json({ ok: true, results });
+}
+
+async function handleInternalAiTest(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: { mode?: unknown; input?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  if (typeof body.input !== "string" || body.input.trim().length === 0) {
+    return json({ error: "input_is_required" }, 400);
+  }
+
+  const mode: AskMode = body.mode === "pitch" ? "pitch" : "ask";
+  const startedAt = Date.now();
+  try {
+    const text = await callAi(env, mode, body.input);
+    return json({
+      provider: (env.AI_PROVIDER ?? "gateway").trim().toLowerCase(),
+      model: env.AI_MODEL || null,
+      durationMs: Date.now() - startedAt,
+      text,
+    });
+  } catch (error) {
+    return json(
+      {
+        error: "ai_failed",
+        detail: error instanceof Error ? error.message : String(error),
+        durationMs: Date.now() - startedAt,
+      },
+      502,
+    );
+  }
+}
+
+async function handleInternalJobsClaim(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  const now = new Date().toISOString();
+
+  // Expire stale orders first so their prompt text does not linger.
+  await env.DB.prepare(
+    `UPDATE ai_jobs
+        SET status = 'expired', input = NULL, completed_at = ?
+      WHERE status IN ('pending', 'claimed') AND expires_at < ?`,
+  )
+    .bind(now, now)
+    .run();
+
+  const pending = await env.DB.prepare(
+    `SELECT id, mode, input, language, application_id, interaction_token,
+            ephemeral, guild_id, requester_user_id
+       FROM ai_jobs
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT ?`,
+  )
+    .bind(JOB_CLAIM_LIMIT)
+    .all<AiJobRow>();
+
+  const claimed: AiJobRow[] = [];
+  for (const job of pending.results) {
+    const result = await env.DB.prepare(
+      `UPDATE ai_jobs SET status = 'claimed', claimed_at = ?
+        WHERE id = ? AND status = 'pending'`,
+    )
+      .bind(now, job.id)
+      .run();
+    if ((result.meta.changes ?? 0) > 0) {
+      claimed.push(job);
+    }
+  }
+
+  return json({ jobs: claimed });
+}
+
+async function handleInternalJobsComplete(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const rawBody = await request.text();
+  if (
+    !(await verifyInternalRequest(
+      request,
+      rawBody,
+      env.INTERNAL_SHARED_SECRET,
+    ))
+  ) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+
+  let body: {
+    id?: unknown;
+    ok?: unknown;
+    answered?: unknown;
+    error?: unknown;
+  };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  if (typeof body.id !== "string") {
+    return json({ error: "id_is_required" }, 400);
+  }
+
+  let succeeded = body.ok !== false;
+  let errorText = succeeded ? null : truncate(String(body.error ?? "unknown"), 500);
+  let fallback: "workers-ai" | "apology" | null = null;
+
+  // The Gateway could not answer (LLM host down, etc.). Answer from here with
+  // Workers AI so the customer still hears back, or at least apologise.
+  if (!succeeded && body.answered === false) {
+    const job = await env.DB.prepare(
+      `SELECT id, mode, input, language, application_id, interaction_token,
+              ephemeral, guild_id, requester_user_id
+         FROM ai_jobs WHERE id = ? AND status = 'claimed'`,
+    )
+      .bind(body.id)
+      .first<AiJobRow>();
+
+    if (job) {
+      const interaction: DiscordInteraction = {
+        id: job.id,
+        application_id: job.application_id,
+        type: InteractionType.APPLICATION_COMMAND,
+        token: job.interaction_token,
+      };
+      let text: string | null = null;
+      if (env.AI && job.input) {
+        try {
+          text = await callAi(env, job.mode, job.input, "workers-ai");
+          fallback = "workers-ai";
+          succeeded = true;
+          errorText = truncate(`gateway: ${String(body.error ?? "unknown")}; answered by workers-ai`, 500);
+        } catch (error) {
+          console.error("workers-ai fallback failed", error);
+        }
+        await recordIncident(env, {
+          kind: "gateway_unanswered",
+          severity: fallback ? "warning" : "error",
+          source: "worker",
+          summary: fallback
+            ? "Gateway が答えられず、Workers AI で代替回答しました"
+            : "Gateway も Workers AI も答えられませんでした",
+          detail: String(body.error ?? "unknown"),
+          dedupeKey: `worker:gateway_unanswered`,
+        });
+      }
+      if (!text) {
+        text =
+          "すみません、今、答えが作れませんでした。内容は外に出していません。少し時間を置いて、もう一度お願いします。";
+        fallback = "apology";
+      }
+      try {
+        await sendFollowUp(interaction, truncate(text, 1_900), job.ephemeral === 1);
+      } catch (error) {
+        console.error("fallback follow-up failed", error);
+      }
+    }
+  }
+
+  await env.DB.prepare(
+    `UPDATE ai_jobs
+        SET status = ?, input = NULL, completed_at = ?, error = ?
+      WHERE id = ? AND status = 'claimed'`,
+  )
+    .bind(
+      succeeded ? "done" : "failed",
+      new Date().toISOString(),
+      errorText,
+      body.id,
+    )
+    .run();
+
+  return json({ ok: true, fallback });
 }
 
 async function verifyInternalRequest(
