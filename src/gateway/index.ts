@@ -16,7 +16,8 @@ import { isQuizPrompt, parseRequestedQuiz, parseQuiz, renderQuiz, QUIZ_SYSTEM_PR
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { auditConversation } from "./conversation-audit.js";
-import { inbox } from "./inbox.js";
+import { inbox, type InboxItem } from "./inbox.js";
+import { LlmReliability, LlmRequestError, llmHttpError } from "./llm-reliability.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
@@ -83,9 +84,30 @@ const wardenCooldownMs =
 const llmApiUrl = process.env.LLM_API_URL?.trim() || "";
 const llmModel = process.env.LLM_MODEL?.trim() || "";
 const llmApiKey = process.env.LLM_API_KEY?.trim() || "";
-const llmTimeoutMs = readPositiveInteger("LLM_TIMEOUT_SECONDS", 120) * 1_000;
+const llmAttemptTimeoutMs = readPositiveInteger("LLM_ATTEMPT_TIMEOUT_SECONDS", 45) * 1_000;
+const llmTotalTimeoutMs = readPositiveInteger("LLM_TOTAL_TIMEOUT_SECONDS", 90) * 1_000;
+const llmMaxAttempts = readPositiveInteger("LLM_MAX_ATTEMPTS", 2);
+// Discord mentions are normal channel replies, so they can remain queued much
+// longer than interactions. A waiting notice is posted while the single-flight
+// request remains attached; ambiguous timeouts are never immediately retried.
+const mentionLlmAttemptTimeoutMs = readPositiveInteger("MENTION_LLM_ATTEMPT_TIMEOUT_SECONDS", 900) * 1_000;
+const mentionLlmTotalTimeoutMs = readPositiveInteger("MENTION_LLM_TOTAL_TIMEOUT_SECONDS", 960) * 1_000;
+const mentionWaitNoticeMs = readPositiveInteger("MENTION_WAIT_NOTICE_SECONDS", 15) * 1_000;
+const mentionDeferredRetries = readPositiveInteger("MENTION_DEFERRED_RETRIES", 2);
+const mentionRetryDelayMs = readPositiveInteger("MENTION_RETRY_DELAY_SECONDS", 60) * 1_000;
 const jobPollMs = readPositiveInteger("JOB_POLL_SECONDS", 3) * 1_000;
 const pitcheeeUrl = process.env.PITCHEEE_URL?.trim() || undefined;
+const llmReliability = new LlmReliability({
+  maxConcurrency: readPositiveInteger("LLM_MAX_CONCURRENCY", 1),
+  maxQueue: readPositiveInteger("LLM_MAX_QUEUE", 50),
+  maxAttempts: llmMaxAttempts,
+  attemptTimeoutMs: llmAttemptTimeoutMs,
+  totalTimeoutMs: llmTotalTimeoutMs,
+  retryDelayMs: readPositiveInteger("LLM_RETRY_DELAY_SECONDS", 2) * 1_000,
+  circuitFailureThreshold: readPositiveInteger("LLM_CIRCUIT_FAILURES", 1),
+  circuitCooldownMs: readPositiveInteger("LLM_CIRCUIT_COOLDOWN_SECONDS", 60) * 1_000,
+});
+let modelPreflightError: string | null = null;
 
 if (passiveObserve && monitoredChannelIds.size === 0) {
   throw new Error(
@@ -142,22 +164,24 @@ const client = new Client({
 const voiceChat = new VoiceChat(client, async (text, history, audit) => {
   const request = { model: llmModel || undefined, response_format: VOICE_RESPONSE_FORMAT, max_tokens: 1_500,
       messages: [{ role: "system", content: buildSystemPrompt("mention", "ja", { pitcheeeUrl }) + '\n音声通話中です。聞き取りは誤認識の可能性があります。応答はJSONだけで {"action":"reply|leave|ignore","text":"読み上げる自然な日本語、300文字以内"}。利用者の意図を判断して、退室依頼はleave、無音・雑音・意味不明な認識結果はignore、それ以外の会話はreply。返答は1〜3文で短く。読み上げに不向きなMarkdownやURLを入れない。通話以外の外部操作は実行できないので実行済みと主張しない。' }, ...history, { role: "user", content: text }],
-    };
+  };
   auditConversation({ ...audit, phase: "llm_request", input: JSON.stringify(request) });
-  const response = await fetch(llmApiUrl, {
-    method: "POST", headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
-    body: JSON.stringify(request), signal: AbortSignal.timeout(llmTimeoutMs),
-  });
-  if (!response.ok) {
-    auditConversation({ ...audit, phase: "llm_response", ok: false, response: JSON.stringify({ status: response.status }) });
-    throw new Error(`Voice LLM returned ${response.status}`);
-  }
-  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const body = await llmReliability.run(async ({ signal, requestId }) => {
+    const response = await fetch(llmApiUrl, {
+      method: "POST", headers: llmHeaders(requestId), body: JSON.stringify(request), signal,
+    });
+    if (!response.ok) {
+      auditConversation({ ...audit, phase: "llm_response", ok: false, response: JSON.stringify({ status: response.status, requestId }) });
+      throw llmHttpError(response.status);
+    }
+    return response.json() as Promise<{ choices?: Array<{ message?: { content?: string } }> }>;
+  }, { priority: "interactive" });
   auditConversation({ ...audit, phase: "llm_response", ok: true, response: body.choices?.[0]?.message?.content ?? "" });
   return parseVoiceDecision(body.choices?.[0]?.message?.content ?? "");
 });
 let startupReady = false;
 let inFlight = 0;
+const slowMentionIds = new Set<string>();
 let lastMusingSlot = readSlot("musing-slot");
 const botRateState = new Map<string, RateState>();
 const experiences = new ExperienceStore();
@@ -177,12 +201,14 @@ client.once(Events.ClientReady, async (readyClient) => {
   } catch (error) {
     console.error("channel resolution failed", error);
   }
+  await preflightConfiguredModel();
   startReadinessServer();
   while (!lifecycle.draining) {
     try { await lifecycle.run(catchUpMessages); startupReady = true; break; }
     catch (error) { console.error("inbox recovery blocked", error); await sleep(5000); }
   }
   void replayInboxForever();
+  void providerWatchForever();
   setInterval(() => { if (client.isReady() && !lifecycle.draining) inbox.heartbeat(); }, 5000);
   void maintenanceForever();
   void experienceForever();
@@ -300,7 +326,14 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
-export async function onMessageImpl(message: Message): Promise<void> {
+interface MessageOutcome {
+  status: "answered" | "deferred" | "failed";
+  noticeMessageId?: string;
+  error?: string;
+  countAttempt?: boolean;
+}
+
+export async function onMessageImpl(message: Message, recovery?: InboxItem): Promise<MessageOutcome | void> {
   if (!message.guildId || message.flags?.has(64) || (primaryGuildId && message.guildId !== primaryGuildId) || message.author.id === client.user?.id) {
     return;
   }
@@ -391,7 +424,27 @@ export async function onMessageImpl(message: Message): Promise<void> {
     let speechText: string | undefined;
     let transcript: string | undefined;
     let ok = true;
+    let deferredOutcome: MessageOutcome | undefined;
+    let finalFailure: string | undefined;
+    let recoveryNoticeMessageId = recovery?.noticeMessageId;
+    let waitNoticePromise: Promise<void> | undefined;
     const startedAt = Date.now();
+    const waitNoticeTimer = recovery ? setTimeout(() => {
+      waitNoticePromise = (async () => {
+        slowMentionIds.add(message.id);
+        recoveryNoticeMessageId = await upsertRecoveryNotice(
+          message,
+          recoveryNoticeMessageId,
+          "返答を生成する順番を待っています。この依頼は待ち行列に保持し、完了したらここを回答に更新します。",
+        );
+        await reportIncident(
+          "mention_llm_waiting",
+          "warning",
+          "スーのメンション返答がLLM待ち行列で遅延しています",
+          JSON.stringify({ messageId: message.id, model: llmModel || null, provider: llmReliability.snapshot() }),
+        );
+      })().catch(error => console.error("waiting notice failed", error));
+    }, mentionWaitNoticeMs) : undefined;
     inFlight += 1;
     try {
       if (audioAddressed) {
@@ -403,17 +456,24 @@ export async function onMessageImpl(message: Message): Promise<void> {
         prompt,
         buildSystemPrompt("mention", detectLanguage(prompt), { pitcheeeUrl }),
         async (messages, allowTools) => {
-          const response = await fetch(llmApiUrl, {
-            method: "POST",
-            headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
-            body: JSON.stringify({ model: llmModel || undefined, messages, tools: mentionTools, tool_choice: allowTools ? "auto" : "none", temperature: 0.4, max_tokens: 1200 }),
-            signal: AbortSignal.timeout(llmTimeoutMs),
+          return llmReliability.run(async ({ signal, requestId }) => {
+            const response = await fetch(llmApiUrl, {
+              method: "POST",
+              headers: llmHeaders(requestId),
+              body: JSON.stringify({ model: llmModel || undefined, messages, tools: mentionTools, tool_choice: allowTools ? "auto" : "none", temperature: 0.4, max_tokens: 1200 }),
+              signal,
+            });
+            if (!response.ok) throw llmHttpError(response.status);
+            const body = await response.json() as { choices?: Array<{ message?: AgentMessage }> };
+            const answer = body.choices?.[0]?.message;
+            if (!answer) throw new LlmRequestError("Agent LLM returned no message", { code: "empty_message", retryable: true });
+            return answer;
+          }, {
+            priority: "interactive",
+            requestId: `mention-${message.id}-${randomUUID()}`,
+            attemptTimeoutMs: mentionLlmAttemptTimeoutMs,
+            totalTimeoutMs: mentionLlmTotalTimeoutMs,
           });
-          if (!response.ok) throw new Error(`Agent LLM returned ${response.status}`);
-          const body = await response.json() as { choices?: Array<{ message?: AgentMessage }> };
-          const answer = body.choices?.[0]?.message;
-          if (!answer) throw new Error("Agent LLM returned no message");
-          return answer;
         },
         async (name, args) => {
           if (name === "join_voice_channel") return voiceChat.join(message);
@@ -428,7 +488,18 @@ export async function onMessageImpl(message: Message): Promise<void> {
             lethweiReaction = true;
             return { attachedToReply: true, animation: "怒りのラウェイ・コンボ", realAction: false };
           }
-          if (name === "post_channel_message") return postChannelMessage(message, args);
+          if (name === "post_channel_message") {
+            const post = (args ?? {}) as { channel_id?: unknown; content?: unknown };
+            const receiptKey = `post:${createHash("sha256").update(JSON.stringify([post.channel_id, post.content])).digest("hex")}`;
+            const prior = inbox.toolReceipt(message.id, receiptKey);
+            if (prior.found) return prior.value;
+            const result = await postChannelMessage(message, args);
+            // Persist the result before asking the model for its final wording.
+            // Discord's stable nonce is the crash-window backstop; this receipt
+            // also lets a later replay report the original send accurately.
+            inbox.recordToolReceipt(message.id, receiptKey, result);
+            return result;
+          }
           const id = (args as { channel_id?: unknown } | null)?.channel_id;
           const allowed = [...message.content.matchAll(/<#(\d+)>/g)].map(match => match[1]);
           if (typeof id !== "string" || !allowed.includes(id)) throw new Error("ユーザーが今回指定したチャンネルのみ参照できます");
@@ -440,11 +511,57 @@ export async function onMessageImpl(message: Message): Promise<void> {
           ...(connpassEnabled ? [eventReference(connpass.reference(prompt))] : [])],
       );
     } catch (error) {
+      if (waitNoticeTimer) clearTimeout(waitNoticeTimer);
+      await waitNoticePromise;
       ok = false;
       console.error("mention agent failed", error);
-      text = audioAddressed ? "すみません、音声を処理できませんでした。8MB以下・2分以内の音声を1件ずつ送るか、文字でお願いします。" : "すみません、今は依頼を完了できませんでした。少し時間を置いて再度お願いします。";
+      const failure = error instanceof Error ? error.message : String(error);
+      if (error instanceof LlmRequestError) {
+        await reportIncident(
+          "mention_llm_failed",
+          "error",
+          "スーがメンションへの返答を生成できませんでした",
+          JSON.stringify({ messageId: message.id, model: llmModel || null, code: error.code, failure, provider: llmReliability.snapshot() }),
+        );
+        if (recovery && recovery.attempts < mentionDeferredRetries) {
+          const noticeMessageId = await upsertRecoveryNotice(
+            message,
+            recoveryNoticeMessageId,
+            `返答処理を待ち行列に保持しています。LLMの復旧を確認してから再開します（試行 ${recovery.attempts + 1}/${mentionDeferredRetries}）。`,
+          );
+          deferredOutcome = {
+            status: "deferred",
+            noticeMessageId,
+            error: failure,
+            countAttempt: !["circuit_open", "circuit_half_open", "queue_full"].includes(error.code),
+          };
+        } else if (recovery) {
+          finalFailure = failure;
+        }
+      }
+      text = audioAddressed
+        ? "すみません、音声を処理できませんでした。8MB以下・2分以内の音声を1件ずつ送るか、文字でお願いします。"
+        : recovery
+          ? "返答生成を自動で再試行しましたが、今回は復旧できませんでした。障害として記録し、改善対象に入れました。"
+          : "すみません、今は依頼を完了できませんでした。障害として記録し、こちらで再試行します。";
     } finally {
+      if (waitNoticeTimer) clearTimeout(waitNoticeTimer);
+      await waitNoticePromise;
+      slowMentionIds.delete(message.id);
       inFlight -= 1;
+    }
+    if (deferredOutcome) {
+      await logReply({
+        event: "mention_deferred",
+        guildId: message.guildId,
+        channelId: message.channelId,
+        messageId: deferredOutcome.noticeMessageId,
+        requesterUserId: message.author.id,
+        latencyMs: Date.now() - startedAt,
+        ok: false,
+        replyText: "automatic retry scheduled",
+      });
+      return deferredOutcome;
     }
   
     const files: Array<{ attachment: Buffer | string; name: string; description?: string }> = [];
@@ -460,14 +577,17 @@ export async function onMessageImpl(message: Message): Promise<void> {
     }
     if (transcript) text = `聞き取り：${truncate(transcript, 500)}\n\n${text}`;
     auditConversation({ ...audit, phase: "generated", response: truncate(text, 1_900), ok });
-    const sent = await message.reply({
+    const replyOptions = {
       content: truncate(text, 1_900),
       ...(files.length ? { files } : {}),
       allowedMentions: {
         parse: [],
         repliedUser: false,
       },
-    });
+    };
+    const sent = recoveryNoticeMessageId
+      ? await editRecoveryNotice(message, recoveryNoticeMessageId, replyOptions.content, files)
+      : await message.reply(replyOptions);
     auditConversation({ ...audit, phase: "sent", messageId: sent.id });
     if (ok && context.status === "available") {
       try { experiences.enqueue(message.id, context.sources); }
@@ -483,9 +603,45 @@ export async function onMessageImpl(message: Message): Promise<void> {
       ok,
       replyText: text,
     });
+    if (ok && inbox.deadLetterSize > 0) {
+      const requeued = inbox.requeueDeadLetters(20);
+      if (requeued > 0) console.log(`LLM recovered; requeued ${requeued} deferred mention(s)`);
+    }
+    return finalFailure ? { status: "failed", error: finalFailure } : { status: "answered" };
   } finally {
     stopTyping();
   }
+}
+
+async function upsertRecoveryNotice(message: Message, noticeMessageId: string | undefined, content: string): Promise<string> {
+  if (noticeMessageId) {
+    try {
+      const notice = await message.channel.messages?.fetch(noticeMessageId);
+      if (notice) {
+        await notice.edit({ content, allowedMentions: { parse: [] } });
+        return notice.id;
+      }
+    } catch (error) {
+      console.warn("retry notice edit failed; sending a replacement", error);
+    }
+  }
+  const sent = await message.reply({ content, allowedMentions: { parse: [], repliedUser: false } });
+  return sent.id;
+}
+
+async function editRecoveryNotice(
+  message: Message,
+  noticeMessageId: string,
+  content: string,
+  files: Array<{ attachment: Buffer | string; name: string; description?: string }>,
+): Promise<{ id: string }> {
+  try {
+    const notice = await message.channel.messages?.fetch(noticeMessageId);
+    if (notice) return await notice.edit({ content, ...(files.length ? { files } : {}), allowedMentions: { parse: [] } });
+  } catch (error) {
+    console.warn("retry result edit failed; sending a replacement", error);
+  }
+  return message.reply({ content, ...(files.length ? { files } : {}), allowedMentions: { parse: [], repliedUser: false } });
 }
 
 async function verifyExperience(memory: ExperienceMemory): Promise<boolean> {
@@ -523,10 +679,12 @@ const publishableChannel = (memory: ExperienceMemory): boolean =>
   publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId);
 
 const experienceLlm = async (messages: AgentMessage[]): Promise<string> => {
-  const response = await fetch(llmApiUrl, { method: "POST", headers: { "content-type": "application/json", ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}) },
-    body: JSON.stringify({ model: llmModel || undefined, messages, temperature: 0.1, max_tokens: 1500 }), signal: AbortSignal.timeout(llmTimeoutMs) });
-  if (!response.ok) throw new Error("Experience LLM failed");
-  const body = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const body = await llmReliability.run(async ({ signal, requestId }) => {
+    const response = await fetch(llmApiUrl, { method: "POST", headers: llmHeaders(requestId),
+      body: JSON.stringify({ model: llmModel || undefined, messages, temperature: 0.1, max_tokens: 1500 }), signal });
+    if (!response.ok) throw llmHttpError(response.status);
+    return response.json() as Promise<{ choices?: Array<{ message?: { content?: string } }> }>;
+  }, { priority: "background" });
   return body.choices?.[0]?.message?.content ?? "";
 };
 
@@ -666,17 +824,22 @@ function startReadinessServer(): void {
       response.writeHead(404).end();
       return;
     }
+    const provider = llmReliability.snapshot();
+    const active = lifecycle.active > 0;
+    const providerDegraded = modelPreflightError !== null || provider.state !== "healthy" || slowMentionIds.size > 0;
     const body = {
       contract: "nexa.host.update.readiness/v1",
-      decision: lifecycle.active > 0 ? "defer" : "ready",
+      decision: active ? "defer" : providerDegraded ? "degraded" : "ready",
       draining: lifecycle.draining,
       startupReady: startupReady && client.isReady(),
       pid: process.pid,
       release: process.env.SU_RELEASE_SHA ?? "unknown",
       queuedMessages: inbox.size,
-      reasonCode: lifecycle.active > 0 ? "active_work" : "idle",
-      message: `${lifecycle.active} operations in progress`,
+      deadLetterMessages: inbox.deadLetterSize,
+      reasonCode: active ? (slowMentionIds.size > 0 ? "llm_queue_slow" : "active_work") : modelPreflightError ? "llm_model_unavailable" : providerDegraded ? "llm_degraded" : "idle",
+      message: modelPreflightError ?? `${lifecycle.active} operations in progress`,
       activeWork: lifecycle.active,
+      llm: { ...provider, model: llmModel || null, preflightError: modelPreflightError, slowMentions: slowMentionIds.size },
       retryAfterSeconds: 30,
       observedAt: new Date().toISOString(),
     };
@@ -794,6 +957,78 @@ export async function postMusingImpl(
 
 let repliesSinceStart = 0;
 let failuresSinceStart = 0;
+
+function llmHeaders(requestId: string): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    "x-nexa-client": "su-gateway",
+    "x-nexa-request-id": requestId,
+    ...(llmApiKey ? { authorization: `Bearer ${llmApiKey}` } : {}),
+  };
+}
+
+async function preflightConfiguredModel(): Promise<void> {
+  if (!llmApiUrl || !llmModel) return;
+  try {
+    const url = new URL(llmApiUrl);
+    url.pathname = url.pathname.replace(/\/chat\/completions\/?$/, "/models");
+    const response = await fetch(url, {
+      headers: llmHeaders(`model-preflight-${randomUUID()}`),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      console.warn(`LLM model preflight unavailable: ${response.status}`);
+      return;
+    }
+    const body = await response.json() as { data?: Array<{ id?: string }> };
+    const available = (body.data ?? []).flatMap(item => item.id ? [item.id] : []);
+    if (available.length > 0 && !available.includes(llmModel)) {
+      modelPreflightError = `configured model ${llmModel} is not loaded`;
+      await reportIncident(
+        "llm_model_unavailable",
+        "critical",
+        "スーが指定しているLLMモデルが204にロードされていません",
+        JSON.stringify({ configuredModel: llmModel, availableModels: available.slice(0, 20) }),
+      );
+      return;
+    }
+    modelPreflightError = null;
+  } catch (error) {
+    console.warn("LLM model preflight failed", error);
+  }
+}
+
+async function providerWatchForever(): Promise<void> {
+  for (;;) {
+    if (!lifecycle.draining) {
+      const state = llmReliability.snapshot().state;
+      if (modelPreflightError || state === "open" || state === "degraded") {
+        await preflightConfiguredModel();
+        try {
+          await llmReliability.run(async ({ signal, requestId }) => {
+            const response = await fetch(llmApiUrl, {
+              method: "POST",
+              headers: llmHeaders(requestId),
+              body: JSON.stringify({
+                model: llmModel || undefined,
+                messages: [{ role: "user", content: "health check: reply OK" }],
+                temperature: 0,
+                max_tokens: 8,
+              }),
+              signal,
+            });
+            if (!response.ok) throw llmHttpError(response.status);
+          }, { priority: "background", maxAttempts: 1, attemptTimeoutMs: 30_000, totalTimeoutMs: 30_000 });
+          const requeued = inbox.requeueDeadLetters(20);
+          if (requeued > 0) console.log(`LLM health probe recovered; requeued ${requeued} mention(s)`);
+        } catch (error) {
+          console.warn("LLM health probe still degraded", error);
+        }
+      }
+    }
+    await sleep(30_000);
+  }
+}
 
 async function logReply(entry: {
   event: string;
@@ -990,13 +1225,6 @@ async function generateRawReply(
 
   const systemPrompt = isQuizPrompt(input) ? QUIZ_SYSTEM_PROMPT : buildSystemPrompt(event, language, { pitcheeeUrl });
 
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-  };
-  if (llmApiKey) {
-    headers.authorization = `Bearer ${llmApiKey}`;
-  }
-
   const requestBody = JSON.stringify({
     model: llmModel || undefined,
     messages: [
@@ -1010,43 +1238,15 @@ async function generateRawReply(
     max_tokens: 2_000,
   });
 
-  // Two different failures are worth another go: the in-house LLM host
-  // occasionally drops off the LAN for a few seconds (EHOSTUNREACH), and the
-  // local reasoning model sometimes spends its whole token budget thinking and
-  // answers with nothing at all. The interaction token lives 15 minutes.
-  const delaysMs = [0, 2_000, 5_000, 10_000, 20_000];
-  let lastError: unknown;
-  let retryImmediately = false;
-  for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
-    const delay = retryImmediately ? 0 : delaysMs[attempt]!;
-    retryImmediately = false;
-    if (delay > 0) {
-      await sleep(delay);
-    }
-
-    let response: Response;
-    try {
-      response = await fetch(llmApiUrl, {
-        method: "POST",
-        headers,
-        body: requestBody,
-        signal: AbortSignal.timeout(llmTimeoutMs),
-      });
-    } catch (error) {
-      lastError = error;
-      console.warn("LLM request failed, retrying", error);
-      continue;
-    }
-
-    if (!response.ok) {
-      lastError = new Error(`LLM API returned ${response.status}`);
-      if (response.status < 500) {
-        break; // Our own request is wrong; sending it again will not help.
-      }
-      continue;
-    }
-
-    const body = (await response.json()) as {
+  return llmReliability.run(async ({ signal, requestId }) => {
+    const response = await fetch(llmApiUrl, {
+      method: "POST",
+      headers: llmHeaders(requestId),
+      body: requestBody,
+      signal,
+    });
+    if (!response.ok) throw llmHttpError(response.status);
+    const body = await response.json() as {
       choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
     };
     const choice = body.choices?.[0];
@@ -1054,17 +1254,13 @@ async function generateRawReply(
     if (text && text.trim().length > 0) {
       return stripReasoning(text).trim();
     }
-
-    lastError = new Error(
+    throw new LlmRequestError(
       choice?.finish_reason === "length"
         ? "LLM spent the whole token budget on reasoning and returned no text"
         : "LLM API returned no text",
+      { code: "empty_response", retryable: true },
     );
-    console.warn("LLM returned no text, retrying", lastError);
-    retryImmediately = true;
-  }
-
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }, { priority: event === "musing" ? "background" : "interactive" });
 }
 
 /** Some local models echo their reasoning in <think>…</think>; never show it. */
@@ -1305,29 +1501,42 @@ async function catchUpMessages(): Promise<void> {
 }
 
 async function replayInboxForever(): Promise<void> {
+  const replayingMessageIds = new Set<string>();
   for (;;) {
     if (!lifecycle.draining) {
-      for (const item of inbox.items()) {
-        if (lifecycle.draining) break;
+      const ready = inbox.items().filter(item => !replayingMessageIds.has(item.messageId)).slice(0, 20);
+      await Promise.allSettled(ready.map(async item => {
+        replayingMessageIds.add(item.messageId);
         try {
           await lifecycle.run(async () => {
             const channel = await client.channels.fetch(item.channelId) as TextChannel | null;
             if (!channel?.messages) throw new Error("inbox channel unavailable");
             const message = await channel.messages.fetch(item.messageId);
-            await onMessage(message);
-            inbox.remove(item.messageId);
+            const outcome = await onMessageImpl(message, item);
+            if (outcome?.status === "deferred") {
+              inbox.defer(item.messageId, {
+                delayMs: mentionRetryDelayMs,
+                ...(outcome.noticeMessageId ? { noticeMessageId: outcome.noticeMessageId } : {}),
+                ...(outcome.error ? { error: outcome.error } : {}),
+                ...(outcome.countAttempt === undefined ? {} : { countAttempt: outcome.countAttempt }),
+              });
+            } else if (outcome?.status === "failed") {
+              inbox.fail(item.messageId, outcome.error);
+            } else {
+              inbox.remove(item.messageId);
+            }
           });
         } catch (error) {
           if ((error as { code?: number }).code === 10008) inbox.remove(item.messageId);
           else console.error("inbox replay failed", error);
+        } finally {
+          replayingMessageIds.delete(item.messageId);
         }
-      }
+      }));
     }
     await sleep(5000);
   }
 }
-
-const onMessage = (...args: Parameters<typeof onMessageImpl>): ReturnType<typeof onMessageImpl> => lifecycle.run(() => onMessageImpl(...args));
 
 const postMusing = (...args: Parameters<typeof postMusingImpl>): ReturnType<typeof postMusingImpl> => lifecycle.run(() => postMusingImpl(...args));
 

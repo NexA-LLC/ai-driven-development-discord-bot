@@ -28,11 +28,38 @@ describe('gateway restart safety', () => {
       const first = new Inbox(path);
       first.add('channel', 'message');
       const recovered = new Inbox(path);
-      expect(recovered.items()).toEqual([{ channelId: 'channel', messageId: 'message' }]);
+      expect(recovered.items()).toEqual([{
+        channelId: 'channel', messageId: 'message', attempts: 0, nextAttemptAt: 0,
+      }]);
       recovered.remove('message');
       const restarted = new Inbox(path);
       restarted.add('channel', 'message');
       expect(restarted.size).toBe(0);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('persists deferred delivery state and dead letters without marking the message completed', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'su-inbox-deferred-'));
+    try {
+      const path = join(directory, 'inbox.json');
+      const first = new Inbox(path);
+      first.add('channel', 'message');
+      first.recordToolReceipt('message', 'post:abc', { posted: true, messageId: 'sent' });
+      first.defer('message', { delayMs: 60_000, noticeMessageId: 'notice', error: 'timeout' });
+      expect(first.size).toBe(1);
+      expect(first.items()).toEqual([]);
+
+      const recovered = new Inbox(path);
+      expect(recovered.items(Number.MAX_SAFE_INTEGER)[0]).toMatchObject({
+        messageId: 'message', attempts: 1, noticeMessageId: 'notice', lastError: 'timeout',
+      });
+      expect(recovered.toolReceipt('message', 'post:abc')).toEqual({
+        found: true, value: { posted: true, messageId: 'sent' },
+      });
+      recovered.fail('message', 'still unavailable');
+      expect(recovered.size).toBe(0);
+      expect(recovered.deadLetterSize).toBe(1);
+      expect(recovered.requeueDeadLetters()).toBe(1);
+      expect(recovered.items()).toHaveLength(1);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });

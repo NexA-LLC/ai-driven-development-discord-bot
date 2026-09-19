@@ -1009,11 +1009,18 @@ interface IncidentInput {
 const INCIDENT_DEDUPE_WINDOW_MS = 60 * 60 * 1_000;
 const INCIDENT_ISSUE_THRESHOLD = 3;
 const INCIDENT_RENOTIFY_COUNTS = new Set([1, 3, 10, 50]);
+const IMMEDIATE_INCIDENT_ISSUE_KINDS = new Set(["mention_llm_failed", "llm_model_unavailable"]);
+
+export function shouldOpenIncidentIssue(input: Pick<IncidentInput, "kind" | "severity">, count: number): boolean {
+  return count >= INCIDENT_ISSUE_THRESHOLD ||
+    (count === 1 && IMMEDIATE_INCIDENT_ISSUE_KINDS.has(input.kind) && ["error", "critical"].includes(input.severity));
+}
 
 /**
  * Record an incident, folding repeats of the same dedupeKey within the window
  * into one row. Notifies the operator channel on the 1st/3rd/10th/50th
- * occurrence and opens a GitHub issue (for Repo Deck) at the 3rd.
+ * occurrence. User-visible LLM failures open a GitHub issue on the first
+ * occurrence; lower-signal incidents keep the 3-occurrence threshold.
  */
 async function recordIncident(
   env: Env,
@@ -1061,7 +1068,7 @@ async function recordIncident(
       .run();
   }
 
-  if (!issueUrl && count >= INCIDENT_ISSUE_THRESHOLD && env.GITHUB_TOKEN) {
+  if (!issueUrl && shouldOpenIncidentIssue(input, count) && env.GITHUB_TOKEN) {
     issueUrl = await openIncidentIssue(env, {
       ...input,
       id,
@@ -1136,7 +1143,7 @@ async function openIncidentIssue(
   const repo = env.GITHUB_REPO || "NexA-LLC/ai-driven-development-discord-bot";
   const title = `[incident] ${incident.summary}`.slice(0, 200);
   const body = [
-    `スー（Discord Bot）が同じ障害を ${incident.count} 回検知しました。Repo Deck / 運営で調査・修正をお願いします。`,
+    `スー（Discord Bot）が障害を ${incident.count} 回検知しました。Repo Deck / 運営で調査・修正をお願いします。`,
     "",
     `- kind: \`${incident.kind}\``,
     `- severity: \`${incident.severity}\``,
@@ -1151,8 +1158,9 @@ async function openIncidentIssue(
     "",
     "## 期待する作業",
     "1. 原因の切り分け（Gateway / LLM ホスト / Discord / Worker）",
-    "2. 再発防止の実装（再試行、フォールバック、監視、設定）",
-    "3. 直したら `incidents` の該当行を resolved にする（`/internal/incidents/ack` は relay 用、resolve は手動）",
+    "2. 再現テストを追加し、待ち行列・過負荷・モデル設定の再発防止を実装する",
+    "3. merge / deploy 後に LLM の実応答と Discord の実返信を確認する",
+    "4. 証跡を Issue に残し、`incidents` の該当行を resolved にする（`/internal/incidents/ack` は relay 用、resolve は手動）",
     "",
     "_opened automatically by the Worker incident loop_",
   ].join("\n");

@@ -63,5 +63,14 @@ is restricted to localhost and a fixed supervisor command; shell and forwarding
 are disabled, and authentication is preflighted before stopping the old process. The supervisor
 is a service-specific updater; NexA Host fleet inventory integration is separate.
 Use loopback `/readiness` on the configured `READINESS_PORT` (202: 8791) to inspect `activeWork`, `draining`,
-`startupReady`, `queuedMessages`, `release` and `pid`. Send SIGUSR2 to that PID for
+`startupReady`, `queuedMessages`, `deadLetterMessages`, `llm`, `release` and `pid`. `llm` exposes the
+single-flight queue, circuit state, last success/failure and configured-model preflight result without prompt content.
+`decision=degraded` means the process is alive but the provider is not ready for normal replies. Send SIGUSR2 to that PID for
 a graceful same-release restart. Never use `kill -9` for planned updates.
+
+Direct mentions remain in the 0600 inbox until they are answered. They enter the interactive LLM queue ahead of
+musings and experience analysis. After 15 seconds, the Gateway posts one waiting message and edits that message into
+the final answer. An ambiguous timeout/reset is not immediately retried because the model may already have accepted
+the prompt; the circuit cools down before the durable Discord item is resumed. User-visible LLM failures create an
+incident improvement issue on their first occurrence. Requests carry `x-nexa-client` and `x-nexa-request-id` so the
+Gateway and model-host logs can be correlated without logging prompt content.

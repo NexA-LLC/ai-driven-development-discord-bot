@@ -16,7 +16,7 @@ const sharedSecret = process.env.INTERNAL_SHARED_SECRET?.trim() || "";
 const llmApiUrl = process.env.LLM_API_URL?.trim() || "";
 const llmModel = process.env.LLM_MODEL?.trim() || "";
 const llmApiKey = process.env.LLM_API_KEY?.trim() || "";
-const llmTimeoutMs = readPositiveInteger("LLM_TIMEOUT_SECONDS", 120) * 1_000;
+const llmTimeoutMs = readPositiveInteger("LLM_ATTEMPT_TIMEOUT_SECONDS", 45) * 1_000;
 const quizChannelId =
   process.env.QUIZ_CHANNEL_ID?.trim() || process.env.MUSINGS_CHANNEL_ID?.trim() || "";
 const quizHourJst = readHour("QUIZ_HOUR_JST", 20);
