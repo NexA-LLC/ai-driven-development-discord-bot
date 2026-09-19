@@ -82,6 +82,12 @@ the prompt; the circuit cools down before the durable Discord item is resumed. U
 incident improvement issue on their first occurrence. Requests carry `x-nexa-client` and `x-nexa-request-id` so the
 Gateway and model-host logs can be correlated without logging prompt content.
 
+On `10.1.0.204`, launchd label `net.nex-a.ds4-health` runs `scripts/monitor-llm-health.py` every five minutes and appends
+content-free evidence to `~/Library/Logs/ds4-health.jsonl`. Each row records configured-model presence, model count,
+generation HTTP status, final-content/reasoning lengths, finish reason, latency and a bounded error class/status. It never
+records either prompt or generated text. This monitor complements the Gateway incident path; it does not replace durable
+stdout/stderr capture when the model server itself is next restarted under a proper supervisor.
+
 When a previously open incident is resolved, the Worker posts one recovery notice to the operator channel with the
 incident kind, source, occurrence count and elapsed time. A repeated resolve of an already-resolved incident is silent.
 Gateway success paths explicitly resolve recoverable LLM wait/failure, model availability, Discord reconnect, nightly
