@@ -3,6 +3,7 @@ import { buildQuizPrompt, parseQuiz, renderQuiz, type QuizDraft } from "../share
 import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { createHmac } from "node:crypto";
+import { searchWeb } from "./web-search.js";
 
 interface NewsItem {
   title: string;
@@ -28,7 +29,7 @@ const communityPrompts = (process.env.QUIZ_COMMUNITY_PROMPTS ?? "")
   .filter(Boolean);
 const newsQuery =
   process.env.QUIZ_NEWS_QUERY?.trim() ||
-  "AI OR OpenAI OR Anthropic OR Claude OR Gemini OR LLM when:1d";
+  "AI OR OpenAI OR Anthropic OR Claude OR Gemini OR LLM";
 
 let lastQuizDate = readSlot("quiz-date");
 
@@ -129,51 +130,12 @@ async function buildQuiz(today: string): Promise<QuizDraft> {
 }
 
 async function fetchAiNews(): Promise<NewsItem[]> {
-  const params = new URLSearchParams({
-    q: newsQuery,
-    hl: "ja",
-    gl: "JP",
-    ceid: "JP:ja",
-  });
-  const response = await fetch(`https://news.google.com/rss/search?${params.toString()}`, {
-    headers: { "user-agent": "ai-driven-development-discord-bot/0.1" },
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) {
-    throw new Error(`Google News RSS returned ${response.status}`);
-  }
-  const xml = await response.text();
-  const items: NewsItem[] = [];
-  for (const match of xml.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
-    const block = match[1] ?? "";
-    const title = extractXmlTag(block, "title");
-    const link = extractXmlTag(block, "link");
-    const publishedAt = extractXmlTag(block, "pubDate");
-    if (title && link) {
-      items.push({ title: decodeXml(title), link: decodeXml(link), publishedAt });
-    }
-    if (items.length >= 15) {
-      break;
-    }
-  }
-  if (items.length === 0) {
-    throw new Error("Google News RSS returned no parseable items");
-  }
-  return items;
-}
-
-function extractXmlTag(block: string, tag: string): string {
-  const match = block.match(new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/${tag}>`));
-  return match?.[1]?.trim() ?? "";
-}
-
-function decodeXml(value: string): string {
-  return value
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+  const result = await searchWeb(newsQuery, { freshnessDays: 1, limit: 15 });
+  return result.results.map(item => ({
+    title: item.title,
+    link: item.url,
+    ...(item.publishedAt ? { publishedAt: item.publishedAt } : {}),
+  }));
 }
 
 async function callLlm(prompt: string): Promise<string> {

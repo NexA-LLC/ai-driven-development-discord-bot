@@ -22,6 +22,40 @@ it("does not force a history read merely because a channel is mentioned", async 
   expect(execute).not.toHaveBeenCalled();
   expect(complete.mock.calls[0]?.[0][1]).toEqual({ role: "user", content: question });
 });
+it("lets the model search current news and requires a cited answer turn", async () => {
+  const complete = vi.fn()
+    .mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "web1", type: "function", function: { name: "search_web", arguments: '{"query":"AI最新ニュース","freshness_days":1}' } }] })
+    .mockImplementationOnce(async (messages: AgentMessage[]) => {
+      expect(messages.at(-1)).toMatchObject({ role: "tool", tool_call_id: "web1" });
+      expect(messages.at(-1)?.content).toContain("https://news.google.com/");
+      return { role: "assistant", content: "今日確認できた見出しです。出典: https://news.google.com/rss/articles/example" };
+    });
+  const execute = vi.fn().mockResolvedValue({ searchedAt: "2026-09-19T13:00:00Z", results: [{ title: "AIニュース", url: "https://news.google.com/rss/articles/example" }] });
+  const answer = await runMentionAgent("今日のAIニュースを調べて", "persona", complete, execute);
+  expect(execute).toHaveBeenCalledWith("search_web", { query: "AI最新ニュース", freshness_days: 1 });
+  expect(answer).toContain("https://news.google.com/");
+});
+it("executes web search at most once per message", async () => {
+  const call = { role: "assistant", content: null, tool_calls: [
+    { id: "web1", type: "function", function: { name: "search_web", arguments: '{"query":"AIニュース"}' } },
+    { id: "web2", type: "function", function: { name: "search_web", arguments: '{"query":"生成AIニュース"}' } },
+  ] } as AgentMessage;
+  const complete = vi.fn().mockResolvedValueOnce(call).mockResolvedValueOnce({ role: "assistant", content: "最初の検索結果だけを使いました。" });
+  const execute = vi.fn().mockResolvedValue({ results: [] });
+  await runMentionAgent("AIニュースを調べて", "persona", complete, execute);
+  expect(execute).toHaveBeenCalledOnce();
+  expect(execute).toHaveBeenCalledWith("search_web", { query: "AIニュース" });
+  expect(complete.mock.calls[1]?.[0].at(-1)?.content).toContain("1依頼につき1回");
+});
+it("appends a validated source URL when the model omits citations after search", async () => {
+  const complete = vi.fn()
+    .mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "web", type: "function", function: { name: "search_web", arguments: '{"query":"AIニュース"}' } }] })
+    .mockResolvedValueOnce({ role: "assistant", content: "確認できた最新ニュースです。" });
+  const execute = vi.fn().mockResolvedValue({ results: [{ title: "AIニュース", url: "https://news.google.com/rss/articles/source" }] });
+  const answer = await runMentionAgent("最新ニュースは？", "persona", complete, execute);
+  expect(answer).toContain("出典:");
+  expect(answer).toContain("https://news.google.com/rss/articles/source");
+});
 it("returns unsupported tool errors to the model without executing them", async () => {
   const complete = vi.fn().mockResolvedValueOnce({ role: "assistant", content: null, tool_calls: [{ id: "x", type: "function", function: { name: "delete_channel", arguments: "{}" } }] }).mockResolvedValueOnce({ role: "assistant", content: "投稿はしていません。" });
   const execute = vi.fn();

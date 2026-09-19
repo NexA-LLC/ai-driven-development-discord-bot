@@ -19,6 +19,7 @@ import { auditConversation } from "./conversation-audit.js";
 import { inbox, type InboxItem } from "./inbox.js";
 import { LlmReliability, LlmRequestError, llmHttpError } from "./llm-reliability.js";
 import { completionText, type LlmCompletionBody } from "./llm-completion.js";
+import { searchWeb } from "./web-search.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
@@ -146,6 +147,9 @@ let lastGardenSyncFailureAt: string | null = null;
 let lastGardenSyncFailureStatus: string | null = null;
 let lastGardenReadFailureAt: string | null = null;
 let lastGardenReadFailureStatus: string | null = null;
+let lastWebSearchAt: string | null = null;
+let lastWebSearchFailureAt: string | null = null;
+let lastWebSearchFailureStatus: string | null = null;
 let sweepCursor = 0;
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
@@ -491,6 +495,29 @@ export async function onMessageImpl(message: Message, recovery?: InboxItem): Pro
           });
         },
         async (name, args) => {
+          if (name === "search_web") {
+            const search = (args ?? {}) as { query?: unknown; freshness_days?: unknown };
+            if (typeof search.query !== "string") throw new Error("検索語が必要です");
+            const freshnessDays = typeof search.freshness_days === "number" ? search.freshness_days : 7;
+            try {
+              const result = await searchWeb(search.query, { freshnessDays, limit: 5 });
+              lastWebSearchAt = new Date().toISOString();
+              lastWebSearchFailureAt = null;
+              lastWebSearchFailureStatus = null;
+              await resolveIncidentImpl("web_search_failed").catch(error => console.warn("web search recovery report failed", error));
+              return result;
+            } catch (error) {
+              lastWebSearchFailureAt = new Date().toISOString();
+              lastWebSearchFailureStatus = error instanceof Error ? error.name : "unknown";
+              await reportIncidentImpl(
+                "web_search_failed",
+                "warning",
+                "スーの公開ニュース検索に失敗",
+                JSON.stringify({ provider: "Google News RSS", error: lastWebSearchFailureStatus }),
+              ).catch(reportError => console.warn("web search incident report failed", reportError));
+              throw error;
+            }
+          }
           if (name === "join_voice_channel") return voiceChat.join(message);
           if (name === "leave_voice_channel") return voiceChat.leave(message);
           if (name === "speak_reply") {
@@ -898,6 +925,13 @@ function startReadinessServer(): void {
       message: modelPreflightError ?? `${lifecycle.active} operations in progress`,
       activeWork: lifecycle.active,
       llm: { ...provider, model: llmModel || null, preflightError: modelPreflightError, slowMentions: slowMentionIds.size },
+      webSearch: {
+        provider: "Google News RSS",
+        scope: "news",
+        lastSuccessAt: lastWebSearchAt,
+        lastFailureAt: lastWebSearchFailureAt,
+        lastFailureStatus: lastWebSearchFailureStatus,
+      },
       knowledge: {
         ...experiences.snapshot(Date.now(), knowledgeChannel),
         configuredChannels: experienceKnowledgeChannels.size,
