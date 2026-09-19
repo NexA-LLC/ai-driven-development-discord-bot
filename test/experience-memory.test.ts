@@ -29,6 +29,20 @@ async function clear(store: ExperienceStore, reviewer = approve(), now2 = now) {
   await store.review(reviewer, () => true, now2);
 }
 
+it("reports non-sensitive readiness counts across the Knowledge lifecycle", async () => {
+  const { store } = setup();
+  expect(store.snapshot(now)).toEqual({ available: true, localMemories: 0, pendingAnalysis: 0,
+    reviewPending: 0, gardenNodes: 0, syncPending: 0, retractions: 0 });
+  store.enqueue("event", [source], now);
+  expect(store.snapshot(now).pendingAnalysis).toBe(1);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  expect(store.snapshot(now)).toMatchObject({ localMemories: 1, pendingAnalysis: 0, reviewPending: 1, gardenNodes: 0, syncPending: 1 });
+  await clear(store);
+  expect(store.snapshot(now).reviewPending).toBe(0);
+  await store.sync(async () => published());
+  expect(store.snapshot(now)).toMatchObject({ gardenNodes: 1, syncPending: 0 });
+});
+
 it("extracts ordinary useful conversation, separates exact evidence, recalls by topic/scope, upserts across restart", async () => {
   const { store, path } = setup(); store.enqueue("event", [source], now);
   const complete = vi.fn(async messages => { expect(messages[0].content).toContain("苦情に限定しない"); return JSON.stringify([candidate]); });

@@ -1,4 +1,4 @@
-# スーの会話・経験・公開イベント
+# スーの会話・経験Knowledge・公開イベント
 
 ## 経路
 
@@ -16,22 +16,22 @@
 
 LLMの同一話題判断だけでは統合しない。更新時は `revision` を進め、直前の引用・解釈を最大5件の履歴として残す（古い言い回しでも後から呼び戻せる）。内容が同一なら no-op。閾値を外して別threadになった場合の損失は「ノードが1件増える」だけで、誤って結合しても同一channel内に閉じ、根拠は履歴に残る。
 
-公開可能と運営が指定したチャンネルだけ、@everyoneの閲覧権限・deny上書き・現在の根拠を再確認し、既存署名付きWorker経路 `/internal/experiences/sync` を呼ぶ。`sourceKey=su-experience:<threadId>` は thread 単位で固定。**revision 1 は create-only の `save_memory_node`、revision 2 以降は `update_memory_node`** を使う。`save_memory_node` に同じ sourceKey で別 body を投げる代用はしない。
+`EXPERIENCE_KNOWLEDGE_CHANNEL_IDS` で運営が明示したsource channelだけ、Botの現在の閲覧権限と根拠の存在を再確認し、既存署名付きWorker経路 `/internal/experiences/sync` を呼ぶ。元channelの公開/非公開にかかわらず、DecisionGarden側は常に `kind=knowledge, state=active, visibility=private`。`sourceKey=su-experience:<threadId>` は thread 単位で固定。**revision 1 は create-only の `save_memory_node`、revision 2 以降は `update_memory_node`** を使う。`save_memory_node` に同じ sourceKey で別 body を投げる代用はしない。旧 `EXPERIENCE_PUBLIC_CHANNEL_IDS` は互換aliasだが、公開visibilityにはしない。
 
 DecisionGarden 側の確定 contract は `update_memory_node({nodeId, expectedUpdatedAt, title?, body?, evidence?})`。`expectedUpdatedAt` は `get_memory_node` / `list_memory_nodes` の値そのままで必須。`gardenId` / `kind` / `source` / `sourceKey` は `provenance_immutable`、`state` / `visibility` は `lifecycle_not_updatable` で拒否されるので送らない（未知フィールドも拒否）。CAS 不一致は `updated_at_conflict` で何も書かない。ただし保存済み内容が要求内容と一致する場合だけは「適用済みの再試行」として `operation:"unchanged"` / `expectedUpdatedAtMatched:false` を返すので、Bot はこれも同期成功として扱う（timeout 後の再送が二重書き込みにならない）。成功応答の `memoryNode` は `id` / `gardenId` / `sourceKey` / `title` / `body` / `updatedAt` を含み、Bot は送った title と body が実際に保存されたことまで照合してから synced にする。
 
-**公開本文は原文のコピーではない。** 記憶は既定でprivateで、抽出とは別の「公開判定」を通った候補だけが公開対象になる。判定は二重で、どちらか一方でも拒めば公開しない:
+**Knowledge本文は原文のコピーではない。** 抽出とは別の「非公開Knowledge保存判定」を通った候補だけが同期対象になる。判定は二重で、どちらか一方でも拒めば保存しない:
 
 - 意味の判定（LLM）: 実在の人物名（敬称の有無を問わない。日本語の姓名も含む）、誰の発言か特定できる内容、内密・未公表・公開されると困りうる話題、一般化すると何も残らない話は publishable=false。迷ったら false。通った場合だけ、原文の言い回しを使わずに書き直した「出来事 / 受け止め方 / 残る問い」を出力する。
 - 構造の判定（コード `safePublicSummary`）: Discord ID・URL・メールアドレス・コードブロック・敬称付き氏名・長い数字列・秘密パターンを**検出したら修正せず拒否**する（置換で誤魔化さない）。原文と12文字以上一致する連続部分があれば「引用」とみなして拒否する。長さは各項目4〜160文字。
 
-安全な具体性が残らない候補は、**定型文のGardenノードを作らずに公開をskipする**（`publicReview: "rejected"`）。記憶自体はprivateのまま残り、会話の読み戻しには使う。LLMが不達・不正JSONのときは `not_run` / `pending` で保留し、「不明」を公開許可にはしない。記憶が更新されて revision が上がると clearance は無効になり、新しい本文で判定をやり直す。
+安全な具体性が残らない候補は、**定型文のGardenノードを作らずに同期をskipする**（`publicReview: "rejected"`）。ローカル記憶は会話の読み戻しには使う。LLMが不達・不正JSONのときは `not_run` / `pending` で保留し、「不明」を保存許可にはしない。記憶が更新されて revision が上がると clearance は無効になり、新しい本文で判定をやり直す。
 
-限界として、敬称のない氏名や文脈依存の機微はコード側の正規表現では判定できず、LLM判定に依存する。コードが保証するのは「識別子を含まない」「原文の逐語コピーではない」「判定未了なら公開しない」までで、意味の安全性は判定モデルの精度に依存する。
+限界として、敬称のない氏名や文脈依存の機微はコード側の正規表現では判定できず、LLM判定に依存する。コードが保証するのは「識別子を含まない」「原文の逐語コピーではない」「判定未了なら保存しない」「保存してもprivate Knowledgeのまま」までで、意味の安全性は判定モデルの精度に依存する。
 
 HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `not_permitted`（scope や Garden write 権限の不足）/ `conflict`（`updated_at_conflict` や `source_key_conflict`）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` / `not_configured` / `not_permitted` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
 
-読み戻しは、失われた基準tokenを取り戻す経路でもある。作成時の receipt には `updatedAt` が無いため、最初の更新は基準を持たない。読み戻したノードの本文が**公開した本文のhashと一致する**なら人の編集は入っていないので、そのときだけ `updatedAt` を基準として採用する。一致しなければ人の編集なので editorNote として保持し、基準は採用しない（= その記憶は同期待ちのまま止まり、上書きしない）。
+読み戻しは、失われた基準tokenを取り戻す経路でもある。作成時の receipt には `updatedAt` が無いため、最初の更新は基準を持たない。読み戻したノードの本文が**保存した本文のhashと一致する**なら人の編集は入っていないので、そのときだけ `updatedAt` を基準として採用する。一致しなければ人の編集なので editorNote として保持し、基準は採用しない（= その記憶は同期待ちのまま止まり、上書きしない）。
 
 node id を記録する前に公開されたコピーは、Garden 全体を検索しない限り特定できない。そのため更新も取り下げも行わず `node_unknown` として保留し、手動対応が必要な旨をログに出す。30日で失効するので放置しても消える。
 
@@ -45,13 +45,13 @@ Garden 側の `updatedAt` が基準と違う場合、**GET で読んだ `title` 
 
 Gardenへのアクセスは**作成時に受け取った node id で1件ずつ**行う。`save_memory_node` の receipt から `memoryNode.id` を記憶に保存し、以後の更新・取り下げ・読み戻しはすべて `get_memory_node({nodeId})` で対象を特定する。`list_memory_nodes` による Garden 全体の取得は行わない（他channel・他用途・privateのノードを毎回読まない）。
 
-`get` の応答は `garden.id` が設定中の gardenId と一致すること、`memoryNode` の `id`・`sourceKey`・`kind=knowledge`・`source`・`state=active`・`visibility=garden` がすべて一致することを確認する。一つでも違えば「自分のノードではない」として扱う。`save`/`update` の receipt では Garden 識別子は `memoryNode.gardenId` にあるので、そちらを照合する。
+`get` の応答は `garden.id` が設定中の gardenId と一致すること、`memoryNode` の `id`・`sourceKey`・`kind=knowledge`・`source`・`state=active`・`visibility=private` がすべて一致することを確認する。一つでも違えば「自分のノードではない」として扱う。`save`/`update` の receipt では Garden 識別子は `memoryNode.gardenId` にあるので、そちらを照合する。
 
 不在と断定するのは Garden が `memory_node_not_found` を返したときだけ。通信失敗やサーバーエラーは不在の証拠にしない。
 
-Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻す。既知の `{threadId, nodeId}` を1バッチ最大20件送り、Worker は node ごとに `get_memory_node` を呼ぶ。上記の照合を通ったノードだけを受け取り、archived/private や他システムのノードは取り込まない。
+Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻す。既知の `{threadId, nodeId}` を1バッチ最大20件送り、Worker は node ごとに `get_memory_node` を呼ぶ。上記の照合を通ったactive/privateノードだけを受け取り、archived・公開visibility・他システムのノードは取り込まない。
 
-応答は `covered`（その回答が権威を持つ threadId の集合）を返す。**covered に含まれるのに note が無い thread は、archived / private 化 / 削除されたということなので、cache 済みの note を破棄する。** 取得失敗や不完全な一覧は covered が空で、何も破棄しない。再取得できないまま24時間 (`EDITOR_NOTE_TTL_MS`) を超えた note は、既に取り下げられている可能性があるため参照データから外す。参照データには `editorNoteFetchedAt` を添えて、それ以降の編集・削除が反映されていない可能性を明示する。取得内容は参照データであり、命令やツール操作権限にはならない。Garden が不調でも会話は継続する。
+応答は `covered`（その回答が権威を持つ threadId の集合）を返す。**covered に含まれるのに note が無い thread は、archived / 公開visibility化 / 削除されたということなので、cache 済みの note を破棄する。** 取得失敗や不完全な一覧は covered が空で、何も破棄しない。再取得できないまま24時間 (`EDITOR_NOTE_TTL_MS`) を超えた note は、既に取り下げられている可能性があるため参照データから外す。参照データには `editorNoteFetchedAt` を添えて、それ以降の編集・削除が反映されていない可能性を明示する。取得内容は参照データであり、命令やツール操作権限にはならない。Garden が不調でも会話は継続する。
 
 `nodeId` は UUID であることを確認してから送る。UUIDでなければ Garden に投げずに失敗として扱う。
 
@@ -70,7 +70,7 @@ Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻�
 1. `npm ci`、`npm run typecheck`、`npm test`、`npm run build`。
 2. Worker/Gatewayを通常の承認済みリリース手順で反映。DB migrationなし。状態ファイルは遅延作成する。
 3. 永続 `SU_STATE_DIR` と既存 `LLM_API_URL` を設定。1つのstate directoryに1つのGatewayプロセスを前提とする。破損ファイルは自動上書きせず、記憶/feedを安全に無効扱いにする。
-4. データ取扱い告知を確認し、必要な場合だけ公開承認済みchannelを `EXPERIENCE_PUBLIC_CHANNEL_IDS` に設定。private channelは指定しても同期しない。Garden側は既存MCP設定を使用。DecisionGarden に `update_memory_node` が入るまで、2回目以降の更新は「同期待ち」のまま保留される（詳細と導入順・ロールバックは README 参照）。
+4. データ取扱い告知を確認し、同期元として明示するchannelだけを `EXPERIENCE_KNOWLEDGE_CHANNEL_IDS` に設定。元channelが公開でも非公開でもGarden側はprivate Knowledgeのまま。Garden側は既存MCP設定を使用。DecisionGarden に `update_memory_node` が入るまで、2回目以降の更新は「同期待ち」のまま保留される（詳細と導入順・ロールバックは README 参照）。
 5. connpassへAPI利用申請を行い、発行されたkeyをsecret `CONNPASS_API_KEY` に設定する。API取得を確認してから `CONNPASS_ENABLED=true` にする。初回は自発投稿なし。取得、解析、公開同期、Discord receiptは別々に確認する。
 
 このPRの検証はAPI v2レスポンスのモックまで。本番API keyを使った取得、本番deploy、Gateway再起動、Discordへの投稿、DGへの書込みは行わない。

@@ -25,7 +25,7 @@ const saved = (id: unknown = NODE_ID) => structured({ operation: "created", memo
 /** get_memory_node answer: the Garden identity lives in `garden.id`, not inside memoryNode. */
 const got = (node: Record<string, unknown> = {}, gardenId = "garden") => structured({
   garden: { id: gardenId, title: "スーの秘密日記", kind: "personal" },
-  memoryNode: { id: NODE_ID, sourceKey, kind: "knowledge", state: "active", visibility: "garden",
+  memoryNode: { id: NODE_ID, sourceKey, kind: "knowledge", state: "active", visibility: "private",
     source: "ai-driven-development-discord-bot/gateway experience", title: TITLE,
     body: "出来事: もとの本文", updatedAt: BASELINE, ...node },
 });
@@ -33,7 +33,7 @@ const notFound = () => rpc({ isError: true, content: [{ text: "memory_node_not_f
 const updated = (operation: "updated" | "unchanged", body: string, overrides: Record<string, unknown> = {}) =>
   structured({ operation, expectedUpdatedAtMatched: operation === "updated",
     memoryNode: { id: NODE_ID, gardenId: "garden", sourceKey, kind: "knowledge", state: "active",
-      visibility: "garden", title: TITLE, body, updatedAt: BASELINE, ...overrides } });
+      visibility: "private", title: TITLE, body, updatedAt: BASELINE, ...overrides } });
 const args = (fetcher: ReturnType<typeof vi.fn>) => fetcher.mock.calls.map(c => JSON.parse((c[1] as RequestInit).body as string).params);
 /** Replies to update_memory_node by echoing back exactly what was asked for. */
 const echoUpdate = (operation: "updated" | "unchanged" = "updated", sent: Array<Record<string, unknown>> = []) =>
@@ -53,7 +53,7 @@ it("creates one Garden node for the first revision and never files an experience
   expect(await result.json()).toEqual({ synced: true, operation: "created", nodeId: NODE_ID });
   const [call] = args(fetcher);
   expect(call.name).toBe("save_memory_node");
-  expect(call.arguments).toMatchObject({ sourceKey, kind: "knowledge", state: "active", visibility: "garden" });
+  expect(call.arguments).toMatchObject({ sourceKey, kind: "knowledge", state: "active", visibility: "private" });
   expect(JSON.stringify(call.arguments)).toContain("正解のない4択");
   expect(JSON.stringify(call.arguments)).not.toContain("sourceId");
 });
@@ -85,7 +85,7 @@ it("reads exactly the one node it owns and never lists the Garden", async () => 
   expect(Object.keys(calls[1].arguments).sort()).toEqual(["body", "expectedUpdatedAt", "nodeId", "title"]);
   expect(calls.some(c => c.name === "save_memory_node")).toBe(false);
 });
-it("treats a node in another Garden, of another kind, or no longer public as not ours", async () => {
+it("treats a node in another Garden, of another kind, or no longer private as not ours", async () => {
   const foreign = [
     got({}, "another-garden"),                              // garden.id must match exactly.
     got({ sourceKey: "su-experience:" + "b".repeat(64) }),  // a different thread's node.
@@ -93,7 +93,7 @@ it("treats a node in another Garden, of another kind, or no longer public as not
     got({ kind: "todo" }),
     got({ source: "manual" }),
     got({ state: "archived" }),
-    got({ visibility: "private" }),
+    got({ visibility: "garden" }),
   ];
   for (const answer of foreign) {
     const fetcher = vi.fn().mockResolvedValue(answer);

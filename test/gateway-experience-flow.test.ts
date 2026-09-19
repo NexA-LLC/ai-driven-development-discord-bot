@@ -28,7 +28,7 @@ function message(id: string, content: string, author = "human", reference?: stri
 const dir = mkdtempSync(join(tmpdir(), "su-gateway-flow-"));
 beforeAll(async () => {
   vi.useFakeTimers(); vi.setSystemTime(now);
-  for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test", INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel", LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "true", CONNPASS_API_KEY: "connpass-fixture", MUSE_ON_START: "false", EXPERIENCE_PUBLIC_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
+  for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test", INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel", LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "true", CONNPASS_API_KEY: "connpass-fixture", MUSE_ON_START: "false", EXPERIENCE_KNOWLEDGE_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
   mocks.client.channels.fetch.mockResolvedValue(channel);
   vi.stubGlobal("fetch", vi.fn(async (url: string | URL, options: RequestInit) => {
     if (String(url).includes("connpass.com/api/v2/events")) {

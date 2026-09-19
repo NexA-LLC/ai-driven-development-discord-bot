@@ -45,7 +45,7 @@ beforeAll(async () => {
   vi.useFakeTimers(); vi.setSystemTime(day1);
   for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test",
     INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel",
-    LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "false", MUSE_ON_START: "false", EXPERIENCE_PUBLIC_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
+    LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "false", MUSE_ON_START: "false", EXPERIENCE_KNOWLEDGE_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
   mocks.client.channels.fetch.mockResolvedValue(channel);
   vi.stubGlobal("fetch", vi.fn(async (url: string | URL, options: RequestInit) => {
     if (String(url).includes("worker.test")) {
@@ -58,7 +58,7 @@ beforeAll(async () => {
     const request = JSON.parse(options.body as string); mocks.llm.push(request);
     const system = request.messages[0].content as string;
     const content = system.includes("スー宛の実際の会話") ? mocks.extraction
-      : system.includes("公開Gardenに出してよいか判定") ? mocks.review : "わかりました。";
+      : system.includes("非公開Knowledgeとして保存してよいか判定") ? mocks.review : "わかりました。";
     return Response.json({ choices: [{ message: { role: "assistant", content } }] });
   }));
   gateway = await import("../src/gateway/index.js");

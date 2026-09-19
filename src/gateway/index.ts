@@ -139,6 +139,12 @@ const experiencePullMs = readPositiveInteger("EXPERIENCE_PULL_SECONDS", 3600) * 
 // Nodes read back per pull. The Worker caps this server-side too; the whole Garden is never read.
 const experiencePullBatch = 20;
 let lastExperiencePullAt = 0;
+let lastGardenSyncAt: string | null = null;
+let lastGardenReadAt: string | null = null;
+let lastGardenSyncFailureAt: string | null = null;
+let lastGardenSyncFailureStatus: string | null = null;
+let lastGardenReadFailureAt: string | null = null;
+let lastGardenReadFailureStatus: string | null = null;
 let sweepCursor = 0;
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
@@ -190,7 +196,11 @@ const connpass = new ConnpassFeed(undefined, readPositiveInteger("CONNPASS_POLL_
   process.env.CONNPASS_API_KEY?.trim() ?? "");
 const connpassEnabled = readBoolean("CONNPASS_ENABLED", false);
 if (connpassEnabled && !process.env.CONNPASS_API_KEY?.trim()) console.warn("CONNPASS_ENABLED requires CONNPASS_API_KEY; event refreshes will fail until it is set");
-const publicExperienceChannels = new Set((process.env.EXPERIENCE_PUBLIC_CHANNEL_IDS ?? "").split(",").map(s => s.trim()).filter(Boolean));
+const experienceKnowledgeChannels = new Set([
+  ...(process.env.EXPERIENCE_KNOWLEDGE_CHANNEL_IDS ?? "").split(","),
+  // Backward-compatible alias. It now enables private Knowledge sync, never public visibility.
+  ...(process.env.EXPERIENCE_PUBLIC_CHANNEL_IDS ?? "").split(","),
+].map(s => s.trim()).filter(Boolean));
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(
@@ -682,9 +692,35 @@ client.on(Events.MessageBulkDelete, messages => { for (const message of messages
 /** Lets a read-back tell the text we published from a text a person rewrote. */
 const bodyHash = (body: string): string => createHash("sha256").update(body).digest("hex");
 
-/** Operator-approved public channel inside the primary guild. Publication needs this and a review. */
-const publishableChannel = (memory: ExperienceMemory): boolean =>
-  publicExperienceChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId);
+/** Explicit source-channel allowlist inside the primary guild. Private Knowledge sync needs this and a review. */
+const knowledgeChannel = (memory: ExperienceMemory): boolean =>
+  experienceKnowledgeChannels.has(memory.channelId) && (!primaryGuildId || memory.guildId === primaryGuildId);
+
+async function noteGardenSyncFailure(status: string): Promise<void> {
+  lastGardenSyncFailureAt = new Date().toISOString();
+  lastGardenSyncFailureStatus = status;
+  await reportIncidentImpl("decisiongarden_sync_failed", "warning", "DecisionGardenへのKnowledge同期に失敗", `status=${status}`);
+}
+
+async function noteGardenSyncSuccess(): Promise<void> {
+  lastGardenSyncAt = new Date().toISOString();
+  lastGardenSyncFailureAt = null;
+  lastGardenSyncFailureStatus = null;
+  await resolveIncidentImpl("decisiongarden_sync_failed");
+}
+
+async function noteGardenReadFailure(status: string): Promise<void> {
+  lastGardenReadFailureAt = new Date().toISOString();
+  lastGardenReadFailureStatus = status;
+  await reportIncidentImpl("decisiongarden_read_failed", "warning", "DecisionGardenのKnowledge読戻しに失敗", `status=${status}`);
+}
+
+async function noteGardenReadSuccess(): Promise<void> {
+  lastGardenReadAt = new Date().toISOString();
+  lastGardenReadFailureAt = null;
+  lastGardenReadFailureStatus = null;
+  await resolveIncidentImpl("decisiongarden_read_failed");
+}
 
 const experienceLlm = async (messages: AgentMessage[]): Promise<string> => {
   const body = await llmReliability.run(async ({ signal, requestId }) => {
@@ -701,16 +737,13 @@ export async function experienceTick(): Promise<void> {
   await sweepDeletedEvidence();
   if (connpassEnabled) await connpass.refresh();
   await experiences.analyse(llmApiUrl ? experienceLlm : undefined);
-  // Publication review runs before sync, and only for memories an operator already allowed to be public.
-  await experiences.review(llmApiUrl ? experienceLlm : undefined, publishableChannel);
+  // Knowledge review runs before sync, and only for memories from an explicitly allowed source channel.
+  await experiences.review(llmApiUrl ? experienceLlm : undefined, knowledgeChannel);
   await experiences.sync(async memory => {
-    // A copy is only publishable while its evidence still exists in a channel everyone can read.
+    // A private Knowledge copy is only valid while its evidence still exists and remains readable to the bot.
     if (!await verifyExperience(memory)) return { outcome: "failed" };
-    const channel = await client.channels.fetch(memory.channelId) as TextChannel;
-    const read = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
-    if (!channel.permissionsFor(channel.guild.roles.everyone)?.has(read) || channel.permissionOverwrites.cache.some(o => o.deny.any(read))) return { outcome: "failed" };
     const publishable = publicExperience(memory);
-    // No cleared summary means nothing may be published; never fall back to a generic node.
+    // No cleared summary means nothing may be stored; never fall back to a generic node.
     if (!publishable) return { outcome: "failed" };
     // The node id addresses exactly one Garden node, so nothing else in the Garden is ever read.
     // The baseline is our own last-write token: the Worker compares it and refuses rather than
@@ -719,8 +752,15 @@ export async function experienceTick(): Promise<void> {
       ...(memory.syncedUpdatedAt ? { baselineUpdatedAt: memory.syncedUpdatedAt } : {}),
       ...(memory.gardenNodeId ? { nodeId: memory.gardenNodeId } : {}) };
     // A conflict or a Garden failure answers with a non-2xx; the status still has to be read, not thrown away.
-    const result = (await postSignedOutcome<{ synced?: boolean; status?: SyncOutcome; updatedAt?: string; nodeId?: string }>("/internal/experiences/sync", payload)).body;
+    let result: { synced?: boolean; status?: SyncOutcome; updatedAt?: string; nodeId?: string } | null;
+    try {
+      result = (await postSignedOutcome<{ synced?: boolean; status?: SyncOutcome; updatedAt?: string; nodeId?: string }>("/internal/experiences/sync", payload)).body;
+    } catch {
+      await noteGardenSyncFailure("failed");
+      return { outcome: "failed" };
+    }
     if (result?.synced === true) {
+      await noteGardenSyncSuccess();
       return { outcome: "synced", updatedAt: result.updatedAt ?? null, nodeId: result.nodeId ?? null,
         bodyHash: bodyHash(publicExperienceBody(publishable).body) };
     }
@@ -733,8 +773,9 @@ export async function experienceTick(): Promise<void> {
       node_unknown: "published before node ids were tracked; archive or re-create it by hand",
     };
     if (status && waiting[status]) console.warn(`experience ${memory.threadId.slice(0, 8)} rev${memory.revision}: ${waiting[status]}; waiting`);
+    if (!status || ["not_configured", "not_permitted", "update_unsupported", "failed"].includes(status)) await noteGardenSyncFailure(status ?? "failed");
     return { outcome: status && (waiting[status] || status === "not_configured") ? status as SyncOutcome : "failed" };
-  }, publishableChannel,
+  }, knowledgeChannel,
     async entry => (await postSigned<{ retracted: boolean }>("/internal/experiences/retract", entry)).retracted === true);
   // A publish blocked only on a missing baseline is unblocked by reading the Garden copy now.
   await pullEditorNotes(Date.now(), experiences.awaitingReadback());
@@ -765,12 +806,19 @@ async function pullEditorNotes(now = Date.now(), force = false): Promise<void> {
     const result = await postSigned<{ status: string; covered?: string[]; notes?: Array<{ threadId: string; body: string; updatedAt: string }> }>(
       "/internal/experiences/pull", { nodes });
     // Only an authoritative answer may clear a cached note; a partial or failed read clears nothing.
-    if (result.status !== "ok" || !Array.isArray(result.notes) || !Array.isArray(result.covered)) return;
+    if (result.status !== "ok" || !Array.isArray(result.notes) || !Array.isArray(result.covered)) {
+      await noteGardenReadFailure(result.status || "failed");
+      return;
+    }
+    await noteGardenReadSuccess();
     const covered = result.covered.filter(id => known.has(id));
     experiences.applyEditorNotes(
       result.notes.filter(n => covered.includes(n.threadId)).map(n => ({ ...n, bodyHash: bodyHash(n.body) })),
       covered, now);
-  } catch { /* The Garden is optional context; conversation continues without it. */ }
+  } catch {
+    await noteGardenReadFailure("failed");
+    /* The Garden is optional context; conversation continues without it. */
+  }
 }
 
 async function experienceForever(): Promise<void> {
@@ -848,6 +896,12 @@ function startReadinessServer(): void {
       message: modelPreflightError ?? `${lifecycle.active} operations in progress`,
       activeWork: lifecycle.active,
       llm: { ...provider, model: llmModel || null, preflightError: modelPreflightError, slowMentions: slowMentionIds.size },
+      knowledge: {
+        ...experiences.snapshot(),
+        configuredChannels: experienceKnowledgeChannels.size,
+        sync: { lastSuccessAt: lastGardenSyncAt, lastFailureAt: lastGardenSyncFailureAt, lastFailureStatus: lastGardenSyncFailureStatus },
+        readback: { lastSuccessAt: lastGardenReadAt, lastFailureAt: lastGardenReadFailureAt, lastFailureStatus: lastGardenReadFailureStatus },
+      },
       retryAfterSeconds: 30,
       observedAt: new Date().toISOString(),
     };

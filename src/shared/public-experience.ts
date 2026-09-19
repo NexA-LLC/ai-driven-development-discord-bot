@@ -112,7 +112,7 @@ export function publicExperienceBody(item: PublicExperience): { title: string; b
     `残る問い: ${item.openQuestion ?? "いまはない。"}`,
     `最終更新: 第${item.revision}版 / 根拠の発言時刻 ${new Date(item.at).toISOString()}`,
     `記憶参照キー: ${publicExperienceSourceKey(item.id)}`,
-    "これは原文の引用ではなく、公開してよいか判定したうえで書き直した要約。受け止め方は解釈で、確定した事実ではない。原文・人物・Discord識別子は公開しない。運営用根拠は発言から最大30日で失効し、失効時はこのノードをarchived+privateへ下げる。",
+    "これは原文の引用ではなく、非公開Knowledgeとして保存してよいか判定したうえで書き直した要約。受け止め方は解釈で、確定した事実ではない。原文・人物・Discord識別子は保存しない。運営用根拠は発言から最大30日で失効し、失効時はこのノードをarchived+privateへ下げる。",
   ].join("\n") };
 }
 

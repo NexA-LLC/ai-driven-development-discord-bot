@@ -1685,7 +1685,7 @@ async function syncPublicExperience(env: Env, item: PublicExperience, baselineUp
       const receipt = await mcpCall(dg.url, dg.token, "save_memory_node", {
         gardenId: dg.gardenId, sourceKey, source: EXPERIENCE_SOURCE,
         // Open questions stay knowledge. スー never files an operational TODO into the Garden.
-        kind: "knowledge", state: "active", visibility: "garden", ...content,
+        kind: "knowledge", state: "active", visibility: "private", ...content,
       }) as { memoryNode?: { id?: unknown } } | null;
       const created = receipt?.memoryNode?.id;
       if (typeof created !== "string" || !UUID.test(created)) throw new McpToolError("other", "MCP save receipt has no usable node id");
@@ -1766,7 +1766,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /**
  * Reads one known node. Returns null only when the Garden says it is not there, so absence is a
  * direct answer rather than something inferred from a list. Everything that identifies the node is
- * checked: a node that is not ours, not in our Garden, or no longer active and garden-visible is
+ * checked: a node that is not ours, not in our Garden, or no longer active and private is
  * treated as not found rather than used.
  */
 async function getMemoryNode(dg: { url: string; token: string; gardenId: string }, nodeId: string, sourceKey: string): Promise<GardenMemoryNode | null> {
@@ -1782,8 +1782,8 @@ async function getMemoryNode(dg: { url: string; token: string; gardenId: string 
   if (!node || result?.garden?.id !== dg.gardenId) return null;
   const value = (key: string) => String(node[key] ?? "");
   if (value("id") !== nodeId || value("sourceKey") !== sourceKey || value("kind") !== "knowledge"
-    || value("source") !== EXPERIENCE_SOURCE || value("state") !== "active" || value("visibility") !== "garden") return null;
-  return { id: nodeId, sourceKey, kind: "knowledge", state: "active", visibility: "garden",
+    || value("source") !== EXPERIENCE_SOURCE || value("state") !== "active" || value("visibility") !== "private") return null;
+  return { id: nodeId, sourceKey, kind: "knowledge", state: "active", visibility: "private",
     source: EXPERIENCE_SOURCE, title: value("title"), body: value("body"), updatedAt: value("updatedAt") };
 }
 
