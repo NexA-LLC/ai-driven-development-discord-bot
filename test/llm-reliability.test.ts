@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { LlmReliability, LlmRequestError } from "../src/gateway/llm-reliability.js";
+import { completionText } from "../src/gateway/llm-completion.js";
 
 function controller(overrides: Partial<ConstructorParameters<typeof LlmReliability>[0]> = {}) {
   return new LlmReliability({
@@ -80,5 +81,21 @@ describe("LLM reliability controller", () => {
     now += 501;
     await expect(reliability.run(async () => "recovered", { priority: "interactive" })).resolves.toBe("recovered");
     expect(reliability.snapshot().state).toBe("healthy");
+  });
+});
+
+describe("LLM completion validation", () => {
+  it("accepts final text and strips echoed reasoning", () => {
+    expect(completionText({ choices: [{ message: { content: "<think>secret reasoning</think>\nOK" }, finish_reason: "stop" }] })).toBe("OK");
+  });
+
+  it("rejects HTTP-success-shaped responses without final text", () => {
+    expect(() => completionText({ choices: [{ message: { content: "" }, finish_reason: "stop" }] }))
+      .toThrowError(expect.objectContaining({ code: "empty_response", retryable: true }));
+  });
+
+  it("classifies reasoning-budget exhaustion as a retryable empty response", () => {
+    expect(() => completionText({ choices: [{ message: { content: "" }, finish_reason: "length" }] }))
+      .toThrow("whole token budget");
   });
 });

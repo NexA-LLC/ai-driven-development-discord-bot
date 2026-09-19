@@ -68,6 +68,11 @@ single-flight queue, circuit state, last success/failure and configured-model pr
 `decision=degraded` means the process is alive but the provider is not ready for normal replies. Send SIGUSR2 to that PID for
 a graceful same-release restart. Never use `kill -9` for planned updates.
 
+Model availability is not established by HTTP 200 alone. The configured model must appear in `/v1/models`, and a recovery
+probe must produce non-empty final text after hidden reasoning is removed. The probe uses enough completion budget for a
+reasoning model; an empty `content`, even with `finish_reason=stop`, remains `empty_response` and cannot close the circuit or
+requeue dead letters. The same final-text validation applies to mentions, voice replies and experience analysis.
+
 Direct mentions remain in the 0600 inbox until they are answered. They enter the interactive LLM queue ahead of
 musings and experience analysis. After 15 seconds, the Gateway posts one waiting message and edits that message into
 the final answer. An ambiguous timeout/reset is not immediately retried because the model may already have accepted

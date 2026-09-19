@@ -18,6 +18,7 @@ import { lifecycle } from "./lifecycle.js";
 import { auditConversation } from "./conversation-audit.js";
 import { inbox, type InboxItem } from "./inbox.js";
 import { LlmReliability, LlmRequestError, llmHttpError } from "./llm-reliability.js";
+import { completionText, type LlmCompletionBody } from "./llm-completion.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
@@ -172,7 +173,7 @@ const voiceChat = new VoiceChat(client, async (text, history, audit) => {
       messages: [{ role: "system", content: buildSystemPrompt("mention", "ja", { pitcheeeUrl }) + '\n音声通話中です。聞き取りは誤認識の可能性があります。応答はJSONだけで {"action":"reply|leave|ignore","text":"読み上げる自然な日本語、300文字以内"}。利用者の意図を判断して、退室依頼はleave、無音・雑音・意味不明な認識結果はignore、それ以外の会話はreply。返答は1〜3文で短く。読み上げに不向きなMarkdownやURLを入れない。通話以外の外部操作は実行できないので実行済みと主張しない。' }, ...history, { role: "user", content: text }],
   };
   auditConversation({ ...audit, phase: "llm_request", input: JSON.stringify(request) });
-  const body = await llmReliability.run(async ({ signal, requestId }) => {
+  const answer = await llmReliability.run(async ({ signal, requestId }) => {
     const response = await fetch(llmApiUrl, {
       method: "POST", headers: llmHeaders(requestId), body: JSON.stringify(request), signal,
     });
@@ -180,10 +181,10 @@ const voiceChat = new VoiceChat(client, async (text, history, audit) => {
       auditConversation({ ...audit, phase: "llm_response", ok: false, response: JSON.stringify({ status: response.status, requestId }) });
       throw llmHttpError(response.status);
     }
-    return response.json() as Promise<{ choices?: Array<{ message?: { content?: string } }> }>;
+    return completionText(await response.json() as LlmCompletionBody);
   }, { priority: "interactive" });
-  auditConversation({ ...audit, phase: "llm_response", ok: true, response: body.choices?.[0]?.message?.content ?? "" });
-  return parseVoiceDecision(body.choices?.[0]?.message?.content ?? "");
+  auditConversation({ ...audit, phase: "llm_response", ok: true, response: answer });
+  return parseVoiceDecision(answer);
 });
 let startupReady = false;
 let inFlight = 0;
@@ -479,6 +480,7 @@ export async function onMessageImpl(message: Message, recovery?: InboxItem): Pro
             const body = await response.json() as { choices?: Array<{ message?: AgentMessage }> };
             const answer = body.choices?.[0]?.message;
             if (!answer) throw new LlmRequestError("Agent LLM returned no message", { code: "empty_message", retryable: true });
+            if (!(answer.tool_calls?.length)) completionText(body as LlmCompletionBody);
             return answer;
           }, {
             priority: "interactive",
@@ -723,13 +725,12 @@ async function noteGardenReadSuccess(): Promise<void> {
 }
 
 const experienceLlm = async (messages: AgentMessage[]): Promise<string> => {
-  const body = await llmReliability.run(async ({ signal, requestId }) => {
+  return llmReliability.run(async ({ signal, requestId }) => {
     const response = await fetch(llmApiUrl, { method: "POST", headers: llmHeaders(requestId),
       body: JSON.stringify({ model: llmModel || undefined, messages, temperature: 0.1, max_tokens: 1500 }), signal });
     if (!response.ok) throw llmHttpError(response.status);
-    return response.json() as Promise<{ choices?: Array<{ message?: { content?: string } }> }>;
+    return completionText(await response.json() as LlmCompletionBody);
   }, { priority: "background" });
-  return body.choices?.[0]?.message?.content ?? "";
 };
 
 export async function experienceTick(): Promise<void> {
@@ -1046,7 +1047,7 @@ async function preflightConfiguredModel(): Promise<void> {
     }
     const body = await response.json() as { data?: Array<{ id?: string }> };
     const available = (body.data ?? []).flatMap(item => item.id ? [item.id] : []);
-    if (available.length > 0 && !available.includes(llmModel)) {
+    if (!available.includes(llmModel)) {
       modelPreflightError = `configured model ${llmModel} is not loaded`;
       await reportIncident(
         "llm_model_unavailable",
@@ -1076,13 +1077,19 @@ async function providerWatchForever(): Promise<void> {
               headers: llmHeaders(requestId),
               body: JSON.stringify({
                 model: llmModel || undefined,
-                messages: [{ role: "user", content: "health check: reply OK" }],
+                messages: [
+                  { role: "system", content: "Return only the requested final answer." },
+                  { role: "user", content: "Answer with the single word OK." },
+                ],
                 temperature: 0,
-                max_tokens: 8,
+                // Reasoning tokens share this budget. Eight tokens can produce HTTP 200
+                // with no final text, which is not a recovery signal.
+                max_tokens: 512,
               }),
               signal,
             });
             if (!response.ok) throw llmHttpError(response.status);
+            completionText(await response.json() as LlmCompletionBody);
           }, { priority: "background", maxAttempts: 1, attemptTimeoutMs: 30_000, totalTimeoutMs: 30_000 });
           const requeued = inbox.requeueDeadLetters(20);
           if (requeued > 0) console.log(`LLM health probe recovered; requeued ${requeued} mention(s)`);
@@ -1321,26 +1328,8 @@ async function generateRawReply(
       signal,
     });
     if (!response.ok) throw llmHttpError(response.status);
-    const body = await response.json() as {
-      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
-    };
-    const choice = body.choices?.[0];
-    const text = choice?.message?.content;
-    if (text && text.trim().length > 0) {
-      return stripReasoning(text).trim();
-    }
-    throw new LlmRequestError(
-      choice?.finish_reason === "length"
-        ? "LLM spent the whole token budget on reasoning and returned no text"
-        : "LLM API returned no text",
-      { code: "empty_response", retryable: true },
-    );
+    return completionText(await response.json() as LlmCompletionBody);
   }, { priority: event === "musing" ? "background" : "interactive" });
-}
-
-/** Some local models echo their reasoning in <think>…</think>; never show it. */
-function stripReasoning(text: string): string {
-  return text.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<\/?think>/g, "");
 }
 
 async function sendInteractionFollowUp(
