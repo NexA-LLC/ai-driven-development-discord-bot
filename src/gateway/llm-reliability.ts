@@ -56,6 +56,11 @@ export interface LlmRunOptions {
   totalTimeoutMs?: number;
 }
 
+export interface LlmProbeOptions {
+  requestId?: string;
+  timeoutMs?: number;
+}
+
 export interface LlmReliabilitySnapshot {
   state: LlmCircuitState;
   active: number;
@@ -121,6 +126,23 @@ export class LlmReliability {
       lastFailureAt: this.lastFailureAt === null ? null : new Date(this.lastFailureAt).toISOString(),
       lastFailureCode: this.lastFailureCode,
     };
+  }
+
+  /**
+   * Run an idle-only synthetic probe without changing customer-request circuit
+   * state. The caller is responsible for checking that normal work is idle.
+   */
+  async probe<T>(operation: (context: LlmRunContext) => Promise<T>, options: LlmProbeOptions = {}): Promise<T> {
+    const controller = new AbortController();
+    const timeoutMs = options.timeoutMs ?? this.options.attemptTimeoutMs;
+    const timer = setTimeout(() => controller.abort(new DOMException("LLM probe timed out", "TimeoutError")), timeoutMs);
+    try {
+      return await operation({ signal: controller.signal, attempt: 1, requestId: options.requestId ?? randomUUID() });
+    } catch (error) {
+      throw normalizeLlmError(error);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async run<T>(operation: (context: LlmRunContext) => Promise<T>, runOptions: LlmRunOptions): Promise<T> {

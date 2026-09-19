@@ -52,6 +52,14 @@ describe("LLM reliability controller", () => {
     expect(attempts).toBe(1);
   });
 
+  it("does not degrade customer-request circuit state when a synthetic probe fails", async () => {
+    const reliability = controller({ circuitFailureThreshold: 1 });
+    await expect(reliability.probe(async () => {
+      throw new DOMException("probe timed out", "TimeoutError");
+    })).rejects.toMatchObject({ code: "ambiguous_timeout" });
+    expect(reliability.snapshot()).toMatchObject({ state: "healthy", consecutiveFailures: 0 });
+  });
+
   it("queues interactive work ahead of background work", async () => {
     const reliability = controller({ maxAttempts: 1 });
     let release!: () => void;

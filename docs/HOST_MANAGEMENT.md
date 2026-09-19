@@ -73,14 +73,21 @@ probe must produce non-empty final text after hidden reasoning is removed. The p
 reasoning model; an empty `content`, even with `finish_reason=stop`, remains `empty_response` and cannot close the circuit or
 requeue dead letters. The same final-text validation applies to mentions, voice replies and experience analysis. The Gateway
 runs this real-generation probe on startup and every `LLM_HEALTH_PROBE_SECONDS` (default 300 seconds). Failures open
-`llm_health_probe_failed`; a later valid final answer resolves it and emits the normal one-time recovery notice.
+`llm_health_probe_failed`; a later valid final answer resolves it and emits the normal one-time recovery notice. A healthy-state
+periodic probe is independent of the production circuit, runs only while the Gateway LLM queue is idle, and cannot open that
+circuit by itself. While a circuit cooldown is already active, the watcher waits instead of reporting `circuit_open` as a new
+provider failure. After cooldown, one real final answer through the half-open circuit establishes recovery.
 
 Direct mentions remain in the 0600 inbox until they are answered. They enter the interactive LLM queue ahead of
-musings and experience analysis. After 15 seconds, the Gateway posts one waiting message and edits that message into
-the final answer. An ambiguous timeout/reset is not immediately retried because the model may already have accepted
+musings and experience analysis. After 15 seconds, the Gateway posts one generation-in-progress message and edits that
+message into the final answer. Slow but active generation is status, not an incident and not described as queueing. An
+ambiguous timeout/reset is not immediately retried because the model may already have accepted
 the prompt; the circuit cools down before the durable Discord item is resumed. User-visible LLM failures create an
 incident improvement issue on their first occurrence. Requests carry `x-nexa-client` and `x-nexa-request-id` so the
 Gateway and model-host logs can be correlated without logging prompt content.
+
+Scheduled musings use a separate 120-second attempt / 180-second total budget by default. This keeps the background
+operation bounded while avoiding false failures from the local model's observed 40-second-plus tail latency.
 
 On `10.1.0.204`, launchd label `net.nex-a.ds4-health` runs `scripts/monitor-llm-health.py` every five minutes and appends
 content-free evidence to `~/Library/Logs/ds4-health.jsonl`. Each row records configured-model presence, model count,

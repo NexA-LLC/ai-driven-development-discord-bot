@@ -17,7 +17,7 @@ import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { auditConversation } from "./conversation-audit.js";
 import { inbox, type InboxItem } from "./inbox.js";
-import { LlmReliability, LlmRequestError, llmHttpError } from "./llm-reliability.js";
+import { LlmReliability, LlmRequestError, llmHttpError, normalizeLlmError } from "./llm-reliability.js";
 import { completionText, type LlmCompletionBody } from "./llm-completion.js";
 import { searchWeb } from "./web-search.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
@@ -89,11 +89,16 @@ const llmApiKey = process.env.LLM_API_KEY?.trim() || "";
 const llmAttemptTimeoutMs = readPositiveInteger("LLM_ATTEMPT_TIMEOUT_SECONDS", 45) * 1_000;
 const llmTotalTimeoutMs = readPositiveInteger("LLM_TOTAL_TIMEOUT_SECONDS", 90) * 1_000;
 const llmMaxAttempts = readPositiveInteger("LLM_MAX_ATTEMPTS", 2);
+// Background prose can legitimately take longer than the generic 45 second
+// attempt limit on the local reasoning model. Keep it bounded, but do not turn
+// a merely slow scheduled musing into a user-facing outage.
+const backgroundLlmAttemptTimeoutMs = readPositiveInteger("BACKGROUND_LLM_ATTEMPT_TIMEOUT_SECONDS", 120) * 1_000;
+const backgroundLlmTotalTimeoutMs = readPositiveInteger("BACKGROUND_LLM_TOTAL_TIMEOUT_SECONDS", 180) * 1_000;
 // Discord mentions are normal channel replies, so they can remain queued much
 // longer than interactions. A waiting notice is posted while the single-flight
 // request remains attached; ambiguous timeouts are never immediately retried.
-const mentionLlmAttemptTimeoutMs = readPositiveInteger("MENTION_LLM_ATTEMPT_TIMEOUT_SECONDS", 900) * 1_000;
-const mentionLlmTotalTimeoutMs = readPositiveInteger("MENTION_LLM_TOTAL_TIMEOUT_SECONDS", 960) * 1_000;
+const mentionLlmAttemptTimeoutMs = readPositiveInteger("MENTION_LLM_ATTEMPT_TIMEOUT_SECONDS", 180) * 1_000;
+const mentionLlmTotalTimeoutMs = readPositiveInteger("MENTION_LLM_TOTAL_TIMEOUT_SECONDS", 240) * 1_000;
 const mentionWaitNoticeMs = readPositiveInteger("MENTION_WAIT_NOTICE_SECONDS", 15) * 1_000;
 const mentionDeferredRetries = readPositiveInteger("MENTION_DEFERRED_RETRIES", 2);
 const mentionRetryDelayMs = readPositiveInteger("MENTION_RETRY_DELAY_SECONDS", 60) * 1_000;
@@ -453,13 +458,7 @@ export async function onMessageImpl(message: Message, recovery?: InboxItem): Pro
         recoveryNoticeMessageId = await upsertRecoveryNotice(
           message,
           recoveryNoticeMessageId,
-          "返答を生成する順番を待っています。この依頼は待ち行列に保持し、完了したらここを回答に更新します。",
-        );
-        await reportIncident(
-          "mention_llm_waiting",
-          "warning",
-          "スーのメンション返答がLLM待ち行列で遅延しています",
-          JSON.stringify({ messageId: message.id, model: llmModel || null, provider: llmReliability.snapshot() }),
+          "返答を生成中です。完了したら、このメッセージを回答に更新します。",
         );
       })().catch(error => console.error("waiting notice failed", error));
     }, mentionWaitNoticeMs) : undefined;
@@ -921,7 +920,7 @@ function startReadinessServer(): void {
       release: process.env.SU_RELEASE_SHA ?? "unknown",
       queuedMessages: inbox.size,
       deadLetterMessages: inbox.deadLetterSize,
-      reasonCode: active ? (slowMentionIds.size > 0 ? "llm_queue_slow" : "active_work") : modelPreflightError ? "llm_model_unavailable" : providerDegraded ? "llm_degraded" : "idle",
+      reasonCode: active ? (slowMentionIds.size > 0 ? "llm_response_slow" : "active_work") : modelPreflightError ? "llm_model_unavailable" : providerDegraded ? "llm_degraded" : "idle",
       message: modelPreflightError ?? `${lifecycle.active} operations in progress`,
       activeWork: lifecycle.active,
       llm: { ...provider, model: llmModel || null, preflightError: modelPreflightError, slowMentions: slowMentionIds.size },
@@ -1103,11 +1102,18 @@ async function providerWatchForever(): Promise<void> {
   let nextPeriodicProbeAt = 0;
   for (;;) {
     if (!lifecycle.draining) {
-      const state = llmReliability.snapshot().state;
-      if (modelPreflightError || state === "open" || state === "degraded" || Date.now() >= nextPeriodicProbeAt) {
+      const snapshot = llmReliability.snapshot();
+      const state = snapshot.state;
+      const periodicProbeDue = state === "healthy" && snapshot.active === 0 &&
+        snapshot.queuedInteractive === 0 && snapshot.queuedBackground === 0 && Date.now() >= nextPeriodicProbeAt;
+      if (modelPreflightError || state === "open" || state === "degraded" || periodicProbeDue) {
         await preflightConfiguredModel();
-        if (!modelPreflightError) try {
-          await llmReliability.run(async ({ signal, requestId }) => {
+        // An open circuit is already the consequence of a reported primary
+        // failure. Calling run() while its cooldown is active only produces a
+        // local circuit_open rejection and a duplicate incident; wait for the
+        // half-open window instead.
+        if (!modelPreflightError && state !== "open") try {
+          const probe = async (signal: AbortSignal, requestId: string): Promise<void> => {
             const response = await fetch(llmApiUrl, {
               method: "POST",
               headers: llmHeaders(requestId),
@@ -1118,30 +1124,49 @@ async function providerWatchForever(): Promise<void> {
                   { role: "user", content: "Answer with the single word OK." },
                 ],
                 temperature: 0,
-                // Reasoning tokens share this budget. Eight tokens can produce HTTP 200
-                // with no final text, which is not a recovery signal.
-                max_tokens: 512,
+                // Reasoning tokens share this budget. The current model uses
+                // roughly 45 tokens for this probe, so leave a bounded margin.
+                max_tokens: 128,
               }),
               signal,
             });
             if (!response.ok) throw llmHttpError(response.status);
             completionText(await response.json() as LlmCompletionBody);
-          }, { priority: "background", maxAttempts: 1, attemptTimeoutMs: 30_000, totalTimeoutMs: 30_000 });
+          };
+
+          if (state === "degraded") {
+            // After cooldown, one real final answer closes the shared circuit.
+            await llmReliability.run(
+              ({ signal, requestId }) => probe(signal, requestId),
+              { priority: "background", maxAttempts: 1, attemptTimeoutMs: 90_000, totalTimeoutMs: 90_000 },
+            );
+          } else {
+            // A synthetic periodic probe must not open the production circuit
+            // or block customer work. Real requests own circuit state.
+            nextPeriodicProbeAt = Date.now() + llmHealthProbeMs;
+            await llmReliability.probe(
+              ({ signal, requestId }) => probe(signal, requestId),
+              { requestId: `health-${randomUUID()}`, timeoutMs: 90_000 },
+            );
+          }
           nextPeriodicProbeAt = Date.now() + llmHealthProbeMs;
           await resolveIncidentImpl("llm_health_probe_failed");
           const requeued = inbox.requeueDeadLetters(20);
           if (requeued > 0) console.log(`LLM health probe recovered; requeued ${requeued} mention(s)`);
         } catch (error) {
           console.warn("LLM health probe still degraded", error);
-          const failure = error instanceof LlmRequestError
-            ? { code: error.code, message: error.message }
-            : { code: "request_failed", message: error instanceof Error ? error.message : String(error) };
-          await reportIncidentImpl(
-            "llm_health_probe_failed",
-            "error",
-            "スーのLLM実応答ヘルスチェックに失敗",
-            JSON.stringify({ model: llmModel || null, ...failure, provider: llmReliability.snapshot() }),
-          );
+          const normalized = normalizeLlmError(error);
+          // Admission/backpressure errors describe this gateway's current
+          // state, not a fresh provider failure. The primary incident and its
+          // recovery remain the single operator-visible lifecycle.
+          if (!["circuit_open", "circuit_half_open", "queue_full"].includes(normalized.code)) {
+            await reportIncidentImpl(
+              "llm_health_probe_failed",
+              "error",
+              "スーのLLM実応答ヘルスチェックに失敗",
+              JSON.stringify({ model: llmModel || null, code: normalized.code, message: normalized.message, provider: llmReliability.snapshot() }),
+            );
+          }
         }
       }
     }
@@ -1367,6 +1392,7 @@ async function generateRawReply(
     max_tokens: 2_000,
   });
 
+  const background = event === "musing";
   return llmReliability.run(async ({ signal, requestId }) => {
     const response = await fetch(llmApiUrl, {
       method: "POST",
@@ -1376,7 +1402,13 @@ async function generateRawReply(
     });
     if (!response.ok) throw llmHttpError(response.status);
     return completionText(await response.json() as LlmCompletionBody);
-  }, { priority: event === "musing" ? "background" : "interactive" });
+  }, {
+    priority: background ? "background" : "interactive",
+    ...(background ? {
+      attemptTimeoutMs: backgroundLlmAttemptTimeoutMs,
+      totalTimeoutMs: backgroundLlmTotalTimeoutMs,
+    } : {}),
+  });
 }
 
 async function sendInteractionFollowUp(
