@@ -603,6 +603,9 @@ export async function onMessageImpl(message: Message, recovery?: InboxItem): Pro
       ok,
       replyText: text,
     });
+    if (ok && recoveryNoticeMessageId && slowMentionIds.size === 0) {
+      await resolveIncidentImpl("mention_llm_waiting");
+    }
     if (ok && inbox.deadLetterSize > 0) {
       const requeued = inbox.requeueDeadLetters(20);
       if (requeued > 0) console.log(`LLM recovered; requeued ${requeued} deferred mention(s)`);
@@ -1073,6 +1076,14 @@ async function reportIncidentImpl(
     });
   } catch (error) {
     console.error("incident report failed", error);
+  }
+}
+
+async function resolveIncidentImpl(kind: string): Promise<void> {
+  try {
+    await postSigned("/internal/incidents/resolve", { kind, source: gatewayHost });
+  } catch (error) {
+    console.error("incident resolve failed", error);
   }
 }
 

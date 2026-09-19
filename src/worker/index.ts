@@ -185,6 +185,10 @@ export default {
       return handleInternalIncidentsAck(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/internal/incidents/resolve") {
+      return handleInternalIncidentResolve(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/internal/reply-logs") {
       return handleInternalReplyLog(request, env);
     }
@@ -1246,6 +1250,29 @@ async function handleInternalIncidentsAck(request: Request, env: Env): Promise<R
     await env.DB.prepare(`UPDATE su_incidents SET relayed_at = ? WHERE id = ?`).bind(now, id).run();
   }
   return json({ ok: true, acked: ids.length });
+}
+
+async function handleInternalIncidentResolve(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  let body: { kind?: unknown; source?: unknown };
+  try {
+    body = JSON.parse(rawBody) as typeof body;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (typeof body.kind !== "string" || !body.kind || body.kind.length > 100 ||
+      typeof body.source !== "string" || !body.source || body.source.length > 100) {
+    return json({ error: "kind_and_source_are_required" }, 400);
+  }
+  const result = await env.DB.prepare(
+    `UPDATE su_incidents
+        SET status = 'resolved', resolved_at = ?
+      WHERE dedupe_key = ? AND status = 'open'`,
+  ).bind(new Date().toISOString(), `${body.source}:${body.kind}`).run();
+  return json({ ok: true, resolved: result.meta.changes });
 }
 
 async function handleInternalReplyLog(request: Request, env: Env): Promise<Response> {
