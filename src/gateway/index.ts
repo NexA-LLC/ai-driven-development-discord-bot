@@ -149,6 +149,7 @@ let lastGardenReadFailureStatus: string | null = null;
 let sweepCursor = 0;
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
+const llmHealthProbeMs = readPositiveInteger("LLM_HEALTH_PROBE_SECONDS", 300) * 1_000;
 
 const intents = [
   GatewayIntentBits.Guilds,
@@ -1065,12 +1066,13 @@ async function preflightConfiguredModel(): Promise<void> {
 }
 
 async function providerWatchForever(): Promise<void> {
+  let nextPeriodicProbeAt = 0;
   for (;;) {
     if (!lifecycle.draining) {
       const state = llmReliability.snapshot().state;
-      if (modelPreflightError || state === "open" || state === "degraded") {
+      if (modelPreflightError || state === "open" || state === "degraded" || Date.now() >= nextPeriodicProbeAt) {
         await preflightConfiguredModel();
-        try {
+        if (!modelPreflightError) try {
           await llmReliability.run(async ({ signal, requestId }) => {
             const response = await fetch(llmApiUrl, {
               method: "POST",
@@ -1091,10 +1093,21 @@ async function providerWatchForever(): Promise<void> {
             if (!response.ok) throw llmHttpError(response.status);
             completionText(await response.json() as LlmCompletionBody);
           }, { priority: "background", maxAttempts: 1, attemptTimeoutMs: 30_000, totalTimeoutMs: 30_000 });
+          nextPeriodicProbeAt = Date.now() + llmHealthProbeMs;
+          await resolveIncidentImpl("llm_health_probe_failed");
           const requeued = inbox.requeueDeadLetters(20);
           if (requeued > 0) console.log(`LLM health probe recovered; requeued ${requeued} mention(s)`);
         } catch (error) {
           console.warn("LLM health probe still degraded", error);
+          const failure = error instanceof LlmRequestError
+            ? { code: error.code, message: error.message }
+            : { code: "request_failed", message: error instanceof Error ? error.message : String(error) };
+          await reportIncidentImpl(
+            "llm_health_probe_failed",
+            "error",
+            "スーのLLM実応答ヘルスチェックに失敗",
+            JSON.stringify({ model: llmModel || null, ...failure, provider: llmReliability.snapshot() }),
+          );
         }
       }
     }

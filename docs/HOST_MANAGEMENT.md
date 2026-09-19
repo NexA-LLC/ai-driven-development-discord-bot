@@ -71,7 +71,9 @@ a graceful same-release restart. Never use `kill -9` for planned updates.
 Model availability is not established by HTTP 200 alone. The configured model must appear in `/v1/models`, and a recovery
 probe must produce non-empty final text after hidden reasoning is removed. The probe uses enough completion budget for a
 reasoning model; an empty `content`, even with `finish_reason=stop`, remains `empty_response` and cannot close the circuit or
-requeue dead letters. The same final-text validation applies to mentions, voice replies and experience analysis.
+requeue dead letters. The same final-text validation applies to mentions, voice replies and experience analysis. The Gateway
+runs this real-generation probe on startup and every `LLM_HEALTH_PROBE_SECONDS` (default 300 seconds). Failures open
+`llm_health_probe_failed`; a later valid final answer resolves it and emits the normal one-time recovery notice.
 
 Direct mentions remain in the 0600 inbox until they are answered. They enter the interactive LLM queue ahead of
 musings and experience analysis. After 15 seconds, the Gateway posts one waiting message and edits that message into
