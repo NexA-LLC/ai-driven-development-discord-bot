@@ -105,7 +105,8 @@ const mentionRetryDelayMs = readPositiveInteger("MENTION_RETRY_DELAY_SECONDS", 6
 const jobPollMs = readPositiveInteger("JOB_POLL_SECONDS", 3) * 1_000;
 const pitcheeeUrl = process.env.PITCHEEE_URL?.trim() || undefined;
 const llmReliability = new LlmReliability({
-  maxConcurrency: readPositiveInteger("LLM_MAX_CONCURRENCY", 1),
+  maxConcurrency: readPositiveInteger("LLM_MAX_CONCURRENCY", 2),
+  maxBackgroundConcurrency: readPositiveInteger("LLM_MAX_BACKGROUND_CONCURRENCY", 1),
   maxQueue: readPositiveInteger("LLM_MAX_QUEUE", 50),
   maxAttempts: llmMaxAttempts,
   attemptTimeoutMs: llmAttemptTimeoutMs,
@@ -757,7 +758,12 @@ const experienceLlm = async (messages: AgentMessage[]): Promise<string> => {
       body: JSON.stringify({ model: llmModel || undefined, messages, temperature: 0.1, max_tokens: 1500 }), signal });
     if (!response.ok) throw llmHttpError(response.status);
     return completionText(await response.json() as LlmCompletionBody);
-  }, { priority: "background" });
+  }, {
+    priority: "background",
+    attemptTimeoutMs: backgroundLlmAttemptTimeoutMs,
+    totalTimeoutMs: backgroundLlmTotalTimeoutMs,
+    affectsCircuit: false,
+  });
 };
 
 export async function experienceTick(): Promise<void> {
@@ -1407,6 +1413,7 @@ async function generateRawReply(
     ...(background ? {
       attemptTimeoutMs: backgroundLlmAttemptTimeoutMs,
       totalTimeoutMs: backgroundLlmTotalTimeoutMs,
+      affectsCircuit: false,
     } : {}),
   });
 }

@@ -54,6 +54,7 @@ export interface LlmRunOptions {
   maxAttempts?: number;
   attemptTimeoutMs?: number;
   totalTimeoutMs?: number;
+  affectsCircuit?: boolean;
 }
 
 export interface LlmProbeOptions {
@@ -75,6 +76,7 @@ export interface LlmReliabilitySnapshot {
 
 interface ReliabilityOptions {
   maxConcurrency: number;
+  maxBackgroundConcurrency?: number;
   maxQueue: number;
   maxAttempts: number;
   attemptTimeoutMs: number;
@@ -87,11 +89,13 @@ interface ReliabilityOptions {
 }
 
 interface Waiter {
+  priority: LlmPriority;
   resolve: () => void;
 }
 
 export class LlmReliability {
   private active = 0;
+  private activeBackground = 0;
   private readonly interactiveQueue: Waiter[] = [];
   private readonly backgroundQueue: Waiter[] = [];
   private consecutiveFailures = 0;
@@ -150,12 +154,16 @@ export class LlmReliability {
     const totalTimeoutMs = runOptions.totalTimeoutMs ?? this.options.totalTimeoutMs;
     const attemptTimeoutMs = runOptions.attemptTimeoutMs ?? this.options.attemptTimeoutMs;
     const maxAttempts = runOptions.maxAttempts ?? this.options.maxAttempts;
+    const affectsCircuit = runOptions.affectsCircuit ?? true;
     let halfOpen = false;
 
     if (this.openedUntil > this.now()) {
       throw new LlmRequestError("LLM circuit is open", { code: "circuit_open", retryable: true });
     }
     if (this.openedUntil > 0) {
+      if (!affectsCircuit) {
+        throw new LlmRequestError("LLM circuit awaits a tracked recovery probe", { code: "circuit_open", retryable: true });
+      }
       if (this.halfOpenInFlight) {
         throw new LlmRequestError("LLM circuit half-open probe is already running", { code: "circuit_half_open", retryable: true });
       }
@@ -187,7 +195,7 @@ export class LlmReliability {
         try {
           const value = await operation({ signal: controller.signal, attempt, requestId });
           clearTimeout(timer);
-          this.recordSuccess();
+          if (affectsCircuit) this.recordSuccess();
           return value;
         } catch (error) {
           clearTimeout(timer);
@@ -197,34 +205,40 @@ export class LlmReliability {
           await this.wait(this.options.retryDelayMs);
         }
       }
-      this.recordFailure(lastError);
+      if (affectsCircuit) this.recordFailure(lastError);
       throw lastError;
     } finally {
       if (halfOpen) this.halfOpenInFlight = false;
-      this.release();
+      this.release(runOptions.priority);
     }
   }
 
   private async acquire(priority: LlmPriority): Promise<void> {
-    if (this.active < this.options.maxConcurrency) {
+    const maxBackground = this.options.maxBackgroundConcurrency ?? this.options.maxConcurrency;
+    if (this.active < this.options.maxConcurrency && (priority === "interactive" || this.activeBackground < maxBackground)) {
       this.active += 1;
+      if (priority === "background") this.activeBackground += 1;
       return;
     }
     if (this.interactiveQueue.length + this.backgroundQueue.length >= this.options.maxQueue) {
       throw new LlmRequestError("LLM queue is full", { code: "queue_full", retryable: true });
     }
     await new Promise<void>((resolve) => {
-      const waiter = { resolve };
+      const waiter = { priority, resolve };
       if (priority === "interactive") this.interactiveQueue.push(waiter);
       else this.backgroundQueue.push(waiter);
     });
   }
 
-  private release(): void {
+  private release(priority: LlmPriority): void {
     this.active -= 1;
-    const next = this.interactiveQueue.shift() ?? this.backgroundQueue.shift();
+    if (priority === "background") this.activeBackground -= 1;
+    const maxBackground = this.options.maxBackgroundConcurrency ?? this.options.maxConcurrency;
+    const next = this.interactiveQueue.shift() ??
+      (this.activeBackground < maxBackground ? this.backgroundQueue.shift() : undefined);
     if (next) {
       this.active += 1;
+      if (next.priority === "background") this.activeBackground += 1;
       next.resolve();
     }
   }

@@ -60,6 +60,31 @@ describe("LLM reliability controller", () => {
     expect(reliability.snapshot()).toMatchObject({ state: "healthy", consecutiveFailures: 0 });
   });
 
+  it("does not degrade customer-request circuit state when untracked background work fails", async () => {
+    const reliability = controller({ circuitFailureThreshold: 1 });
+    await expect(reliability.run(async () => {
+      throw new DOMException("background timed out", "TimeoutError");
+    }, { priority: "background", affectsCircuit: false })).rejects.toMatchObject({ code: "ambiguous_timeout" });
+    expect(reliability.snapshot()).toMatchObject({ state: "healthy", consecutiveFailures: 0 });
+  });
+
+  it("reserves concurrency for interactive work while background work is active", async () => {
+    const reliability = controller({ maxConcurrency: 2, maxBackgroundConcurrency: 1, maxAttempts: 1 });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const order: string[] = [];
+    const first = reliability.run(async () => { order.push("background-1"); await gate; }, { priority: "background" });
+    await Promise.resolve();
+    const second = reliability.run(async () => { order.push("background-2"); }, { priority: "background" });
+    await Promise.resolve();
+    const interactive = reliability.run(async () => { order.push("interactive"); }, { priority: "interactive" });
+    await interactive;
+    expect(order).toEqual(["background-1", "interactive"]);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["background-1", "interactive", "background-2"]);
+  });
+
   it("queues interactive work ahead of background work", async () => {
     const reliability = controller({ maxAttempts: 1 });
     let release!: () => void;

@@ -86,8 +86,11 @@ the prompt; the circuit cools down before the durable Discord item is resumed. U
 incident improvement issue on their first occurrence. Requests carry `x-nexa-client` and `x-nexa-request-id` so the
 Gateway and model-host logs can be correlated without logging prompt content.
 
-Scheduled musings use a separate 120-second attempt / 180-second total budget by default. This keeps the background
-operation bounded while avoiding false failures from the local model's observed 40-second-plus tail latency.
+The model host exposes two batched sessions. The Gateway uses at most two concurrent requests but permits only one
+background request, reserving the other session for mentions and voice. Scheduled musings and Knowledge analysis use a
+separate 120-second attempt / 180-second total budget by default. Their failures are reported by their own feature path
+but do not open the customer-request circuit. This keeps background work bounded while avoiding false global outages
+from the local model's observed 40-second-plus tail latency.
 
 On `10.1.0.204`, launchd label `net.nex-a.ds4-health` runs `scripts/monitor-llm-health.py` every five minutes and appends
 content-free evidence to `~/Library/Logs/ds4-health.jsonl`. Each row records configured-model presence, model count,
