@@ -897,7 +897,7 @@ function startReadinessServer(): void {
       activeWork: lifecycle.active,
       llm: { ...provider, model: llmModel || null, preflightError: modelPreflightError, slowMentions: slowMentionIds.size },
       knowledge: {
-        ...experiences.snapshot(),
+        ...experiences.snapshot(Date.now(), knowledgeChannel),
         configuredChannels: experienceKnowledgeChannels.size,
         sync: { lastSuccessAt: lastGardenSyncAt, lastFailureAt: lastGardenSyncFailureAt, lastFailureStatus: lastGardenSyncFailureStatus },
         readback: { lastSuccessAt: lastGardenReadAt, lastFailureAt: lastGardenReadFailureAt, lastFailureStatus: lastGardenReadFailureStatus },

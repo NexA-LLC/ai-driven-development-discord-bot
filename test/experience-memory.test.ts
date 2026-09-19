@@ -32,15 +32,27 @@ async function clear(store: ExperienceStore, reviewer = approve(), now2 = now) {
 it("reports non-sensitive readiness counts across the Knowledge lifecycle", async () => {
   const { store } = setup();
   expect(store.snapshot(now)).toEqual({ available: true, localMemories: 0, pendingAnalysis: 0,
-    reviewPending: 0, gardenNodes: 0, syncPending: 0, retractions: 0 });
+    eligibleMemories: 0, excludedMemories: 0, reviewPending: 0, reviewRejected: 0,
+    gardenNodes: 0, syncPending: 0, retractions: 0 });
   store.enqueue("event", [source], now);
   expect(store.snapshot(now).pendingAnalysis).toBe(1);
   await store.analyse(async () => JSON.stringify([candidate]), now);
-  expect(store.snapshot(now)).toMatchObject({ localMemories: 1, pendingAnalysis: 0, reviewPending: 1, gardenNodes: 0, syncPending: 1 });
+  expect(store.snapshot(now)).toMatchObject({ localMemories: 1, eligibleMemories: 1, excludedMemories: 0,
+    pendingAnalysis: 0, reviewPending: 1, reviewRejected: 0, gardenNodes: 0, syncPending: 0 });
+  expect(store.snapshot(now, () => false)).toMatchObject({ localMemories: 1, eligibleMemories: 0,
+    excludedMemories: 1, reviewPending: 0, reviewRejected: 0, gardenNodes: 0, syncPending: 0 });
   await clear(store);
-  expect(store.snapshot(now).reviewPending).toBe(0);
+  expect(store.snapshot(now)).toMatchObject({ reviewPending: 0, reviewRejected: 0, syncPending: 1 });
   await store.sync(async () => published());
   expect(store.snapshot(now)).toMatchObject({ gardenNodes: 1, syncPending: 0 });
+});
+
+it("reports a fail-closed review as rejected rather than pending sync", async () => {
+  const { store } = setup(); store.enqueue("event", [source], now);
+  await store.analyse(async () => JSON.stringify([candidate]), now);
+  await clear(store, refuse);
+  expect(store.snapshot(now)).toMatchObject({ eligibleMemories: 1, reviewPending: 0,
+    reviewRejected: 1, gardenNodes: 0, syncPending: 0 });
 });
 
 it("extracts ordinary useful conversation, separates exact evidence, recalls by topic/scope, upserts across restart", async () => {

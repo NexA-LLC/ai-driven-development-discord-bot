@@ -143,18 +143,26 @@ export class ExperienceStore {
   }
   get available(): boolean { return this.state.available; }
   /** Non-sensitive operational counts for loopback readiness. */
-  snapshot(now = Date.now()): {
-    available: boolean; localMemories: number; pendingAnalysis: number; reviewPending: number;
+  snapshot(now = Date.now(), eligible: (memory: ExperienceMemory) => boolean = () => true): {
+    available: boolean; localMemories: number; eligibleMemories: number; excludedMemories: number;
+    pendingAnalysis: number; reviewPending: number; reviewRejected: number;
     gardenNodes: number; syncPending: number; retractions: number;
   } {
     const memories = this.state.value.memories.filter(m => m.expiresAt > now);
+    const eligibleMemories = memories.filter(eligible);
     return {
       available: this.available,
       localMemories: memories.length,
+      eligibleMemories: eligibleMemories.length,
+      excludedMemories: memories.length - eligibleMemories.length,
       pendingAnalysis: this.state.value.jobs.filter(j => !j.status.startsWith("success")).length,
-      reviewPending: memories.filter(m => m.publicReview === "pending" || m.publicReview === "not_run").length,
-      gardenNodes: memories.filter(m => !!m.gardenNodeId).length,
-      syncPending: memories.filter(m => m.syncedRevision < m.revision).length,
+      reviewPending: eligibleMemories.filter(m => m.publicReview === "pending" || m.publicReview === "not_run").length,
+      reviewRejected: eligibleMemories.filter(m => m.publicReview === "rejected").length,
+      gardenNodes: eligibleMemories.filter(m => !!m.gardenNodeId).length,
+      // A rejected or not-yet-reviewed memory is not queued for Garden sync. Calling it
+      // "pending" makes a healthy fail-closed decision look like an outage in readiness.
+      syncPending: eligibleMemories.filter(m => m.publicReview === "approved" && m.publicSummary !== null
+        && m.syncedRevision < m.revision).length,
       retractions: this.state.value.retractions.length,
     };
   }

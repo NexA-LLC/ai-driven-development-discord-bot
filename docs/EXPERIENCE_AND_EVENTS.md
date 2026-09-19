@@ -27,6 +27,8 @@ DecisionGarden 側の確定 contract は `update_memory_node({nodeId, expectedUp
 
 安全な具体性が残らない候補は、**定型文のGardenノードを作らずに同期をskipする**（`publicReview: "rejected"`）。ローカル記憶は会話の読み戻しには使う。LLMが不達・不正JSONのときは `not_run` / `pending` で保留し、「不明」を保存許可にはしない。記憶が更新されて revision が上がると clearance は無効になり、新しい本文で判定をやり直す。
 
+readiness の `reviewPending` / `reviewRejected` / `gardenNodes` / `syncPending` は、現在の `EXPERIENCE_KNOWLEDGE_CHANNEL_IDS` に含まれる記憶だけを数える。`syncPending` は安全審査を通過し、要約があり、まだ最新revisionを保存できていないものだけである。審査却下や対象外channelは同期待ちに見せず、`reviewRejected` / `excludedMemories` で区別する。
+
 限界として、敬称のない氏名や文脈依存の機微はコード側の正規表現では判定できず、LLM判定に依存する。コードが保証するのは「識別子を含まない」「原文の逐語コピーではない」「判定未了なら保存しない」「保存してもprivate Knowledgeのまま」までで、意味の安全性は判定モデルの精度に依存する。
 
 HTTP/MCP `isError`/`ok:false` は成功にしない。Worker は結果を `synced` / `update_unsupported`（サーバーが旧版）/ `not_permitted`（scope や Garden write 権限の不足）/ `conflict`（`updated_at_conflict` や `source_key_conflict`）/ `not_configured` / `failed` に区別して返し、Gateway はどれも成功扱いにしない。`update_unsupported` / `not_configured` / `not_permitted` は6時間、`conflict` は1時間、`failed` は15分保留して再試行する。`syncedRevision` が `revision` に追いついたときだけ同期済みとする。
