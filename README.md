@@ -146,6 +146,8 @@ Third-party Agent
 
 ## Local setup
 
+以下はローカル開発向けです。実サーバーで動かすまでの手順は [`docs/DEPLOY.md`](docs/DEPLOY.md) にまとめています。
+
 ```bash
 npm install
 cp .env.example .env
