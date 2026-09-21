@@ -17,7 +17,7 @@ import { readSlot, writeSlot } from "./schedule-state.js";
 import { lifecycle } from "./lifecycle.js";
 import { auditConversation } from "./conversation-audit.js";
 import { inbox, type InboxItem } from "./inbox.js";
-import { LlmReliability, LlmRequestError, llmHttpError, normalizeLlmError } from "./llm-reliability.js";
+import { ConsecutiveFailureGate, LlmReliability, LlmRequestError, llmHttpError, normalizeLlmError } from "./llm-reliability.js";
 import { completionText, type LlmCompletionBody } from "./llm-completion.js";
 import { searchWeb } from "./web-search.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
@@ -160,6 +160,8 @@ let sweepCursor = 0;
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
 const llmHealthProbeMs = readPositiveInteger("LLM_HEALTH_PROBE_SECONDS", 300) * 1_000;
+const llmHealthProbeFailureThreshold = readPositiveInteger("LLM_HEALTH_PROBE_FAILURE_THRESHOLD", 3);
+const llmHealthProbeFailures = new ConsecutiveFailureGate(llmHealthProbeFailureThreshold);
 
 const intents = [
   GatewayIntentBits.Guilds,
@@ -916,7 +918,8 @@ function startReadinessServer(): void {
     }
     const provider = llmReliability.snapshot();
     const active = lifecycle.active > 0;
-    const providerDegraded = modelPreflightError !== null || provider.state !== "healthy" || slowMentionIds.size > 0;
+    const providerDegraded = modelPreflightError !== null || provider.state !== "healthy" ||
+      slowMentionIds.size > 0 || llmHealthProbeFailures.count >= llmHealthProbeFailureThreshold;
     const body = {
       contract: "nexa.host.update.readiness/v1",
       decision: active ? "defer" : providerDegraded ? "degraded" : "ready",
@@ -929,7 +932,14 @@ function startReadinessServer(): void {
       reasonCode: active ? (slowMentionIds.size > 0 ? "llm_response_slow" : "active_work") : modelPreflightError ? "llm_model_unavailable" : providerDegraded ? "llm_degraded" : "idle",
       message: modelPreflightError ?? `${lifecycle.active} operations in progress`,
       activeWork: lifecycle.active,
-      llm: { ...provider, model: llmModel || null, preflightError: modelPreflightError, slowMentions: slowMentionIds.size },
+      llm: {
+        ...provider,
+        model: llmModel || null,
+        preflightError: modelPreflightError,
+        slowMentions: slowMentionIds.size,
+        consecutiveProbeFailures: llmHealthProbeFailures.count,
+        probeFailureThreshold: llmHealthProbeFailureThreshold,
+      },
       webSearch: {
         provider: "Google News RSS",
         scope: "news",
@@ -1156,6 +1166,10 @@ async function providerWatchForever(): Promise<void> {
             );
           }
           nextPeriodicProbeAt = Date.now() + llmHealthProbeMs;
+          const probeRecovery = llmHealthProbeFailures.recordSuccess();
+          if (probeRecovery.previousCount > 0) {
+            console.log(`LLM health probe succeeded; reset ${probeRecovery.previousCount} consecutive failure(s)`);
+          }
           await resolveIncidentImpl("llm_health_probe_failed");
           const requeued = inbox.requeueDeadLetters(20);
           if (requeued > 0) console.log(`LLM health probe recovered; requeued ${requeued} mention(s)`);
@@ -1166,12 +1180,24 @@ async function providerWatchForever(): Promise<void> {
           // state, not a fresh provider failure. The primary incident and its
           // recovery remain the single operator-visible lifecycle.
           if (!["circuit_open", "circuit_half_open", "queue_full"].includes(normalized.code)) {
-            await reportIncidentImpl(
-              "llm_health_probe_failed",
-              "error",
-              "スーのLLM実応答ヘルスチェックに失敗",
-              JSON.stringify({ model: llmModel || null, code: normalized.code, message: normalized.message, provider: llmReliability.snapshot() }),
+            const probeFailure = llmHealthProbeFailures.recordFailure();
+            console.warn(
+              `LLM health probe consecutive failure ${probeFailure.count}/${llmHealthProbeFailureThreshold}`,
             );
+            if (probeFailure.shouldOpen) {
+              await reportIncidentImpl(
+                "llm_health_probe_failed",
+                "error",
+                `スーのLLM実応答ヘルスチェックが${llmHealthProbeFailureThreshold}回連続で失敗`,
+                JSON.stringify({
+                  model: llmModel || null,
+                  code: normalized.code,
+                  message: normalized.message,
+                  consecutiveProbeFailures: probeFailure.count,
+                  provider: llmReliability.snapshot(),
+                }),
+              );
+            }
           }
         }
       }

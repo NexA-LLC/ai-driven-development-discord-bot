@@ -72,8 +72,10 @@ Model availability is not established by HTTP 200 alone. The configured model mu
 probe must produce non-empty final text after hidden reasoning is removed. The probe uses enough completion budget for a
 reasoning model; an empty `content`, even with `finish_reason=stop`, remains `empty_response` and cannot close the circuit or
 requeue dead letters. The same final-text validation applies to mentions, voice replies and experience analysis. The Gateway
-runs this real-generation probe on startup and every `LLM_HEALTH_PROBE_SECONDS` (default 300 seconds). Failures open
-`llm_health_probe_failed`; a later valid final answer resolves it and emits the normal one-time recovery notice. A healthy-state
+runs this real-generation probe on startup and every `LLM_HEALTH_PROBE_SECONDS` (default 300 seconds). A single slow probe is
+logged but does not open an operator incident. `llm_health_probe_failed` opens after
+`LLM_HEALTH_PROBE_FAILURE_THRESHOLD` consecutive failures (default 3); one valid final answer resets the counter, resolves any
+open incident, and emits the normal one-time recovery notice. A healthy-state
 periodic probe is independent of the production circuit, runs only while the Gateway LLM queue is idle, and cannot open that
 circuit by itself. While a circuit cooldown is already active, the watcher waits instead of reporting `circuit_open` as a new
 provider failure. After cooldown, one real final answer through the half-open circuit establishes recovery.

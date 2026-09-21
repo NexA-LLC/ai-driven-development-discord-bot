@@ -62,6 +62,31 @@ export interface LlmProbeOptions {
   timeoutMs?: number;
 }
 
+export class ConsecutiveFailureGate {
+  private failures = 0;
+
+  constructor(readonly threshold: number) {
+    if (!Number.isInteger(threshold) || threshold < 1) {
+      throw new Error("Consecutive failure threshold must be a positive integer");
+    }
+  }
+
+  get count(): number {
+    return this.failures;
+  }
+
+  recordFailure(): { count: number; shouldOpen: boolean } {
+    this.failures += 1;
+    return { count: this.failures, shouldOpen: this.failures === this.threshold };
+  }
+
+  recordSuccess(): { previousCount: number; wasOpen: boolean } {
+    const previousCount = this.failures;
+    this.failures = 0;
+    return { previousCount, wasOpen: previousCount >= this.threshold };
+  }
+}
+
 export interface LlmReliabilitySnapshot {
   state: LlmCircuitState;
   active: number;

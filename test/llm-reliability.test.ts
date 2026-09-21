@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LlmReliability, LlmRequestError } from "../src/gateway/llm-reliability.js";
+import { ConsecutiveFailureGate, LlmReliability, LlmRequestError } from "../src/gateway/llm-reliability.js";
 import { completionText } from "../src/gateway/llm-completion.js";
 
 function controller(overrides: Partial<ConstructorParameters<typeof LlmReliability>[0]> = {}) {
@@ -18,6 +18,20 @@ function controller(overrides: Partial<ConstructorParameters<typeof LlmReliabili
 }
 
 describe("LLM reliability controller", () => {
+  it("opens a probe incident only after three consecutive failures and resets on success", () => {
+    const gate = new ConsecutiveFailureGate(3);
+    expect(gate.recordFailure()).toEqual({ count: 1, shouldOpen: false });
+    expect(gate.recordFailure()).toEqual({ count: 2, shouldOpen: false });
+    expect(gate.recordSuccess()).toEqual({ previousCount: 2, wasOpen: false });
+    expect(gate.count).toBe(0);
+    expect(gate.recordFailure()).toEqual({ count: 1, shouldOpen: false });
+    expect(gate.recordFailure()).toEqual({ count: 2, shouldOpen: false });
+    expect(gate.recordFailure()).toEqual({ count: 3, shouldOpen: true });
+    expect(gate.recordFailure()).toEqual({ count: 4, shouldOpen: false });
+    expect(gate.recordSuccess()).toEqual({ previousCount: 4, wasOpen: true });
+    expect(gate.count).toBe(0);
+  });
+
   it("retries a transient failure within a bounded attempt count", async () => {
     const reliability = controller();
     let attempts = 0;
