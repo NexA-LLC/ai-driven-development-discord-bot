@@ -20,6 +20,10 @@ const event = (id: number, updatedAt: string | null = "2026-09-16T00:01:00Z") =>
   ended_at: "2026-09-20T21:00:00+09:00",
   updated_at: updatedAt,
 });
+const currentV2Event = (id: number, updatedAt: string | null = "2026-09-16T00:01:00Z") => {
+  const { event_id, event_url, ...rest } = event(id, updatedAt);
+  return { ...rest, id: event_id, url: event_url };
+};
 const api = (events: ReturnType<typeof event>[] = []) => JSON.stringify({
   results_start: 1,
   results_returned: events.length,
@@ -52,6 +56,18 @@ it("parses API v2 events, strips HTML, deduplicates, and keeps actual event date
   expect(eventReference(parsed)).toContain('"startedAt":"2026-09-20T19:00:00+09:00"');
   expect(parseConnpassEvents(api([event(2, null)]))[0]?.updatedAt).toBeNull();
   expect(parseConnpassEvents(api())).toEqual([]);
+});
+
+it("accepts the current connpass API v2 id and url field names", () => {
+  const liveShape = currentV2Event(407072);
+  const parsed = parseConnpassEvents(JSON.stringify({
+    results_start: 1,
+    results_returned: 1,
+    results_available: 1,
+    events: [liveShape],
+  }), now);
+  expect(parsed).toHaveLength(1);
+  expect(parsed[0]).toMatchObject({ id: "407072", url: "https://aid.connpass.com/event/407072/" });
 });
 
 it.each([

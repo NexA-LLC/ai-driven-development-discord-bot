@@ -62,11 +62,15 @@ const stateSchema = z.object({
 });
 
 const apiEventSchema = z.object({
-  event_id: z.number().int().positive(),
+  // Current connpass API v2 uses id/url. Keep the earlier names readable as
+  // well so a phased upstream rollout does not make the feed unavailable.
+  id: z.number().int().positive().optional(),
+  event_id: z.number().int().positive().optional(),
   title: z.string().max(1000),
   catch: z.string().max(10_000).nullable().optional(),
   description: z.string().max(500_000).nullable().optional(),
-  event_url: z.string().max(1000),
+  url: z.string().max(1000).optional(),
+  event_url: z.string().max(1000).optional(),
   started_at: z.string().max(100).nullable().optional(),
   ended_at: z.string().max(100).nullable().optional(),
   updated_at: z.string().max(100).nullable().optional(),
@@ -103,12 +107,15 @@ export function parseConnpassEvents(body: string, now = Date.now()): EventEntry[
   if (parsed.results_returned !== parsed.events.length || parsed.results_returned > parsed.results_available) throw new Error("Connpass API result counts are inconsistent");
   const entries: EventEntry[] = [];
   for (const event of parsed.events) {
-    const url = canonicalEventUrl(event.event_url);
+    const eventId = event.id ?? event.event_id;
+    const eventUrl = event.url ?? event.event_url;
+    if (!eventId || !eventUrl) throw new Error("Connpass API event identity missing");
+    const url = canonicalEventUrl(eventUrl);
     const title = plainText(event.title, 200);
-    if (!url || url !== `https://aid.connpass.com/event/${event.event_id}/` || !title) throw new Error("Invalid connpass API event");
-    if (entries.some(entry => entry.id === String(event.event_id) || entry.url === url)) continue;
+    if (!url || url !== `https://aid.connpass.com/event/${eventId}/` || !title) throw new Error("Invalid connpass API event");
+    if (entries.some(entry => entry.id === String(eventId) || entry.url === url)) continue;
     entries.push({
-      id: String(event.event_id),
+      id: String(eventId),
       url,
       title,
       summary: plainText([event.catch, event.description].filter(Boolean).join(" "), 1200),
