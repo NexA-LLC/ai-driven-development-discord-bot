@@ -56,6 +56,9 @@ musing/digest slots and successful quiz posts persist across restart to suppress
 same-slot repeats. Musing/digest completion slots now advance only after success;
 failures remain retryable. Event sends have a separate durable pending/unknown
 reservation to prevent resending an uncertain delivery. See EXPERIENCE_AND_EVENTS.md.
+Welcome jobs are stored before LLM generation, retried with bounded backoff and a
+deterministic Discord nonce, and fall back to a short static greeting after two
+generation failures. Startup/reconnect backfills only recent members lacking a receipt.
 
 The launchd label is `net.nex-a.su.gateway-managed`. Its SSH loopback entrypoint
 preserves the host's local-network permission workaround. A dedicated SSH identity
@@ -65,7 +68,7 @@ is a service-specific updater; NexA Host fleet inventory integration is separate
 Use loopback `/readiness` on the configured `READINESS_PORT` (202: 8791) to inspect `activeWork`, `draining`,
 `startupReady`, `queuedMessages`, `deadLetterMessages`, `llm`, `release` and `pid`. `llm` exposes the
 single-flight queue, circuit state, last success/failure and configured-model preflight result without prompt content.
-`connpass` exposes whether the six-hour public-event refresh is enabled, its last/next fetch time, failure count and cached entry count without exposing the API key or event text. Event milestone delivery receipts remain in the private Gateway state and suppress duplicate D-3, D-1 and event-day musings.
+`connpass` exposes whether the six-hour public-event refresh is enabled, its configured post channel, last/next fetch time, failure count and cached entry count without exposing the API key or event text. Event milestone delivery receipts remain in the private Gateway state and suppress duplicate D-3, D-1 and event-day musings. `welcome` exposes queue availability, pending/due/sent counts and the next retry time without member names or message text.
 `decision=degraded` means the process is alive but the provider is not ready for normal replies. Send SIGUSR2 to that PID for
 a graceful same-release restart. Never use `kill -9` for planned updates.
 
