@@ -413,11 +413,16 @@ export class ConnpassFeed {
 }
 
 export function eventConversationMaterial(moment: EventConversationMoment, hourJst: number): string {
-  const timing = moment.stage === "three_days_before" ? "開催3日前" : moment.stage === "one_day_before" ? "開催前日" : "開催当日（開始前）";
+  const timing = moment.stage === "three_days_before"
+    ? "開催3日前。本文に『3日後』と書く"
+    : moment.stage === "one_day_before"
+      ? "開催前日。本文に『明日』と書く"
+      : "開催当日（開始前）。本文に『本日』または『今日』と書く";
   return [
-    "公開イベントをきっかけにした、スー自身の自然な独り言を1〜3文で作る。イベント一覧やFAQ回答にはしない。",
-    `${timing}、JST ${hourJst}時ごろ。時期との距離感を自然に含めてもよい。`,
-    "タイトル・テーマから一つだけ気になった点や問いを話す。日時・会場・人数を羅列しない。参加した、準備を見た、誰かと話したとは言わない。",
+    "次の公開イベントについて、必要な事実が一目で分かる短い告知を作る。独り言や日記にはしない。",
+    `${timing}。現在はJST ${hourJst}時ごろ。`,
+    "正式なイベント名と開催日時を必ず書く。地域・会場は参照データにあれば書く。テーマや見どころは一つだけ短く添える。",
+    "告知を9割、スーらしい控えめな一言を1割にする。学校・授業・レジなど、参照データにない自分の行動や体験を作らない。",
     "本文にURLを入れない。URLは送信処理が出典として末尾に付ける。",
     eventReference([moment.event]),
   ].join("\n");

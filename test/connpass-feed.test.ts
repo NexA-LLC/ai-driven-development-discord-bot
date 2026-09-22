@@ -203,7 +203,11 @@ it("selects three-day, previous-day and event-day conversation moments once each
   await feed.refresh(vi.fn().mockResolvedValue(response(payload)), threeDaysBefore);
   const first = feed.selectConversationMoment(threeDaysBefore);
   expect(first).toMatchObject({ key: "10:three_days_before", stage: "three_days_before", daysUntil: 3 });
-  expect(eventConversationMaterial(first!, 12)).toContain("開催3日前");
+  const threeDayMaterial = eventConversationMaterial(first!, 12);
+  expect(threeDayMaterial).toContain("開催3日前。本文に『3日後』と書く");
+  expect(threeDayMaterial).toContain("正式なイベント名と開催日時を必ず書く");
+  expect(threeDayMaterial).toContain("告知を9割");
+  expect(threeDayMaterial).toContain("学校・授業・レジなど、参照データにない自分の行動や体験を作らない");
   expect(feed.reserveConversationMoment(first!.key, threeDaysBefore)).toBe(true);
   feed.deliveredConversationMoment(first!.key, "discord-3d");
   expect(feed.selectConversationMoment(threeDaysBefore)).toBeUndefined();
@@ -212,6 +216,7 @@ it("selects three-day, previous-day and event-day conversation moments once each
   await feed.refresh(vi.fn().mockResolvedValue(response(payload)), oneDayBefore);
   const second = feed.selectConversationMoment(oneDayBefore);
   expect(second).toMatchObject({ key: "10:one_day_before", stage: "one_day_before", daysUntil: 1 });
+  expect(eventConversationMaterial(second!, 12)).toContain("開催前日。本文に『明日』と書く");
   expect(feed.reserveConversationMoment(second!.key, oneDayBefore)).toBe(true);
   feed.deliveredConversationMoment(second!.key, "discord-1d");
 
@@ -219,6 +224,7 @@ it("selects three-day, previous-day and event-day conversation moments once each
   await feed.refresh(vi.fn().mockResolvedValue(response(payload)), eventDay);
   const third = feed.selectConversationMoment(eventDay);
   expect(third).toMatchObject({ key: "10:event_day", stage: "event_day", daysUntil: 0 });
+  expect(eventConversationMaterial(third!, 12)).toContain("開催当日（開始前）。本文に『本日』または『今日』と書く");
   expect(feed.reserveConversationMoment(third!.key, eventDay)).toBe(true);
   feed.deliveredConversationMoment(third!.key, "discord-day");
   expect(feed.selectConversationMoment(Date.parse("2026-09-20T11:00:01Z"))).toBeUndefined();
