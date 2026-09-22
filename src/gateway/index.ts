@@ -1201,7 +1201,7 @@ export async function postMusingImpl(
   }
   let sent: { id: string; text: string };
   if (eventMoment) {
-    const generated = await generateReply("musing", eventConversationMaterial(eventMoment, hourJst), "ja");
+    const generated = await generateReply("event_announcement", eventConversationMaterial(eventMoment, hourJst), "ja");
     const prose = generated.replace(/https?:\/\/\S+/g, "").trim().slice(0, 400);
     if (!prose) throw new Error("Empty event conversation");
     const content = `${prose}\n${eventMoment.event.url}`;
@@ -1590,7 +1590,7 @@ async function generateRawReply(
     max_tokens: 2_000,
   });
 
-  const background = event === "musing";
+  const background = event === "musing" || event === "event_announcement";
   return llmReliability.run(async ({ signal, requestId }) => {
     const response = await fetch(llmApiUrl, {
       method: "POST",

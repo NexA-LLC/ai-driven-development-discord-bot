@@ -99,11 +99,14 @@ it("refreshes connpass without injecting events into replies or non-milestone mu
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).not.toContain("public_event_reference");
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).not.toContain("407072");
 });
-it("turns a three-day event milestone into one sourced musing", async () => {
+it("turns a three-day event milestone into one sourced announcement", async () => {
   vi.setSystemTime(Date.parse("2026-09-17T03:00:00Z"));
   await gateway.experienceTick();
   await gateway.postMusingImpl(12, true);
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("開催3日前");
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("告知9、スーらしさ1");
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("独り言ではなく、告知を主役にする");
+  expect(JSON.stringify(mocks.requests.at(-1)?.messages)).not.toContain("昼は日本語学校、夕方は出勤前");
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("public_event_reference");
   expect(generalChannel.send.mock.calls.at(-1)?.[0].content).toContain("https://aid.connpass.com/event/407072/");
   expect(mocks.client.channels.fetch).toHaveBeenLastCalledWith("general");

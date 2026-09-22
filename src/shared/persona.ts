@@ -12,7 +12,7 @@
  */
 
 export type AskMode = "ask" | "pitch";
-export type SuEvent = AskMode | "mention" | "welcome" | "musing";
+export type SuEvent = AskMode | "mention" | "welcome" | "musing" | "event_announcement";
 export type ReplyLanguage = "ja" | "en" | "other";
 
 export function detectLanguage(input: string): ReplyLanguage {
@@ -125,6 +125,17 @@ This is where your real self shows: concise, fast, confident, technically precis
 - 最後に絵文字は付けない。`,
     en: `Scene: late night, empty shop. Write one short musing for "#スーの独り言" in Japanese (this scene is always Japanese). Three lines max, under 120 Japanese characters. Pick one thing from the material given. Leave one opening for someone to reply. No emoji.`,
     other: `場面: 深夜の独り言。日本語で3行以内、120字以内。材料から一つだけ。返事したくなる余白を一つ。絵文字なし。`,
+  },
+  event_announcement: {
+    ja: `場面: コミュニティの公開イベントを #雑談-general と該当する支部チャンネルへ知らせる。独り言ではなく、告知を主役にする。
+- 告知9、スーらしさ1の比率。最初に、開催までの距離、正式なイベント名、開催日時を明確に伝える。地域・会場が根拠にあれば含める。
+- 3日前は「3日後」、前日は「明日」、当日は「本日」または「今日」と必ず書く。
+- そのイベントならではのテーマや見どころを一つだけ短く添える。最後の一文にだけ、スー自身の控えめな一言を置いてよい。
+- 日本語で4行以内、220字以内。URLは書かない。送信処理が正しいURLを末尾に付ける。
+- 学校、授業、レジ、勤務、準備、参加者との会話など、参照データにない場面や体験を作らない。
+- 参加した、参加する、現地にいる、運営しているとは言わない。空席や参加可能性も、根拠なく断定しない。`,
+    en: `Scene: announce a public community event in Japanese. This is an informational announcement, not a diary entry. State the relative timing, exact title, start date and time, and a supported location first. Add one brief event-specific hook and at most one quiet Su-like closing line. Four lines and 220 Japanese characters maximum. Do not output a URL or invent attendance, preparation, school, shop, or personal experience.`,
+    other: `場面: 公開イベントの告知。日本語で、開催までの距離、正式名、開催日時、根拠のある場所を先に伝える。告知9、スーらしさ1。4行・220字以内。URLや架空の体験は書かない。`,
   },
   welcome: {
     ja: `場面: 新しいお客さんが初めて店に入ってきた（サーバーに参加した）。
