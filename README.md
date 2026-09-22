@@ -10,7 +10,7 @@ AI駆動開発コミュニティ（Discord）のための Discord App / Bot 基�
 
 「今日」「最新」「調べて」など時間依存の質問では、会話agentが `search_web` を選び、固定のGoogle News RSSから公開ニュースを検索できます。任意URLや記事本文は取得せず、最大5件の見出し・媒体・公開日時・Google News URLだけを非信頼の参照データとして渡します。回答には利用したURLを必ず示し、取得不能時は最新情報を推測しません。検索語は2〜160文字、鮮度は1〜30日、15秒timeout・2MiB・2回試行・5分cacheで制限し、秘密らしい値や個人識別情報はコード側でも拒否します。取得失敗は `web_search_failed` incident、次の成功は復帰通知になり、loopback readinessの `webSearch` で最終成功・失敗を確認できます。
 
-connpass API v2 からAI駆動開発グループ（`subdomain=aid`）のイベント一覧を取得し、話題に使えます。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`CONNPASS_ENABLED=true` で有効化します。既定は1時間ごとの取得・24時間のキャッシュ有効期限・イベント独り言1日1件です。初回は取り込みのみ。質問には取得済み情報と実際の開催日時を参照し、新着の独り言には出典URLを必ず添えます。`CONNPASS_POLL_SECONDS` / `CONNPASS_CACHE_HOURS` / `CONNPASS_DAILY_LIMIT` で調整できます。公開情報はスー自身の体験記憶には登録しません。
+connpass API v2 からAI駆動開発グループ（`subdomain=aid`）のイベント一覧を、将来の明示的なtool-callまたは独立したイベント配信処理のために取得・キャッシュできます。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`CONNPASS_ENABLED=true` で有効化します。取得済みイベントはスーのメンション返答や独り言へ自動注入せず、スーを定型的なイベント案内Botとして動かしません。`CONNPASS_POLL_SECONDS` / `CONNPASS_CACHE_HOURS` で取得を調整できます。公開情報はスー自身の体験記憶には登録しません。
 
 記憶は日付ではなく話題で束ねます。同じチャンネルで同じ話が続いた場合は新しいノードを作らず、同一 thread を根拠付きで更新し（`revision` が増え、以前の引用は履歴として残ります）、変化がなければ何も書きません。未解決の問いはTODOではなく knowledge として保持します。日次ダイジェストは廃止しました。
 
