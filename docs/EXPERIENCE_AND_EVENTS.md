@@ -61,11 +61,9 @@ Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻�
 
 ## connpass
 
-固定 `https://connpass.com/api/v2/events/?subdomain=aid&order=3&count=100` をGatewayが取得する。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`X-API-Key` headerだけで送る。キーをログやstateへ保存しない。`CONNPASS_ENABLED=false` が既定。poll既定3600秒、キャッシュ24時間、イベント独り言1日1件（JST）。失敗は最大8倍のbackoff。ETag/Last-Modifiedがあれば条件付きGET、304は既存cacheの再検証。失敗/空/未実行を区別する。
+固定 `https://connpass.com/api/v2/events/?subdomain=aid&order=3&count=100` をGatewayが取得する。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`X-API-Key` headerだけで送る。キーをログやstateへ保存しない。`CONNPASS_ENABLED=false` が既定。poll既定3600秒、キャッシュ24時間。失敗は最大8倍のbackoff。ETag/Last-Modifiedがあれば条件付きGET、304は既存cacheの再検証。失敗/空/未実行を区別する。
 
-初回は全件既読にし、過去イベントを投稿しない。その後、ID/正規URLが未見で、更新日時が初回取り込み以降かつ7日以内のeventだけが独り言候補。更新日時不明は自発投稿しない。取得済みeventは関連する質問には参照できる。APIの `started_at` / `ended_at` は開催日時、`updated_at` は更新日時として区別し、場所/参加経験を推測しない。
-
-イベント独り言の材料は公開entryと有限の一般的な興味だけで、私的な経験原文や人名を含めない。生成後にcanonical URLをコードで付ける。送信前にpendingを永続化し、成功receipt後だけspokenにする。明確な4xx拒否は再試行可能、timeout/5xx/再起動途中はunknown/pendingとして保留し、同じentryを自動再送しない。結果不明時の解除UIは未実装で、運営が実Discord receiptとファイルを照合するまで保留する。1日枠には当日の結果不明も含む。経験独り言も結果不明を7日保留して同じ話の連投を抑止する。
+取得済みeventはスーのメンション返答や独り言へ自動注入しない。特に「次のイベントは？」のような定型質問へ答えるイベント案内Botにはしない。イベント取得を利用するときは、明示的なtool-callまたはスーの会話人格から分離した配信処理として設計する。APIの `started_at` / `ended_at` は開催日時、`updated_at` は更新日時として区別し、場所/参加経験を推測しない。
 
 ## 導入と制限
 

@@ -7,7 +7,7 @@ import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agen
 import { readMentionedChannels } from "./channel-context.js";
 import { allowsConversationInChannel, conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
 import { ExperienceStore, experienceReference, type ExperienceMemory, type SyncOutcome } from "./experience-memory.js";
-import { ConnpassFeed, eventReference } from "./connpass-feed.js";
+import { ConnpassFeed } from "./connpass-feed.js";
 import { deliverMusing } from "./musing.js";
 import { publicExperience, publicExperienceBody } from "../shared/public-experience.js";
 import { startTyping } from "./typing.js";
@@ -206,8 +206,7 @@ let lastMusingSlot = readSlot("musing-slot");
 const botRateState = new Map<string, RateState>();
 const experiences = new ExperienceStore();
 const connpass = new ConnpassFeed(undefined, readPositiveInteger("CONNPASS_POLL_SECONDS", 3600) * 1000,
-  readPositiveInteger("CONNPASS_CACHE_HOURS", 24) * 3600_000, readPositiveInteger("CONNPASS_DAILY_LIMIT", 1),
-  process.env.CONNPASS_API_KEY?.trim() ?? "");
+  readPositiveInteger("CONNPASS_CACHE_HOURS", 24) * 3600_000, process.env.CONNPASS_API_KEY?.trim() ?? "");
 const connpassEnabled = readBoolean("CONNPASS_ENABLED", false);
 if (connpassEnabled && !process.env.CONNPASS_API_KEY?.trim()) console.warn("CONNPASS_ENABLED requires CONNPASS_API_KEY; event refreshes will fail until it is set");
 const experienceKnowledgeChannels = new Set([
@@ -551,8 +550,7 @@ export async function onMessageImpl(message: Message, recovery?: InboxItem): Pro
           return result?.context ? JSON.parse(result.context) : { status: result?.status ?? "参照できませんでした" };
         },
         event => auditConversation({ ...audit, phase: event.phase, ...(event.tool ? { tool: event.tool } : {}), ...(event.ok === undefined ? {} : { ok: event.ok }) }),
-        [conversationReference(context), experienceReference(await recallExperiences(message, prompt)),
-          ...(connpassEnabled ? [eventReference(connpass.reference(prompt))] : [])],
+        [conversationReference(context), experienceReference(await recallExperiences(message, prompt))],
       );
     } catch (error) {
       if (waitNoticeTimer) clearTimeout(waitNoticeTimer);
@@ -1056,7 +1054,6 @@ export async function postMusingImpl(
   const memories: ExperienceMemory[] = [];
   for (const memory of experiences.select(text.guildId, text.id, topic ?? "", true)) if (await verifyExperience(memory)) memories.push(memory);
   const sent = await deliverMusing({ background: material, memories, store: experiences,
-    ...(connpassEnabled && text.id === musingsChannelId && !topic ? { feed: connpass } : {}),
     generate: input => generateReply("musing", input, "ja"),
     send: content => text.send({ content, allowedMentions: { parse: [] } }) });
   await logReply({

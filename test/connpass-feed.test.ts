@@ -3,8 +3,6 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConnpassFeed, CONNPASS_API_URL, MAX_API_BYTES, parseConnpassEvents, eventReference } from "../src/gateway/connpass-feed.js";
-import { ExperienceStore } from "../src/gateway/experience-memory.js";
-import { deliverMusing } from "../src/gateway/musing.js";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -38,7 +36,7 @@ const response = (body: string) => new Response(body, { headers: {
 function setup(apiKey = "test-api-key") {
   const dir = mkdtempSync(join(tmpdir(), "su-feed-test-")); dirs.push(dir);
   const path = join(dir, "feed.json");
-  return { path, feed: new ConnpassFeed(path, undefined, undefined, undefined, apiKey), store: new ExperienceStore(join(dir, "memories.json")) };
+  return { path, feed: new ConnpassFeed(path, undefined, undefined, apiKey) };
 }
 
 it("parses API v2 events, strips HTML, deduplicates, and keeps actual event dates labelled", () => {
@@ -90,7 +88,6 @@ it("uses the fixed API query and key header, preserves cache on 304, and disting
     .mockResolvedValueOnce(response(api()));
   await feed.refresh(fetcher, now);
   expect(feed.status).toBe("ok");
-  expect(feed.select(now)).toBeUndefined();
   expect(fetcher.mock.calls[0]?.[0]).toBe(CONNPASS_API_URL);
   expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ redirect: "error", headers: {
     accept: "application/json",
@@ -151,66 +148,11 @@ it("migrates the existing Atom-backed cache without making the state unavailable
     seen: ["urn:1", "https://aid.connpass.com/event/1/"],
     spoken: [],
   }));
-  const migrated = new ConnpassFeed(path, undefined, undefined, undefined, "test-api-key");
+  const migrated = new ConnpassFeed(path, undefined, undefined, "test-api-key");
   expect(migrated.status).toBe("ok");
   expect(migrated.reference("connpassイベント", now)[0]).toMatchObject({
     startedAt: null,
     endedAt: null,
     updatedAt: "2026-09-15T01:00:00Z",
   });
-});
-
-it("suppresses first backfill across restart and sends only one new event per day with canonical URL", async () => {
-  const { path, feed, store } = setup();
-  await feed.refresh(vi.fn().mockResolvedValue(response(api([event(1)]))), now);
-  const restarted = new ConnpassFeed(path, undefined, undefined, undefined, "test-api-key");
-  await restarted.refresh(vi.fn().mockResolvedValue(response(api([event(1), event(2), event(3)]))), later);
-  const generate = vi.fn(async material => {
-    expect(material).toContain("public_event_reference");
-    expect(material).not.toContain("private-person");
-    return "AI開発の工夫、気になります。";
-  });
-  const send = vi.fn(async text => {
-    expect(restarted.delivery("https://aid.connpass.com/event/2/")).toBe("pending");
-    expect(text).toContain("https://aid.connpass.com/event/2/");
-    return { id: "discord-receipt" };
-  });
-  await deliverMusing({ background: "private-person", memories: [], feed: restarted, store, generate, send, now: later });
-  expect(restarted.delivery("https://aid.connpass.com/event/2/")).toBe("spoken");
-  expect(new ConnpassFeed(path, undefined, undefined, undefined, "test-api-key").select(later)).toBeUndefined();
-  expect(send).toHaveBeenCalledOnce();
-});
-
-it.each([true, false])("only definite rejection releases a send reservation (definite=%s)", async definite => {
-  const { feed, path, store } = setup();
-  await feed.refresh(vi.fn().mockResolvedValue(response(api())), now);
-  await feed.refresh(vi.fn().mockResolvedValue(response(api([event(2)]))), later);
-  const options = {
-    background: "",
-    memories: [],
-    feed,
-    store,
-    generate: async () => "気になる問い",
-    send: async () => { throw Object.assign(new Error("send failed"), { status: definite ? 403 : 503 }); },
-    now: later,
-  };
-  await expect(deliverMusing(options)).rejects.toThrow("send failed");
-  expect(new ConnpassFeed(path, undefined, undefined, undefined, "test-api-key").delivery("https://aid.connpass.com/event/2/")).toBe(definite ? "unspoken" : "unknown");
-  expect(!!new ConnpassFeed(path, undefined, undefined, undefined, "test-api-key").select(later)).toBe(definite);
-});
-
-it("generation failures never mark spoken and missing update dates never become new-event posts", async () => {
-  const { feed, store } = setup();
-  await feed.refresh(vi.fn().mockResolvedValue(response(api())), now);
-  await feed.refresh(vi.fn().mockResolvedValue(response(api([event(2), event(3, null)]))), later);
-  await expect(deliverMusing({
-    background: "",
-    memories: [],
-    feed,
-    store,
-    generate: async () => { throw new Error("LLM failed"); },
-    send: vi.fn(),
-    now: later,
-  })).rejects.toThrow();
-  expect(feed.delivery("https://aid.connpass.com/event/2/")).toBe("unspoken");
 });
