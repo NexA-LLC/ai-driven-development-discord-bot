@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ConnpassFeed, CONNPASS_API_URL, MAX_API_BYTES, parseConnpassEvents, eventReference } from "../src/gateway/connpass-feed.js";
+import { ConnpassFeed, CONNPASS_API_URL, MAX_API_BYTES, eventConversationMaterial, parseConnpassEvents, eventReference } from "../src/gateway/connpass-feed.js";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -189,4 +189,50 @@ it("migrates the existing Atom-backed cache without making the state unavailable
     endedAt: null,
     updatedAt: "2026-09-15T01:00:00Z",
   });
+});
+
+it("selects three-day, previous-day and event-day conversation moments once each", async () => {
+  const { feed } = setup();
+  const startsAt = "2026-09-20T19:00:00+09:00";
+  const payload = api([
+    { ...event(10), started_at: startsAt },
+    { ...event(11), title: "【中止】別のイベント", started_at: startsAt },
+  ]);
+
+  const threeDaysBefore = Date.parse("2026-09-17T03:00:00Z");
+  await feed.refresh(vi.fn().mockResolvedValue(response(payload)), threeDaysBefore);
+  const first = feed.selectConversationMoment(threeDaysBefore);
+  expect(first).toMatchObject({ key: "10:three_days_before", stage: "three_days_before", daysUntil: 3 });
+  expect(eventConversationMaterial(first!, 12)).toContain("開催3日前");
+  expect(feed.reserveConversationMoment(first!.key, threeDaysBefore)).toBe(true);
+  feed.deliveredConversationMoment(first!.key, "discord-3d");
+  expect(feed.selectConversationMoment(threeDaysBefore)).toBeUndefined();
+
+  const oneDayBefore = Date.parse("2026-09-19T03:00:00Z");
+  await feed.refresh(vi.fn().mockResolvedValue(response(payload)), oneDayBefore);
+  const second = feed.selectConversationMoment(oneDayBefore);
+  expect(second).toMatchObject({ key: "10:one_day_before", stage: "one_day_before", daysUntil: 1 });
+  expect(feed.reserveConversationMoment(second!.key, oneDayBefore)).toBe(true);
+  feed.deliveredConversationMoment(second!.key, "discord-1d");
+
+  const eventDay = Date.parse("2026-09-20T03:00:00Z");
+  await feed.refresh(vi.fn().mockResolvedValue(response(payload)), eventDay);
+  const third = feed.selectConversationMoment(eventDay);
+  expect(third).toMatchObject({ key: "10:event_day", stage: "event_day", daysUntil: 0 });
+  expect(feed.reserveConversationMoment(third!.key, eventDay)).toBe(true);
+  feed.deliveredConversationMoment(third!.key, "discord-day");
+  expect(feed.selectConversationMoment(Date.parse("2026-09-20T11:00:01Z"))).toBeUndefined();
+});
+
+it("releases a definitely failed event post but holds an ambiguous send", async () => {
+  const { feed } = setup();
+  const at = Date.parse("2026-09-17T03:00:00Z");
+  await feed.refresh(vi.fn().mockResolvedValue(response(api([{ ...event(20), started_at: "2026-09-20T19:00:00+09:00" }]))), at);
+  const moment = feed.selectConversationMoment(at)!;
+  expect(feed.reserveConversationMoment(moment.key, at)).toBe(true);
+  feed.failedConversationMoment(moment.key, true);
+  expect(feed.selectConversationMoment(at)?.key).toBe(moment.key);
+  expect(feed.reserveConversationMoment(moment.key, at)).toBe(true);
+  feed.failedConversationMoment(moment.key, false);
+  expect(feed.selectConversationMoment(at)).toBeUndefined();
 });
