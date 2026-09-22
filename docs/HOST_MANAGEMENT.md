@@ -68,7 +68,7 @@ is a service-specific updater; NexA Host fleet inventory integration is separate
 Use loopback `/readiness` on the configured `READINESS_PORT` (202: 8791) to inspect `activeWork`, `draining`,
 `startupReady`, `queuedMessages`, `deadLetterMessages`, `llm`, `release` and `pid`. `llm` exposes the
 single-flight queue, circuit state, last success/failure and configured-model preflight result without prompt content.
-`connpass` exposes whether the six-hour public-event refresh is enabled, its configured post channel, last/next fetch time, failure count and cached entry count without exposing the API key or event text. Event milestone delivery receipts remain in the private Gateway state and suppress duplicate D-3, D-1 and event-day musings. `welcome` exposes queue availability, pending/due/sent counts and the next retry time without member names or message text.
+`connpass` exposes whether the six-hour public-event refresh is enabled, its configured general post channel, last/next fetch time, failure count, cached entry count and pending regional copies without exposing the API key or event text. Event milestone and regional delivery receipts remain in the private Gateway state and suppress duplicate D-3, D-1 and event-day posts. `welcome` exposes queue availability, pending/due/sent counts and the next retry time without member names or message text.
 `decision=degraded` means the process is alive but the provider is not ready for normal replies. Send SIGUSR2 to that PID for
 a graceful same-release restart. Never use `kill -9` for planned updates.
 

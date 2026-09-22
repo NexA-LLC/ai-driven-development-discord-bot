@@ -37,6 +37,17 @@ export interface EventConversationMoment {
   daysUntil: 3 | 1 | 0;
   event: EventEntry;
 }
+export interface EventConversationCopy {
+  key: string;
+  momentKey: string;
+  channelId: string;
+  content: string;
+  status: "pending" | "posted";
+  attempts: number;
+  createdAt: number;
+  nextAttemptAt: number;
+  messageId: string | null;
+}
 
 const legacyTrackedSchema = z.object({
   id: z.string().max(1000),
@@ -78,6 +89,19 @@ const conversationMomentReceiptSchema = z.object({
   attemptAt: z.number(),
   messageId: z.string().max(1000).nullable(),
 });
+const conversationCopySchema = z.object({
+  key: z.string().max(2200),
+  momentKey: z.string().max(1200),
+  channelId: z.string().max(1000),
+  content: z.string().max(1900),
+  status: z.enum(["pending", "posted"]),
+  attempts: z.number().int().nonnegative(),
+  createdAt: z.number().int().nonnegative(),
+  nextAttemptAt: z.number().int().nonnegative(),
+  lastAttemptAt: z.number().int().nonnegative().nullable(),
+  messageId: z.string().max(1000).nullable(),
+  lastError: z.string().max(500).nullable(),
+});
 const stateSchema = z.object({
   checkedAt: z.number(),
   nextFetchAt: z.number(),
@@ -87,6 +111,7 @@ const stateSchema = z.object({
   status: z.enum(["not_run", "ok", "empty", "failed"]),
   entries: z.array(trackedSchema).max(100),
   conversationMoments: z.array(conversationMomentReceiptSchema).max(500).default([]),
+  conversationCopies: z.array(conversationCopySchema).max(1000).default([]),
 });
 
 const apiEventSchema = z.object({
@@ -168,6 +193,13 @@ function conversationStage(daysUntil: number): { stage: EventConversationStage; 
   return null;
 }
 
+const copyRetryDelay = (attempts: number): number => {
+  if (attempts <= 1) return 60_000;
+  if (attempts === 2) return 5 * 60_000;
+  if (attempts === 3) return 15 * 60_000;
+  return 6 * 3600_000;
+};
+
 /** Parse the bounded connpass API response and retain only the fixed aid.connpass.com group. */
 export function parseConnpassEvents(body: string, now = Date.now()): EventEntry[] {
   if (Buffer.byteLength(body) > MAX_API_BYTES) throw new Error("Connpass API response too large");
@@ -237,11 +269,11 @@ export class ConnpassFeed {
     private cacheMs = 24 * 3600_000,
     private apiKey = process.env.CONNPASS_API_KEY?.trim() ?? "",
   ) {
-    this.state = new DurableState(path, stateSchema, { checkedAt: 0, nextFetchAt: 0, failures: 0, etag: "", lastModified: "", status: "not_run", entries: [], conversationMoments: [] });
+    this.state = new DurableState(path, stateSchema, { checkedAt: 0, nextFetchAt: 0, failures: 0, etag: "", lastModified: "", status: "not_run", entries: [], conversationMoments: [], conversationCopies: [] });
   }
   get status(): string { return this.state.available ? this.state.value.status : "unavailable"; }
-  snapshot(): { status: string; checkedAt: string | null; nextFetchAt: string | null; failures: number; entries: number } {
-    if (!this.state.available) return { status: "unavailable", checkedAt: null, nextFetchAt: null, failures: 0, entries: 0 };
+  snapshot(): { status: string; checkedAt: string | null; nextFetchAt: string | null; failures: number; entries: number; pendingCopies: number } {
+    if (!this.state.available) return { status: "unavailable", checkedAt: null, nextFetchAt: null, failures: 0, entries: 0, pendingCopies: 0 };
     const s = this.state.value;
     return {
       status: s.status,
@@ -249,6 +281,7 @@ export class ConnpassFeed {
       nextFetchAt: s.nextFetchAt ? new Date(s.nextFetchAt).toISOString() : null,
       failures: s.failures,
       entries: s.entries.length,
+      pendingCopies: s.conversationCopies.filter(copy => copy.status === "pending").length,
     };
   }
   async refresh(fetcher: typeof fetch = fetch, now = Date.now()): Promise<void> {
@@ -327,6 +360,54 @@ export class ConnpassFeed {
     if (index < 0) return;
     if (definitelyNotSent) this.state.value.conversationMoments.splice(index, 1);
     else this.state.value.conversationMoments[index]!.status = "unknown";
+    this.state.save();
+  }
+  queueConversationCopy(momentKey: string, channelId: string, content: string, now = Date.now()): boolean {
+    if (!this.state.available) return false;
+    const key = `${momentKey}:${channelId}`;
+    if (this.state.value.conversationCopies.some(copy => copy.key === key)) return false;
+    this.state.value.conversationCopies.push({
+      key, momentKey, channelId, content: content.slice(0, 1900), status: "pending",
+      attempts: 0, createdAt: now, nextAttemptAt: now, lastAttemptAt: null,
+      messageId: null, lastError: null,
+    });
+    this.state.value.conversationCopies = this.state.value.conversationCopies.slice(-1000);
+    this.state.save();
+    return true;
+  }
+  dueConversationCopies(now = Date.now(), limit = 5): EventConversationCopy[] {
+    if (!this.state.available) return [];
+    return this.state.value.conversationCopies
+      .filter(copy => copy.status === "pending" && copy.nextAttemptAt <= now)
+      .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || a.createdAt - b.createdAt)
+      .slice(0, limit)
+      .map(copy => ({
+        key: copy.key, momentKey: copy.momentKey, channelId: copy.channelId,
+        content: copy.content, status: copy.status, attempts: copy.attempts,
+        createdAt: copy.createdAt, nextAttemptAt: copy.nextAttemptAt, messageId: copy.messageId,
+      }));
+  }
+  beginConversationCopyAttempt(key: string, now = Date.now()): number {
+    const copy = this.state.value.conversationCopies.find(item => item.key === key && item.status === "pending");
+    if (!copy) throw new Error("Event conversation copy is not pending");
+    copy.attempts++;
+    copy.lastAttemptAt = now;
+    this.state.save();
+    return copy.attempts;
+  }
+  deferConversationCopy(key: string, error: string, now = Date.now()): void {
+    const copy = this.state.value.conversationCopies.find(item => item.key === key && item.status === "pending");
+    if (!copy) return;
+    copy.lastError = error.slice(0, 500);
+    copy.nextAttemptAt = now + copyRetryDelay(copy.attempts);
+    this.state.save();
+  }
+  deliveredConversationCopy(key: string, messageId: string): void {
+    const copy = this.state.value.conversationCopies.find(item => item.key === key && item.status === "pending");
+    if (!copy) return;
+    copy.status = "posted";
+    copy.messageId = messageId;
+    copy.lastError = null;
     this.state.save();
   }
 }
