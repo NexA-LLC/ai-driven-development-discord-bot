@@ -8,6 +8,7 @@ import { readMentionedChannels } from "./channel-context.js";
 import { allowsConversationInChannel, conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
 import { ExperienceStore, experienceReference, type ExperienceMemory, type SyncOutcome } from "./experience-memory.js";
 import { ConnpassFeed, eventConversationMaterial } from "./connpass-feed.js";
+import { WelcomeQueue, fallbackWelcome, type WelcomeJob } from "./welcome-queue.js";
 import { deliverMusing } from "./musing.js";
 import { publicExperience, publicExperienceBody } from "../shared/public-experience.js";
 import { startTyping } from "./typing.js";
@@ -29,6 +30,7 @@ import {
   GatewayIntentBits,
   Partials,
   PermissionFlagsBits,
+  type GuildMember,
   type Message,
   type TextChannel,
 } from "discord.js";
@@ -124,13 +126,16 @@ if (passiveObserve && monitoredChannelIds.size === 0) {
 }
 
 const welcomeChannelId = process.env.WELCOME_CHANNEL_ID?.trim() || "";
+const welcomeBackfillHours = readPositiveInteger("WELCOME_BACKFILL_HOURS", 24);
 // Operator channel (店長室) and musings channel (スーの独り言). Resolved by id,
 // else by name inside the primary guild, else created (needs Manage Channels).
 const primaryGuildId = process.env.DISCORD_GUILD_ID?.trim() || "";
 let opsChannelId = process.env.OPS_CHANNEL_ID?.trim() || "";
 let musingsChannelId = process.env.MUSINGS_CHANNEL_ID?.trim() || "";
+let eventPostChannelId = process.env.EVENT_POST_CHANNEL_ID?.trim() || "";
 const opsChannelName = process.env.OPS_CHANNEL_NAME?.trim() || "店長室";
 const musingsChannelName = process.env.MUSINGS_CHANNEL_NAME?.trim() || "スーの独り言";
+const eventPostChannelName = process.env.EVENT_POST_CHANNEL_NAME?.trim() || "雑談-general";
 // Hours (JST) at which スー posts one musing each. The local LLM is free, so
 // several a day are fine; each hour gets time-of-day material.
 const musingsHoursJst = (process.env.MUSINGS_HOURS_JST ?? process.env.MUSINGS_HOUR_JST ?? "7,12,18,23")
@@ -205,6 +210,7 @@ const slowMentionIds = new Set<string>();
 let lastMusingSlot = readSlot("musing-slot");
 const botRateState = new Map<string, RateState>();
 const experiences = new ExperienceStore();
+const welcomeQueue = new WelcomeQueue();
 const connpassPollSeconds = readPositiveInteger("CONNPASS_POLL_SECONDS", 21_600);
 const connpass = new ConnpassFeed(undefined, connpassPollSeconds * 1000,
   readPositiveInteger("CONNPASS_CACHE_HOURS", 24) * 3600_000, process.env.CONNPASS_API_KEY?.trim() ?? "");
@@ -236,6 +242,11 @@ client.once(Events.ClientReady, async (readyClient) => {
   setInterval(() => { if (client.isReady() && !lifecycle.draining) inbox.heartbeat(); }, 5000);
   void maintenanceForever();
   void experienceForever();
+  void welcomeForever();
+  backfillRecentWelcomes().catch(async (error) => {
+    console.error("welcome backfill failed", error);
+    await reportIncident("welcome_failed", "warning", "新規参加者の補完に失敗", String(error));
+  });
   if (llmApiUrl) {
     void pollJobsForever();
     void museForever();
@@ -262,6 +273,7 @@ client.on(Events.ShardDisconnect, (event) => {
 client.on(Events.ShardResume, () => {
   console.log("discord shard resumed");
   void resolveIncident("discord_disconnected");
+  void backfillRecentWelcomes().catch((error) => console.error("welcome resume backfill failed", error));
 });
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => lifecycle.run(async () => {
@@ -292,55 +304,116 @@ client.on(Events.GuildMemberAdd, async (member) => lifecycle.run(async () => {
   if (!welcomeChannelId || member.user.bot || (primaryGuildId && member.guild.id !== primaryGuildId)) {
     return;
   }
-  const slot = `welcome-${member.guild.id}-${member.id}`;
-  const joined = String(member.joinedTimestamp ?? "unknown");
-  if (welcomeInProgress.has(slot) || readSlot(slot) === joined) return;
-  welcomeInProgress.add(slot);
+  enqueueWelcome(member);
+  void processWelcomeQueue();
+}));
+
+function welcomeSlot(guildId: string, memberId: string): string {
+  return `welcome-${guildId}-${memberId}`;
+}
+
+function enqueueWelcome(member: GuildMember): boolean {
+  const joinedAt = member.joinedTimestamp ?? Date.now();
+  if (readSlot(welcomeSlot(member.guild.id, member.id)) === String(joinedAt)) return false;
+  return welcomeQueue.enqueue(member.guild.id, member.id, joinedAt);
+}
+
+async function deliverWelcome(job: WelcomeJob): Promise<void> {
+  const slot = welcomeSlot(job.guildId, job.memberId);
+  if (readSlot(slot) === String(job.joinedAt)) {
+    welcomeQueue.skipped(job.key, "existing receipt");
+    return;
+  }
+  const attempt = welcomeQueue.beginAttempt(job.key);
   try {
-    const name = member.displayName || member.user.username;
-    const text = await generateReply(
-      "welcome",
-      `新しいお客さんの名前: ${name}`,
-      detectLanguage(name) === "ja" ? "ja" : "en",
-    );
-    const channel = await client.channels.fetch(welcomeChannelId);
-    const sendable = channel as
-      | {
-          send?: (options: {
-            content: string;
-            allowedMentions: { users: string[]; parse: [] };
-            nonce: string;
-            enforceNonce: boolean;
-          }) => Promise<unknown>;
-        }
-      | null;
-    if (typeof sendable?.send !== "function") {
-      console.warn("WELCOME_CHANNEL_ID is not sendable");
+    const guild = await client.guilds.fetch(job.guildId);
+    const member = await guild.members.fetch(job.memberId);
+    if (member.user.bot) {
+      welcomeQueue.skipped(job.key, "bot member");
       return;
     }
-    const sent = (await sendable.send({
-      content: `<@${member.id}> ${truncate(text, 1_800)}`,
+    const name = member.displayName || member.user.username;
+    const language = detectLanguage(name) === "ja" ? "ja" : "en";
+    let text = job.content;
+    if (!text) {
+      text = attempt <= 2
+        ? await generateReply("welcome", `新しいお客さんの名前: ${name}`, language)
+        : fallbackWelcome(name, language);
+      text = truncate(text, 1_800);
+      if (!text) throw new Error("Empty welcome");
+      welcomeQueue.rememberContent(job.key, text);
+    }
+    const channel = await client.channels.fetch(welcomeChannelId);
+    const sendable = channel as
+      | { send?: (options: { content: string; allowedMentions: { users: string[]; parse: [] }; nonce: string; enforceNonce: boolean }) => Promise<{ id?: string }> }
+      | null;
+    if (typeof sendable?.send !== "function") throw new Error("WELCOME_CHANNEL_ID is not sendable");
+    const sent = await sendable.send({
+      content: `<@${member.id}> ${text}`,
       allowedMentions: { users: [member.id], parse: [] },
-      nonce: createHmac("sha256", "welcome").update(`${slot}:${joined}`).digest("hex").slice(0, 24),
+      nonce: createHmac("sha256", "welcome").update(job.key).digest("hex").slice(0, 24),
       enforceNonce: true,
-    })) as { id?: string } | undefined;
-    writeSlot(slot, joined);
-    await logReply({
-      event: "welcome",
-      guildId: member.guild.id,
-      channelId: welcomeChannelId,
-      messageId: sent?.id,
-      requesterUserId: member.id,
-      replyText: text,
     });
-    await resolveIncidentImpl("welcome_failed");
+    if (!sent?.id) throw new Error("Welcome delivery receipt missing");
+    writeSlot(slot, String(job.joinedAt));
+    welcomeQueue.sent(job.key, sent.id);
+    try {
+      await logReply({
+        event: "welcome",
+        guildId: job.guildId,
+        channelId: welcomeChannelId,
+        messageId: sent.id,
+        requesterUserId: job.memberId,
+        replyText: text,
+      });
+      await resolveIncidentImpl("welcome_failed");
+    } catch (error) {
+      console.error("welcome post-delivery bookkeeping failed", error);
+    }
   } catch (error) {
-    console.error("welcome failed", error);
-    await reportIncident("welcome_failed", "warning", "新規参加者への挨拶に失敗", String(error));
-  } finally {
-    welcomeInProgress.delete(slot);
+    const code = (error as { code?: unknown }).code;
+    if (code === 10007) {
+      welcomeQueue.skipped(job.key, "member no longer in guild");
+      return;
+    }
+    welcomeQueue.defer(job.key, String(error));
+    console.error(`welcome attempt ${attempt} failed`, error);
+    await reportIncident("welcome_failed", "warning", "新規参加者への挨拶に失敗", `attempt=${attempt} ${String(error)}`);
   }
-}));
+}
+
+async function processWelcomeQueue(): Promise<void> {
+  for (const job of welcomeQueue.due()) {
+    if (welcomeInProgress.has(job.key) || lifecycle.draining) continue;
+    welcomeInProgress.add(job.key);
+    try { await lifecycle.run(() => deliverWelcome(job)); }
+    catch (error) { console.error("welcome queue processing failed", error); }
+    finally { welcomeInProgress.delete(job.key); }
+  }
+}
+
+async function welcomeForever(): Promise<void> {
+  for (;;) {
+    if (!lifecycle.draining) {
+      try { await processWelcomeQueue(); }
+      catch (error) { console.error("welcome queue tick failed", error); }
+    }
+    await sleep(15_000);
+  }
+}
+
+async function backfillRecentWelcomes(): Promise<void> {
+  if (!welcomeChannelId || !primaryGuildId || !welcomeQueue.available) return;
+  const guild = await client.guilds.fetch(primaryGuildId);
+  const members = await guild.members.fetch();
+  const cutoff = Date.now() - welcomeBackfillHours * 3600_000;
+  let queued = 0;
+  for (const member of members.values()) {
+    if (!member.user.bot && member.joinedTimestamp && member.joinedTimestamp >= cutoff && enqueueWelcome(member)) queued++;
+  }
+  if (queued) console.log(`welcome backfill queued=${queued} hours=${welcomeBackfillHours}`);
+  await processWelcomeQueue();
+}
 
 client.on(Events.MessageCreate, async (message) => {
   try {
@@ -905,7 +978,9 @@ async function resolveOperatorChannels(): Promise<void> {
     }
     musingsChannelId = musings.id;
   }
-  console.log(`channels: ops=${opsChannelId} musings=${musingsChannelId}`);
+  if (!eventPostChannelId) eventPostChannelId = findByName(eventPostChannelName)?.id ?? "";
+  if (!eventPostChannelId) console.warn(`event post channel #${eventPostChannelName} is unavailable`);
+  console.log(`channels: ops=${opsChannelId} musings=${musingsChannelId} events=${eventPostChannelId || "disabled"}`);
 }
 
 /** nexa.host.update.readiness/v1 on loopback, for the NexA Host runtime. */
@@ -946,7 +1021,8 @@ function startReadinessServer(): void {
         lastFailureAt: lastWebSearchFailureAt,
         lastFailureStatus: lastWebSearchFailureStatus,
       },
-      connpass: { enabled: connpassEnabled, pollSeconds: connpassPollSeconds, ...connpass.snapshot() },
+      connpass: { enabled: connpassEnabled, pollSeconds: connpassPollSeconds, postChannelId: eventPostChannelId || null, ...connpass.snapshot() },
+      welcome: welcomeQueue.snapshot(),
       knowledge: {
         ...experiences.snapshot(Date.now(), knowledgeChannel),
         configuredChannels: experienceKnowledgeChannels.size,
@@ -1030,14 +1106,18 @@ export async function postMusingImpl(
   topic?: string,
   channelId: string = musingsChannelId,
 ): Promise<void> {
-  const channel = await client.channels.fetch(channelId);
+  const startedAt = Date.now();
+  const eventMoment = connpassEnabled && !topic && channelId === musingsChannelId && eventPostChannelId
+    ? connpass.selectConversationMoment(startedAt) : undefined;
+  const targetChannelId = eventMoment ? eventPostChannelId : channelId;
+  const channel = await client.channels.fetch(targetChannelId);
   const text = channel as TextChannel | null;
   if (!text || text.type !== ChannelType.GuildText) {
     throw new Error("Musing channel unavailable");
   }
   if (primaryGuildId && text.guildId !== primaryGuildId) throw new Error("Musing guild is not allowed");
   // Do not post twice in the same slot if the process restarted after posting.
-  if (!force) {
+  if (!force && !eventMoment) {
     const recent = await text.messages.fetch({ limit: 3 });
     const tooSoon = recent.some(
       (m) => m.author.id === client.user?.id && Date.now() - m.createdTimestamp < 2 * 60 * 60 * 1_000,
@@ -1052,9 +1132,6 @@ export async function postMusingImpl(
     timeOfDayMaterial(hourJst),
     ...(topic ? [`頼まれた話題（これを材料にする）: ${topic}`] : []),
   ].join("\n");
-  const startedAt = Date.now();
-  const eventMoment = connpassEnabled && !topic && text.id === musingsChannelId
-    ? connpass.selectConversationMoment(startedAt) : undefined;
   const memories: ExperienceMemory[] = [];
   if (!eventMoment) for (const memory of experiences.select(text.guildId, text.id, topic ?? "", true)) {
     if (await verifyExperience(memory)) memories.push(memory);

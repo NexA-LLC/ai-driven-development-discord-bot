@@ -17,6 +17,7 @@ const channel: any = { id: "channel", guildId: "guild", type: 0, permissionsFor:
   guild: { roles: { everyone: { id: "everyone" } } }, permissionOverwrites: { cache: { some: () => false } },
   messages: { fetch: vi.fn(async id => { if (typeof id !== "string") return new Map(); if (!rows.has(id)) throw Object.assign(new Error("missing"), { code: 10008 }); return rows.get(id); }) },
   send: vi.fn(async () => ({ id: "musing-receipt" })) };
+const generalChannel: any = { ...channel, id: "general", send: vi.fn(async () => ({ id: "general-receipt" })) };
 function message(id: string, content: string, author = "human", reference?: string, mentioned = false): Message {
   const result = { id, content, guildId: "guild", channelId: "channel", createdTimestamp: now - 1000, createdAt: new Date(now - 1000),
     author: { id: author, bot: author === "su" || author === "another-bot" }, client: mocks.client,
@@ -28,8 +29,8 @@ function message(id: string, content: string, author = "human", reference?: stri
 const dir = mkdtempSync(join(tmpdir(), "su-gateway-flow-"));
 beforeAll(async () => {
   vi.useFakeTimers(); vi.setSystemTime(now);
-  for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test", INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel", LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "true", CONNPASS_API_KEY: "connpass-fixture", MUSE_ON_START: "false", EXPERIENCE_KNOWLEDGE_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
-  mocks.client.channels.fetch.mockResolvedValue(channel);
+  for (const [key, value] of Object.entries({ SU_STATE_DIR: dir, DISCORD_BOT_TOKEN: "fixture", WORKER_INTERNAL_URL: "https://worker.test", INTERNAL_SHARED_SECRET: "fixture", DISCORD_GUILD_ID: "guild", MONITORED_CHANNEL_IDS: "channel", MUSINGS_CHANNEL_ID: "channel", EVENT_POST_CHANNEL_ID: "general", LLM_API_URL: "https://llm.test/chat", CONNPASS_ENABLED: "true", CONNPASS_API_KEY: "connpass-fixture", MUSE_ON_START: "false", EXPERIENCE_KNOWLEDGE_CHANNEL_IDS: "channel" })) vi.stubEnv(key, value);
+  mocks.client.channels.fetch.mockImplementation(async id => id === "general" ? generalChannel : channel);
   vi.stubGlobal("fetch", vi.fn(async (url: string | URL, options: RequestInit) => {
     if (String(url).includes("connpass.com/api/v2/events")) {
       expect((options.headers as Record<string, string>)["x-api-key"]).toBe("connpass-fixture");
@@ -104,7 +105,8 @@ it("turns a three-day event milestone into one sourced musing", async () => {
   await gateway.postMusingImpl(12, true);
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("開催3日前");
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).toContain("public_event_reference");
-  expect(channel.send.mock.calls.at(-1)?.[0].content).toContain("https://aid.connpass.com/event/407072/");
+  expect(generalChannel.send.mock.calls.at(-1)?.[0].content).toContain("https://aid.connpass.com/event/407072/");
+  expect(mocks.client.channels.fetch).toHaveBeenLastCalledWith("general");
   await gateway.onMessageImpl(message("event-question-after-musing", "次のイベントは？", "human", undefined, true));
   expect(JSON.stringify(mocks.requests.at(-1)?.messages)).not.toContain("public_event_reference");
 });
