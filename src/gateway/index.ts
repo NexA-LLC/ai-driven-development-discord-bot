@@ -7,7 +7,8 @@ import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agen
 import { readMentionedChannels } from "./channel-context.js";
 import { allowsConversationInChannel, conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
 import { ExperienceStore, experienceReference, type ExperienceMemory, type SyncOutcome } from "./experience-memory.js";
-import { ConnpassFeed, eventConversationMaterial } from "./connpass-feed.js";
+import { ConnpassFeed, eventConversationMaterial, type EventConversationCopy } from "./connpass-feed.js";
+import { EVENT_BRANCH_DEFINITIONS, matchEventBranchChannel, type EventBranchChannel } from "./event-channel-routing.js";
 import { WelcomeQueue, fallbackWelcome, type WelcomeJob } from "./welcome-queue.js";
 import { deliverMusing } from "./musing.js";
 import { publicExperience, publicExperienceBody } from "../shared/public-experience.js";
@@ -136,6 +137,7 @@ let eventPostChannelId = process.env.EVENT_POST_CHANNEL_ID?.trim() || "";
 const opsChannelName = process.env.OPS_CHANNEL_NAME?.trim() || "店長室";
 const musingsChannelName = process.env.MUSINGS_CHANNEL_NAME?.trim() || "スーの独り言";
 const eventPostChannelName = process.env.EVENT_POST_CHANNEL_NAME?.trim() || "雑談-general";
+const eventBranchChannels: EventBranchChannel[] = [];
 // Hours (JST) at which スー posts one musing each. The local LLM is free, so
 // several a day are fine; each hour gets time-of-day material.
 const musingsHoursJst = (process.env.MUSINGS_HOURS_JST ?? process.env.MUSINGS_HOUR_JST ?? "7,12,18,23")
@@ -844,6 +846,7 @@ export async function experienceTick(): Promise<void> {
   experiences.prune();
   await sweepDeletedEvidence();
   if (connpassEnabled) await connpass.refresh();
+  await deliverEventConversationCopies();
   await experiences.analyse(llmApiUrl ? experienceLlm : undefined);
   // Knowledge review runs before sync, and only for memories from an explicitly allowed source channel.
   await experiences.review(llmApiUrl ? experienceLlm : undefined, knowledgeChannel);
@@ -980,7 +983,12 @@ async function resolveOperatorChannels(): Promise<void> {
   }
   if (!eventPostChannelId) eventPostChannelId = findByName(eventPostChannelName)?.id ?? "";
   if (!eventPostChannelId) console.warn(`event post channel #${eventPostChannelName} is unavailable`);
-  console.log(`channels: ops=${opsChannelId} musings=${musingsChannelId} events=${eventPostChannelId || "disabled"}`);
+  eventBranchChannels.length = 0;
+  for (const definition of EVENT_BRANCH_DEFINITIONS) {
+    const channelId = findByName(definition.channelName)?.id;
+    if (channelId) eventBranchChannels.push({ keywords: definition.keywords, channelId });
+  }
+  console.log(`channels: ops=${opsChannelId} musings=${musingsChannelId} events=${eventPostChannelId || "disabled"} eventBranches=${eventBranchChannels.length}`);
 }
 
 /** nexa.host.update.readiness/v1 on loopback, for the NexA Host runtime. */
@@ -1100,6 +1108,61 @@ function timeOfDayMaterial(hourJst: number): string {
   return "時間帯: 深夜。静かな時間を題材にした想像や問い。実際にした作業や来店客の様子は根拠なしに語らない。";
 }
 
+const eventCopyInProgress = new Set<string>();
+async function deliverEventConversationCopy(copy: EventConversationCopy): Promise<void> {
+  const attempt = connpass.beginConversationCopyAttempt(copy.key);
+  try {
+    const channel = await client.channels.fetch(copy.channelId) as TextChannel | null;
+    if (!channel || channel.type !== ChannelType.GuildText || (primaryGuildId && channel.guildId !== primaryGuildId)) {
+      throw new Error("Event branch channel unavailable");
+    }
+    const recent = await channel.messages.fetch({ limit: 50 });
+    const existing = recent.find(message => message.author.id === client.user?.id &&
+      message.content === copy.content && message.createdTimestamp >= copy.createdAt - 60_000);
+    if (existing) {
+      connpass.deliveredConversationCopy(copy.key, existing.id);
+      try { await resolveIncidentImpl("event_copy_failed"); }
+      catch (error) { console.error("event copy recovery bookkeeping failed", error); }
+      return;
+    }
+    const sent = await channel.send({
+      content: copy.content,
+      allowedMentions: { parse: [] },
+      nonce: createHmac("sha256", "event-copy").update(copy.key).digest("hex").slice(0, 24),
+      enforceNonce: true,
+    });
+    connpass.deliveredConversationCopy(copy.key, sent.id);
+    try {
+      await logReply({
+        event: "event_musing_branch",
+        guildId: channel.guildId,
+        channelId: channel.id,
+        messageId: sent.id,
+        latencyMs: 0,
+        ok: true,
+        replyText: copy.content,
+      });
+      await resolveIncidentImpl("event_copy_failed");
+    } catch (error) {
+      console.error("event copy post-delivery bookkeeping failed", error);
+    }
+  } catch (error) {
+    connpass.deferConversationCopy(copy.key, `attempt=${attempt} ${String(error)}`);
+    console.error(`event conversation copy attempt ${attempt} failed`, error);
+    await reportIncident("event_copy_failed", "warning", "イベントの支部チャンネル投稿に失敗", `channel=${copy.channelId} attempt=${attempt} ${String(error)}`);
+  }
+}
+
+async function deliverEventConversationCopies(): Promise<void> {
+  for (const copy of connpass.dueConversationCopies()) {
+    if (eventCopyInProgress.has(copy.key) || lifecycle.draining) continue;
+    eventCopyInProgress.add(copy.key);
+    try { await lifecycle.run(() => deliverEventConversationCopy(copy)); }
+    catch (error) { console.error("event conversation copy processing failed", error); }
+    finally { eventCopyInProgress.delete(copy.key); }
+  }
+}
+
 export async function postMusingImpl(
   hourJst: number,
   force: boolean,
@@ -1147,6 +1210,11 @@ export async function postMusingImpl(
       const receipt = await text.send({ content, allowedMentions: { parse: [] } });
       connpass.deliveredConversationMoment(eventMoment.key, receipt.id);
       sent = { id: receipt.id, text: content };
+      const branchChannelId = matchEventBranchChannel(eventMoment.event, eventBranchChannels);
+      if (branchChannelId && branchChannelId !== text.id) {
+        connpass.queueConversationCopy(eventMoment.key, branchChannelId, content);
+        await deliverEventConversationCopies();
+      }
     } catch (error) {
       const status = (error as { status?: number }).status;
       connpass.failedConversationMoment(eventMoment.key, !!status && status >= 400 && status < 500 && status !== 408);

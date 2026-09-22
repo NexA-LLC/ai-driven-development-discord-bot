@@ -236,3 +236,20 @@ it("releases a definitely failed event post but holds an ambiguous send", async 
   feed.failedConversationMoment(moment.key, false);
   expect(feed.selectConversationMoment(at)).toBeUndefined();
 });
+
+it("persists and retries a regional conversation copy independently from the primary post", async () => {
+  const { feed } = setup();
+  const now = Date.parse("2026-09-22T03:00:00Z");
+  expect(feed.queueConversationCopy("405783:three_days_before", "osaka", "本文\nhttps://aid.connpass.com/event/405783/", now)).toBe(true);
+  expect(feed.queueConversationCopy("405783:three_days_before", "osaka", "重複", now)).toBe(false);
+  const copy = feed.dueConversationCopies(now)[0]!;
+  expect(copy).toMatchObject({ channelId: "osaka", attempts: 0, status: "pending" });
+  expect(feed.beginConversationCopyAttempt(copy.key, now)).toBe(1);
+  feed.deferConversationCopy(copy.key, "network reset", now);
+  expect(feed.dueConversationCopies(now + 59_999)).toEqual([]);
+  expect(feed.dueConversationCopies(now + 60_000)).toHaveLength(1);
+  feed.beginConversationCopyAttempt(copy.key, now + 60_000);
+  feed.deliveredConversationCopy(copy.key, "osaka-message");
+  expect(feed.dueConversationCopies(now + 86400_000)).toEqual([]);
+  expect(feed.snapshot().pendingCopies).toBe(0);
+});
