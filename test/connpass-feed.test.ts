@@ -7,7 +7,8 @@ import { ConnpassFeed, CONNPASS_API_URL, MAX_API_BYTES, parseConnpassEvents, eve
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const now = Date.parse("2026-09-16T00:00:00Z");
-const later = now + 3600_000;
+const interval = 6 * 3600_000;
+const later = now + interval;
 const event = (id: number, updatedAt: string | null = "2026-09-16T00:01:00Z") => ({
   event_id: id,
   title: `AI駆動開発勉強会 ${id}`,
@@ -16,7 +17,20 @@ const event = (id: number, updatedAt: string | null = "2026-09-16T00:01:00Z") =>
   event_url: `https://aid.connpass.com/event/${id}/?utm_source=api`,
   started_at: "2026-09-20T19:00:00+09:00",
   ended_at: "2026-09-20T21:00:00+09:00",
+  published_at: "2026-09-15T12:00:00+09:00",
   updated_at: updatedAt,
+  image_url: "https://media.connpass.com/example.png",
+  hash_tag: "AI駆動開発",
+  limit: 44,
+  accepted: 42,
+  waiting: 1,
+  event_type: "participation",
+  open_status: "open",
+  group: { subdomain: "aid", title: "AI駆動開発", url: "https://aid.connpass.com/" },
+  place: "大阪会場",
+  address: "大阪府大阪市",
+  lat: "34.7",
+  lon: "135.5",
 });
 const currentV2Event = (id: number, updatedAt: string | null = "2026-09-16T00:01:00Z") => {
   const { event_id, event_url, ...rest } = event(id, updatedAt);
@@ -48,7 +62,20 @@ it("parses API v2 events, strips HTML, deduplicates, and keeps actual event date
     summary: "公開情報 APIの説明",
     startedAt: "2026-09-20T19:00:00+09:00",
     endedAt: "2026-09-20T21:00:00+09:00",
+    publishedAt: "2026-09-15T12:00:00+09:00",
     updatedAt: "2026-09-16T00:01:00Z",
+    imageUrl: "https://media.connpass.com/example.png",
+    hashTag: "AI駆動開発",
+    limit: 44,
+    accepted: 42,
+    waiting: 1,
+    eventType: "participation",
+    openStatus: "open",
+    groupTitle: "AI駆動開発",
+    place: "大阪会場",
+    address: "大阪府大阪市",
+    latitude: 34.7,
+    longitude: 135.5,
   });
   expect(eventReference(parsed)).toContain("startedAt/endedAtは開催日時");
   expect(eventReference(parsed)).toContain('"startedAt":"2026-09-20T19:00:00+09:00"');
@@ -88,6 +115,13 @@ it("uses the fixed API query and key header, preserves cache on 304, and disting
     .mockResolvedValueOnce(response(api()));
   await feed.refresh(fetcher, now);
   expect(feed.status).toBe("ok");
+  expect(feed.snapshot()).toMatchObject({
+    status: "ok",
+    checkedAt: "2026-09-16T00:00:00.000Z",
+    nextFetchAt: "2026-09-16T06:00:00.000Z",
+    failures: 0,
+    entries: 1,
+  });
   expect(fetcher.mock.calls[0]?.[0]).toBe(CONNPASS_API_URL);
   expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ redirect: "error", headers: {
     accept: "application/json",
@@ -100,9 +134,9 @@ it("uses the fixed API query and key header, preserves cache on 304, and disting
     "if-modified-since": "Wed, 16 Sep 2026 00:00:00 GMT",
   } });
   expect(feed.reference("connpassイベント", later)).toHaveLength(1);
-  await feed.refresh(fetcher, later + 3600_000); expect(feed.status).toBe("failed");
-  await feed.refresh(fetcher, later + 3600_001); expect(fetcher).toHaveBeenCalledTimes(3);
-  await feed.refresh(fetcher, later + 7200_000); expect(feed.status).toBe("empty");
+  await feed.refresh(fetcher, later + interval); expect(feed.status).toBe("failed");
+  await feed.refresh(fetcher, later + interval + 1); expect(fetcher).toHaveBeenCalledTimes(3);
+  await feed.refresh(fetcher, later + 2 * interval); expect(feed.status).toBe("empty");
 });
 
 it("does not make a request without an API key", async () => {

@@ -88,7 +88,7 @@ it("does not recall on unrelated topics, denied permissions, or deleted/edited s
   await gateway.onMessageImpl(message("edited", "正解のない4択の用語", "human", undefined, true)); expect(latest()).not.toContain(quote);
 });
 it("refreshes connpass without injecting events into Su's replies or musings", async () => {
-  vi.setSystemTime(now + 3600_000);
+  vi.setSystemTime(now + 6 * 3600_000);
   mocks.connpassJson = JSON.stringify({ results_start: 1, results_returned: 1, results_available: 1, events: [{ event_id: 407072, title: "AI駆動開発のイベント", catch: "AI開発の工夫を紹介", description: "", event_url: "https://aid.connpass.com/event/407072/", started_at: "2026-09-20T19:00:00+09:00", ended_at: "2026-09-20T21:00:00+09:00", updated_at: "2026-09-16T02:10:00Z" }] });
   await gateway.experienceTick();
   await gateway.postMusingImpl(12, true);

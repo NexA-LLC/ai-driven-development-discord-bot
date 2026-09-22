@@ -61,7 +61,7 @@ Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻�
 
 ## connpass
 
-固定 `https://connpass.com/api/v2/events/?subdomain=aid&order=3&count=100` をGatewayが取得する。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`X-API-Key` headerだけで送る。キーをログやstateへ保存しない。`CONNPASS_ENABLED=false` が既定。poll既定3600秒、キャッシュ24時間。失敗は最大8倍のbackoff。ETag/Last-Modifiedがあれば条件付きGET、304は既存cacheの再検証。失敗/空/未実行を区別する。
+固定 `https://connpass.com/api/v2/events/?subdomain=aid&order=3&count=100` をGatewayが6時間ごとに取得する。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`X-API-Key` headerだけで送る。キーをログやstateへ保存しない。`CONNPASS_ENABLED=false` が既定。poll既定21600秒、キャッシュ24時間。失敗は最大8倍のbackoff。ETag/Last-Modifiedがあれば条件付きGET、304は既存cacheの再検証。失敗/空/未実行を区別する。タイトル・説明・開催/公開/更新日時・募集状態・参加集計・会場・画像・位置情報を保存するが、公開オーナーの個人識別情報は保存しない。
 
 取得済みeventはスーのメンション返答や独り言へ自動注入しない。特に「次のイベントは？」のような定型質問へ答えるイベント案内Botにはしない。イベント取得を利用するときは、明示的なtool-callまたはスーの会話人格から分離した配信処理として設計する。APIの `started_at` / `ended_at` は開催日時、`updated_at` は更新日時として区別し、場所/参加経験を推測しない。
 

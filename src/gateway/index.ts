@@ -205,7 +205,8 @@ const slowMentionIds = new Set<string>();
 let lastMusingSlot = readSlot("musing-slot");
 const botRateState = new Map<string, RateState>();
 const experiences = new ExperienceStore();
-const connpass = new ConnpassFeed(undefined, readPositiveInteger("CONNPASS_POLL_SECONDS", 3600) * 1000,
+const connpassPollSeconds = readPositiveInteger("CONNPASS_POLL_SECONDS", 21_600);
+const connpass = new ConnpassFeed(undefined, connpassPollSeconds * 1000,
   readPositiveInteger("CONNPASS_CACHE_HOURS", 24) * 3600_000, process.env.CONNPASS_API_KEY?.trim() ?? "");
 const connpassEnabled = readBoolean("CONNPASS_ENABLED", false);
 if (connpassEnabled && !process.env.CONNPASS_API_KEY?.trim()) console.warn("CONNPASS_ENABLED requires CONNPASS_API_KEY; event refreshes will fail until it is set");
@@ -945,6 +946,7 @@ function startReadinessServer(): void {
         lastFailureAt: lastWebSearchFailureAt,
         lastFailureStatus: lastWebSearchFailureStatus,
       },
+      connpass: { enabled: connpassEnabled, pollSeconds: connpassPollSeconds, ...connpass.snapshot() },
       knowledge: {
         ...experiences.snapshot(Date.now(), knowledgeChannel),
         configuredChannels: experienceKnowledgeChannels.size,
