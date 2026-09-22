@@ -7,7 +7,7 @@ import { runMentionAgent, mentionTools, type AgentMessage } from "./mention-agen
 import { readMentionedChannels } from "./channel-context.js";
 import { allowsConversationInChannel, conversationContext, conversationReference, readableConversation, shouldAnswer } from "./message-routing.js";
 import { ExperienceStore, experienceReference, type ExperienceMemory, type SyncOutcome } from "./experience-memory.js";
-import { ConnpassFeed } from "./connpass-feed.js";
+import { ConnpassFeed, eventConversationMaterial } from "./connpass-feed.js";
 import { deliverMusing } from "./musing.js";
 import { publicExperience, publicExperienceBody } from "../shared/public-experience.js";
 import { startTyping } from "./typing.js";
@@ -1053,13 +1053,35 @@ export async function postMusingImpl(
     ...(topic ? [`頼まれた話題（これを材料にする）: ${topic}`] : []),
   ].join("\n");
   const startedAt = Date.now();
+  const eventMoment = connpassEnabled && !topic && text.id === musingsChannelId
+    ? connpass.selectConversationMoment(startedAt) : undefined;
   const memories: ExperienceMemory[] = [];
-  for (const memory of experiences.select(text.guildId, text.id, topic ?? "", true)) if (await verifyExperience(memory)) memories.push(memory);
-  const sent = await deliverMusing({ background: material, memories, store: experiences,
-    generate: input => generateReply("musing", input, "ja"),
-    send: content => text.send({ content, allowedMentions: { parse: [] } }) });
+  if (!eventMoment) for (const memory of experiences.select(text.guildId, text.id, topic ?? "", true)) {
+    if (await verifyExperience(memory)) memories.push(memory);
+  }
+  let sent: { id: string; text: string };
+  if (eventMoment) {
+    const generated = await generateReply("musing", eventConversationMaterial(eventMoment, hourJst), "ja");
+    const prose = generated.replace(/https?:\/\/\S+/g, "").trim().slice(0, 400);
+    if (!prose) throw new Error("Empty event conversation");
+    const content = `${prose}\n${eventMoment.event.url}`;
+    if (!connpass.reserveConversationMoment(eventMoment.key, startedAt)) throw new Error("Event conversation already reserved");
+    try {
+      const receipt = await text.send({ content, allowedMentions: { parse: [] } });
+      connpass.deliveredConversationMoment(eventMoment.key, receipt.id);
+      sent = { id: receipt.id, text: content };
+    } catch (error) {
+      const status = (error as { status?: number }).status;
+      connpass.failedConversationMoment(eventMoment.key, !!status && status >= 400 && status < 500 && status !== 408);
+      throw error;
+    }
+  } else {
+    sent = await deliverMusing({ background: material, memories, store: experiences,
+      generate: input => generateReply("musing", input, "ja"),
+      send: content => text.send({ content, allowedMentions: { parse: [] } }) });
+  }
   await logReply({
-    event: "musing",
+    event: eventMoment ? "event_musing" : "musing",
     guildId: text.guildId,
     channelId: text.id,
     messageId: sent.id,

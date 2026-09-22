@@ -30,6 +30,13 @@ const entrySchema = z.object({
   fetchedAt: z.number(),
 });
 export type EventEntry = z.infer<typeof entrySchema>;
+export type EventConversationStage = "three_days_before" | "one_day_before" | "event_day";
+export interface EventConversationMoment {
+  key: string;
+  stage: EventConversationStage;
+  daysUntil: 3 | 1 | 0;
+  event: EventEntry;
+}
 
 const legacyTrackedSchema = z.object({
   id: z.string().max(1000),
@@ -63,6 +70,14 @@ const legacyTrackedSchema = z.object({
   fetchedAt: entry.fetchedAt,
 }));
 const trackedSchema = z.union([entrySchema, legacyTrackedSchema]);
+const conversationMomentReceiptSchema = z.object({
+  key: z.string().max(1200),
+  eventId: z.string().max(1000),
+  stage: z.enum(["three_days_before", "one_day_before", "event_day"]),
+  status: z.enum(["pending", "unknown", "posted"]),
+  attemptAt: z.number(),
+  messageId: z.string().max(1000).nullable(),
+});
 const stateSchema = z.object({
   checkedAt: z.number(),
   nextFetchAt: z.number(),
@@ -71,6 +86,7 @@ const stateSchema = z.object({
   lastModified: z.string(),
   status: z.enum(["not_run", "ok", "empty", "failed"]),
   entries: z.array(trackedSchema).max(100),
+  conversationMoments: z.array(conversationMomentReceiptSchema).max(500).default([]),
 });
 
 const apiEventSchema = z.object({
@@ -143,6 +159,15 @@ function coordinate(raw: string | number | null | undefined, min: number, max: n
   return Number.isFinite(value) && value >= min && value <= max ? value : null;
 }
 
+const dayJst = (at: number) => Math.floor((at + 9 * 3600_000) / 86400_000);
+
+function conversationStage(daysUntil: number): { stage: EventConversationStage; daysUntil: 3 | 1 | 0 } | null {
+  if (daysUntil === 3) return { stage: "three_days_before", daysUntil: 3 };
+  if (daysUntil === 1) return { stage: "one_day_before", daysUntil: 1 };
+  if (daysUntil === 0) return { stage: "event_day", daysUntil: 0 };
+  return null;
+}
+
 /** Parse the bounded connpass API response and retain only the fixed aid.connpass.com group. */
 export function parseConnpassEvents(body: string, now = Date.now()): EventEntry[] {
   if (Buffer.byteLength(body) > MAX_API_BYTES) throw new Error("Connpass API response too large");
@@ -212,7 +237,7 @@ export class ConnpassFeed {
     private cacheMs = 24 * 3600_000,
     private apiKey = process.env.CONNPASS_API_KEY?.trim() ?? "",
   ) {
-    this.state = new DurableState(path, stateSchema, { checkedAt: 0, nextFetchAt: 0, failures: 0, etag: "", lastModified: "", status: "not_run", entries: [] });
+    this.state = new DurableState(path, stateSchema, { checkedAt: 0, nextFetchAt: 0, failures: 0, etag: "", lastModified: "", status: "not_run", entries: [], conversationMoments: [] });
   }
   get status(): string { return this.state.available ? this.state.value.status : "unavailable"; }
   snapshot(): { status: string; checkedAt: string | null; nextFetchAt: string | null; failures: number; entries: number } {
@@ -260,6 +285,61 @@ export class ConnpassFeed {
     if (!this.state.available || now - this.state.value.checkedAt > this.cacheMs || !/(イベント|勉強会|connpass|開催|登壇|AI駆動開発)/i.test(query)) return [];
     return this.state.value.entries.filter(entry => relevance(query, entry.title + entry.summary) >= 2 || /connpass|イベント/.test(query)).slice(0, 3);
   }
+  selectConversationMoment(now = Date.now()): EventConversationMoment | undefined {
+    if (!this.state.available || this.state.value.status !== "ok" || now - this.state.value.checkedAt > this.cacheMs) return;
+    if (this.state.value.conversationMoments.some(receipt => dayJst(receipt.attemptAt) === dayJst(now))) return;
+    const candidates = this.state.value.entries.flatMap(event => {
+      if (!event.startedAt || /中止|延期|キャンセル/.test(event.title)) return [];
+      const startsAt = Date.parse(event.startedAt);
+      if (!Number.isFinite(startsAt) || startsAt <= now) return [];
+      const timing = conversationStage(dayJst(startsAt) - dayJst(now));
+      if (!timing) return [];
+      const key = `${event.id}:${timing.stage}`;
+      if (this.state.value.conversationMoments.some(receipt => receipt.key === key)) return [];
+      return [{ key, ...timing, event }];
+    });
+    return candidates.sort((a, b) => Date.parse(a.event.startedAt!) - Date.parse(b.event.startedAt!))[0];
+  }
+  reserveConversationMoment(key: string, now = Date.now()): boolean {
+    const selected = this.selectConversationMoment(now);
+    if (!selected || selected.key !== key) return false;
+    this.state.value.conversationMoments.push({
+      key,
+      eventId: selected.event.id,
+      stage: selected.stage,
+      status: "pending",
+      attemptAt: now,
+      messageId: null,
+    });
+    this.state.value.conversationMoments = this.state.value.conversationMoments.slice(-500);
+    this.state.save();
+    return true;
+  }
+  deliveredConversationMoment(key: string, messageId: string): void {
+    const receipt = this.state.value.conversationMoments.find(item => item.key === key);
+    if (!receipt) return;
+    receipt.status = "posted";
+    receipt.messageId = messageId;
+    this.state.save();
+  }
+  failedConversationMoment(key: string, definitelyNotSent: boolean): void {
+    const index = this.state.value.conversationMoments.findIndex(item => item.key === key);
+    if (index < 0) return;
+    if (definitelyNotSent) this.state.value.conversationMoments.splice(index, 1);
+    else this.state.value.conversationMoments[index]!.status = "unknown";
+    this.state.save();
+  }
+}
+
+export function eventConversationMaterial(moment: EventConversationMoment, hourJst: number): string {
+  const timing = moment.stage === "three_days_before" ? "開催3日前" : moment.stage === "one_day_before" ? "開催前日" : "開催当日（開始前）";
+  return [
+    "公開イベントをきっかけにした、スー自身の自然な独り言を1〜3文で作る。イベント一覧やFAQ回答にはしない。",
+    `${timing}、JST ${hourJst}時ごろ。時期との距離感を自然に含めてもよい。`,
+    "タイトル・テーマから一つだけ気になった点や問いを話す。日時・会場・人数を羅列しない。参加した、準備を見た、誰かと話したとは言わない。",
+    "本文にURLを入れない。URLは送信処理が出典として末尾に付ける。",
+    eventReference([moment.event]),
+  ].join("\n");
 }
 
 export function eventReference(entries: EventEntry[]): string {

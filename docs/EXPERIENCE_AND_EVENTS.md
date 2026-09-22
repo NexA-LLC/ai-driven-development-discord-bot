@@ -63,7 +63,9 @@ Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻�
 
 固定 `https://connpass.com/api/v2/events/?subdomain=aid&order=3&count=100` をGatewayが6時間ごとに取得する。connpassで発行されたAPI keyを `CONNPASS_API_KEY` に設定し、`X-API-Key` headerだけで送る。キーをログやstateへ保存しない。`CONNPASS_ENABLED=false` が既定。poll既定21600秒、キャッシュ24時間。失敗は最大8倍のbackoff。ETag/Last-Modifiedがあれば条件付きGET、304は既存cacheの再検証。失敗/空/未実行を区別する。タイトル・説明・開催/公開/更新日時・募集状態・参加集計・会場・画像・位置情報を保存するが、公開オーナーの個人識別情報は保存しない。
 
-取得済みeventはスーのメンション返答や独り言へ自動注入しない。特に「次のイベントは？」のような定型質問へ答えるイベント案内Botにはしない。イベント取得を利用するときは、明示的なtool-callまたはスーの会話人格から分離した配信処理として設計する。APIの `started_at` / `ended_at` は開催日時、`updated_at` は更新日時として区別し、場所/参加経験を推測しない。
+取得済みeventはスーのメンション返答へ自動注入しない。特に「次のイベントは？」のような定型質問へ答えるイベント案内Botにはしない。独立した自発会話として、JSTの開催3日前・前日・当日の開始前に、通常の独り言枠でタイトルやテーマから一つだけ気になった点を話せる。日時・会場・人数は羅列せず、参加した、準備を見た、誰かと話したとは推測しない。本文の末尾には正規のevent URLをコード側で付ける。中止・延期・キャンセルと読めるタイトルは除外する。
+
+イベントと節目の組み合わせごとに1回、イベント由来の投稿は全体でJST 1日1件まで。Discord送信直前に永続stateへ予約し、成功時はmessage IDをreceiptとして保存する。Discordが明確に未送信と返したときだけ予約を解放して再試行できる。timeoutなど送信成否が不明な場合は `unknown` として保持し、二重投稿を避ける。通常の独り言slotの再起動時重複防止も併用する。APIの `started_at` / `ended_at` は開催日時、`updated_at` は更新日時として区別する。
 
 ## 導入と制限
 
@@ -71,7 +73,7 @@ Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻�
 2. Worker/Gatewayを通常の承認済みリリース手順で反映。DB migrationなし。状態ファイルは遅延作成する。
 3. 永続 `SU_STATE_DIR` と既存 `LLM_API_URL` を設定。1つのstate directoryに1つのGatewayプロセスを前提とする。破損ファイルは自動上書きせず、記憶/feedを安全に無効扱いにする。
 4. データ取扱い告知を確認し、同期元として明示するchannelだけを `EXPERIENCE_KNOWLEDGE_CHANNEL_IDS` に設定。元channelが公開でも非公開でもGarden側はprivate Knowledgeのまま。Garden側は既存MCP設定を使用。DecisionGarden に `update_memory_node` が入るまで、2回目以降の更新は「同期待ち」のまま保留される（詳細と導入順・ロールバックは README 参照）。
-5. connpassへAPI利用申請を行い、発行されたkeyをsecret `CONNPASS_API_KEY` に設定する。API取得を確認してから `CONNPASS_ENABLED=true` にする。初回は自発投稿なし。取得、解析、公開同期、Discord receiptは別々に確認する。
+5. connpassへAPI利用申請を行い、発行されたkeyをsecret `CONNPASS_API_KEY` に設定する。API取得を確認してから `CONNPASS_ENABLED=true` にする。取得、節目判定、LLM生成、Discord receiptは別々に確認する。既に節目当日なら、次の通常の独り言slotで投稿候補になる。
 
 このPRの検証はAPI v2レスポンスのモックまで。本番API keyを使った取得、本番deploy、Gateway再起動、Discordへの投稿、DGへの書込みは行わない。
 
