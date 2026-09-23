@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { DurableState, statePath } from "./durable-state.js";
 
+export const WELCOME_FALLBACK_ATTEMPT = 3;
+
 const welcomeJobSchema = z.object({
   key: z.string().max(1200),
   guildId: z.string().max(1000),
@@ -98,6 +100,10 @@ export class WelcomeQueue {
       sent: this.state.value.jobs.filter(job => job.status === "sent").length,
       nextAttemptAt: next === null ? null : new Date(next).toISOString(),
     };
+  }
+  hasEscalatedPending(): boolean {
+    return this.state.available && this.state.value.jobs.some(job =>
+      job.status === "pending" && job.attempts >= WELCOME_FALLBACK_ATTEMPT);
   }
   private requirePending(key: string): WelcomeJob {
     if (!this.state.available) throw new Error("Welcome queue unavailable");

@@ -58,7 +58,12 @@ failures remain retryable. Event sends have a separate durable pending/unknown
 reservation to prevent resending an uncertain delivery. See EXPERIENCE_AND_EVENTS.md.
 Welcome jobs are stored before LLM generation, retried with bounded backoff and a
 deterministic Discord nonce, and fall back to a short static greeting after two
-generation failures. Startup/reconnect backfills only recent members lacking a receipt.
+generation failures. A first or second failed attempt stays in the durable queue
+without a `welcome_failed` operator alert. That incident opens only if the
+third delivery attempt fails (using a fixed fallback if generation never
+succeeded). It resolves after delivery or member removal once no escalated
+welcome jobs remain. Startup/reconnect
+backfills only recent members lacking a receipt.
 
 The launchd label is `net.nex-a.su.gateway-managed`. Its SSH loopback entrypoint
 preserves the host's local-network permission workaround. A dedicated SSH identity
