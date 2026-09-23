@@ -60,7 +60,7 @@ Welcome jobs are stored before LLM generation, retried with bounded backoff and 
 deterministic Discord nonce, and fall back to a short static greeting after two
 generation failures. A first or second failed attempt stays in the durable queue
 without a `welcome_failed` operator alert. That incident opens only if the
-third delivery attempt fails (using a fixed fallback if generation never
+third welcome attempt fails (using a fixed fallback if generation never
 succeeded). It resolves after delivery or member removal once no escalated
 welcome jobs remain. Startup/reconnect
 backfills only recent members lacking a receipt.
