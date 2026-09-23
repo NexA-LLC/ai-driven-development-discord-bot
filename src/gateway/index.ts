@@ -9,7 +9,7 @@ import { allowsConversationInChannel, conversationContext, conversationReference
 import { ExperienceStore, experienceReference, type ExperienceMemory, type SyncOutcome } from "./experience-memory.js";
 import { ConnpassFeed, eventConversationMaterial, type EventConversationCopy } from "./connpass-feed.js";
 import { EVENT_BRANCH_DEFINITIONS, matchEventBranchChannel, type EventBranchChannel } from "./event-channel-routing.js";
-import { WelcomeQueue, fallbackWelcome, type WelcomeJob } from "./welcome-queue.js";
+import { WelcomeQueue, WELCOME_FALLBACK_ATTEMPT, fallbackWelcome, type WelcomeJob } from "./welcome-queue.js";
 import { deliverMusing } from "./musing.js";
 import { publicExperience, publicExperienceBody } from "../shared/public-experience.js";
 import { startTyping } from "./typing.js";
@@ -314,16 +314,21 @@ function welcomeSlot(guildId: string, memberId: string): string {
   return `welcome-${guildId}-${memberId}`;
 }
 
-function enqueueWelcome(member: GuildMember): boolean {
+export function enqueueWelcome(member: GuildMember): boolean {
   const joinedAt = member.joinedTimestamp ?? Date.now();
   if (readSlot(welcomeSlot(member.guild.id, member.id)) === String(joinedAt)) return false;
   return welcomeQueue.enqueue(member.guild.id, member.id, joinedAt);
+}
+
+async function resolveWelcomeIncidentIfClear(): Promise<void> {
+  if (!welcomeQueue.hasEscalatedPending()) await resolveIncidentImpl("welcome_failed");
 }
 
 async function deliverWelcome(job: WelcomeJob): Promise<void> {
   const slot = welcomeSlot(job.guildId, job.memberId);
   if (readSlot(slot) === String(job.joinedAt)) {
     welcomeQueue.skipped(job.key, "existing receipt");
+    if (job.attempts >= WELCOME_FALLBACK_ATTEMPT) await resolveWelcomeIncidentIfClear();
     return;
   }
   const attempt = welcomeQueue.beginAttempt(job.key);
@@ -332,13 +337,14 @@ async function deliverWelcome(job: WelcomeJob): Promise<void> {
     const member = await guild.members.fetch(job.memberId);
     if (member.user.bot) {
       welcomeQueue.skipped(job.key, "bot member");
+      if (job.attempts >= WELCOME_FALLBACK_ATTEMPT) await resolveWelcomeIncidentIfClear();
       return;
     }
     const name = member.displayName || member.user.username;
     const language = detectLanguage(name) === "ja" ? "ja" : "en";
     let text = job.content;
     if (!text) {
-      text = attempt <= 2
+      text = attempt < WELCOME_FALLBACK_ATTEMPT
         ? await generateReply("welcome", `新しいお客さんの名前: ${name}`, language)
         : fallbackWelcome(name, language);
       text = truncate(text, 1_800);
@@ -368,23 +374,26 @@ async function deliverWelcome(job: WelcomeJob): Promise<void> {
         requesterUserId: job.memberId,
         replyText: text,
       });
-      await resolveIncidentImpl("welcome_failed");
     } catch (error) {
       console.error("welcome post-delivery bookkeeping failed", error);
     }
+    await resolveWelcomeIncidentIfClear();
   } catch (error) {
     const code = (error as { code?: unknown }).code;
     if (code === 10007) {
       welcomeQueue.skipped(job.key, "member no longer in guild");
+      if (attempt >= WELCOME_FALLBACK_ATTEMPT) await resolveWelcomeIncidentIfClear();
       return;
     }
     welcomeQueue.defer(job.key, String(error));
     console.error(`welcome attempt ${attempt} failed`, error);
-    await reportIncident("welcome_failed", "warning", "新規参加者への挨拶に失敗", `attempt=${attempt} ${String(error)}`);
+    if (attempt >= WELCOME_FALLBACK_ATTEMPT) {
+      await reportIncident("welcome_failed", "warning", "新規参加者への挨拶が再試行後も送れません", `attempt=${attempt} ${String(error)}`);
+    }
   }
 }
 
-async function processWelcomeQueue(): Promise<void> {
+export async function processWelcomeQueue(): Promise<void> {
   for (const job of welcomeQueue.due()) {
     if (welcomeInProgress.has(job.key) || lifecycle.draining) continue;
     welcomeInProgress.add(job.key);
