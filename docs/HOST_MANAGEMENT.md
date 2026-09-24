@@ -70,6 +70,10 @@ preserves the host's local-network permission workaround. A dedicated SSH identi
 is restricted to localhost and a fixed supervisor command; shell and forwarding
 are disabled, and authentication is preflighted before stopping the old process. The supervisor
 is a service-specific updater; NexA Host fleet inventory integration is separate.
+The forced-command entrypoint redirects the supervisor and Gateway logs directly
+to `managed.stdout.log` and `managed.stderr.log` before starting Python. Their
+long-running output must not cross the SSH pseudo-terminal, whose blocked write
+would also stop readiness and the 60-second update loop.
 Use loopback `/readiness` on the configured `READINESS_PORT` (202: 8791) to inspect `activeWork`, `draining`,
 `startupReady`, `queuedMessages`, `deadLetterMessages`, `llm`, `release` and `pid`. `llm` exposes the
 single-flight queue, circuit state, last success/failure and configured-model preflight result without prompt content.
