@@ -12,6 +12,8 @@ import urllib.request
 
 home = Path.home()
 root = home / 'service-runners/su-managed'
+logs = home / 'Library/Logs/su-gateway'
+logs.mkdir(parents=True, exist_ok=True)
 source = home / 'service-runners/flow-runtime/ai-driven-development-discord-bot'
 sha = sys.argv[1]
 if len(sha) != 40 or any(c not in '0123456789abcdef' for c in sha):
@@ -30,7 +32,7 @@ identity = home / '.ssh/su_gateway_local'
 if not identity.exists():
     subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(identity), '-C', 'su-gateway-loopback-only'], check=True)
 entry = root / 'ssh-entry.sh'
-entry.write_text('#!/bin/sh\ncase "$SSH_ORIGINAL_COMMAND" in\ncheck) echo ready;;\nrun) exec /usr/bin/python3 ' + str(root / 'supervise-gateway.py') + ';;\n*) exit 64;;\nesac\n')
+shutil.copy2(release / 'scripts/gateway-202-ssh-entry.sh', entry)
 os.chmod(entry, 0o700)
 authorized = home / '.ssh/authorized_keys'
 public = identity.with_suffix('.pub').read_text().strip()
@@ -70,7 +72,6 @@ os.chmod(state / 'inbox.json', 0o600)
 (root / 'current.json').write_text(json.dumps({'sha': sha}))
 label = 'net.nex-a.su.gateway-managed'
 plist_path = home / 'Library/LaunchAgents' / (label + '.plist')
-logs = home / 'Library/Logs/su-gateway'
 plist = {
     'Label': label,
     'ProgramArguments': ['/usr/bin/ssh', '-tt', '-i', str(identity), '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3', 'buildman@127.0.0.1', 'run'],
