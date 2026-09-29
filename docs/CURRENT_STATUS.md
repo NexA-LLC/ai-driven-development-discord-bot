@@ -42,9 +42,9 @@
 | D1 schema | Yes | migration testなし | No | No | prototype |
 | Agent Manifest検証 | Yes | Unit testあり | N/A | N/A | 実装済み |
 | Passport scoring | Yes | Unit testあり | N/A | N/A | prototype |
-| Agent review/approval | DB列のみ | No | No | No | 未実装 |
-| Agent Dock dispatch | No | No | No | No | 未実装 |
-| Quarantine/revoke | No | No | No | No | 未実装 |
+| Agent review/approval | 内部APIのみ（Discord UIなし） | Unit testあり | No | No | 骨格 |
+| Agent Dock dispatch | Yes（Worker内部API、Gateway未接続） | Unit testあり | No | No | 骨格 |
+| Quarantine/revoke | Yes（内部API、secret version失効） | Unit testあり | No | No | 骨格 |
 | 管理UI/Discord運営操作 | No | No | No | No | 未実装 |
 | Pitcheee実投稿 | No | No | No | No | 未実装 |
 | FlowAlign/RepoDeck操作 | No | No | No | No | 未実装 |
