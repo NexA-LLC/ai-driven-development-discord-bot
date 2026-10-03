@@ -1,9 +1,21 @@
 import { verifyKey } from "discord-interactions";
 import { publicExperienceBody, publicExperienceSchema, publicExperienceSourceKey, type PublicExperience } from "../shared/public-experience.js";
 import {
+  agentManifestSchema,
   evaluateAgentManifest,
   type AgentPassport,
 } from "../shared/agent-manifest.js";
+import {
+  agentDockEventSchema,
+  agentRateLimit,
+  agentScopeSchema,
+  checkEventScope,
+  circuitDecision,
+  deriveAgentSecret,
+  diffPassportScope,
+  dispatchToAgent,
+  nextCircuitState,
+} from "../shared/agent-dock.js";
 import { discordCommands } from "../shared/commands.js";
 import { buildQuizPrompt, buildRequestedQuizPrompt, parseRequestedQuiz, isQuizPrompt, parseQuiz, renderQuiz, QUIZ_SYSTEM_PROMPT } from "../shared/quiz.js";
 import {
@@ -44,6 +56,8 @@ interface Env {
   DECISIONGARDEN_MCP_URL?: string;
   DECISIONGARDEN_MCP_TOKEN?: string;
   DECISIONGARDEN_GARDEN_ID?: string;
+  /** Master secret for Agent Dock; per-Agent HMAC secrets are derived from it. */
+  AGENT_DOCK_SECRET?: string;
   /** Bearer token for the public MCP endpoint (/api/mcp). */
   SU_MCP_TOKEN?: string;
   MUSINGS_CHANNEL_ID?: string;
@@ -149,6 +163,13 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/internal/agents") {
       return handleInternalAgentSubmission(request, env);
+    }
+
+    const agentDockRoute = request.method === "POST"
+      ? /^\/internal\/agents\/([^/]+)\/(approve|invoke|quarantine)$/.exec(url.pathname)
+      : null;
+    if (agentDockRoute) {
+      return handleAgentDock(request, env, decodeURIComponent(agentDockRoute[1]!), agentDockRoute[2] as AgentDockAction);
     }
 
     if (
@@ -644,6 +665,204 @@ async function handleInternalAgentSubmission(
     .run();
 
   return json({ id, status, passport });
+}
+
+type AgentDockAction = "approve" | "invoke" | "quarantine";
+
+interface AgentDockRow {
+  submission_id: string;
+  guild_id: string;
+  agent_id: string | null;
+  submission_status: string;
+  passport_band: string | null;
+  manifest_json: string | null;
+  installation_id: string | null;
+  installation_status: string | null;
+  scope_json: string | null;
+  secret_version: number | null;
+  consecutive_failures: number | null;
+  circuit_opened_at_ms: number | null;
+}
+
+// Routes are keyed by agent_submissions.id; one installation per submission.
+async function handleAgentDock(request: Request, env: Env, submissionId: string, action: AgentDockAction): Promise<Response> {
+  const rawBody = await request.text();
+  if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+    return json({ error: "invalid_internal_signature" }, 401);
+  }
+  if (!env.AGENT_DOCK_SECRET) return json({ error: "agent_dock_not_configured" }, 503);
+
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT s.id AS submission_id, s.guild_id, s.agent_id, s.status AS submission_status,
+            s.passport_band, s.manifest_json,
+            i.id AS installation_id, i.status AS installation_status, i.scope_json,
+            i.secret_version, i.consecutive_failures, i.circuit_opened_at_ms
+       FROM agent_submissions s
+       LEFT JOIN agent_installations i ON i.submission_id = s.id
+      WHERE s.id = ?`,
+  ).bind(submissionId).first<AgentDockRow>();
+  if (!row) return json({ error: "agent_not_found" }, 404);
+
+  if (action === "approve") return approveAgent(env, row, body);
+  if (action === "quarantine") return quarantineAgent(env, row, body);
+  return invokeAgent(env, row, body);
+}
+
+function parseStoredManifest(row: AgentDockRow) {
+  try {
+    const parsed = agentManifestSchema.safeParse(JSON.parse(row.manifest_json ?? "null"));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+async function recordAgentAudit(env: Env, eventType: string, row: AgentDockRow, actorId: string | null, detail: Record<string, unknown>): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO audit_events (id, event_type, guild_id, actor_id, detail_json, occurred_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(crypto.randomUUID(), eventType, row.guild_id, actorId, JSON.stringify({ submissionId: row.submission_id, agentId: row.agent_id, ...detail }), new Date().toISOString())
+    .run();
+}
+
+async function approveAgent(env: Env, row: AgentDockRow, body: Record<string, unknown>): Promise<Response> {
+  if (typeof body.reviewerUserId !== "string") return json({ error: "reviewerUserId_is_required" }, 400);
+  if (!["pending", "approved", "quarantined"].includes(row.submission_status) || row.passport_band === "blocked") {
+    return json({ error: "agent_not_approvable", status: row.submission_status }, 409);
+  }
+  const manifest = parseStoredManifest(row);
+  if (!manifest || !row.agent_id) return json({ error: "invalid_stored_manifest" }, 409);
+  const scope = agentScopeSchema.safeParse(body.scope);
+  if (!scope.success) return json({ error: "invalid_scope", issues: scope.error.issues.map((issue) => issue.message) }, 400);
+  const drift = diffPassportScope(manifest, scope.data);
+  if (drift.length > 0) return json({ error: "scope_exceeds_passport", drift }, 409);
+
+  const installationId = row.installation_id ?? crypto.randomUUID();
+  const secretVersion = row.secret_version ?? 1;
+  const now = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO agent_installations (id, guild_id, submission_id, scope_json, status, secret_version)
+       VALUES (?, ?, ?, ?, 'sandbox', ?)
+       ON CONFLICT(submission_id) DO UPDATE SET
+         scope_json = excluded.scope_json, status = 'sandbox', consecutive_failures = 0,
+         circuit_opened_at_ms = NULL, quarantined_at = NULL, quarantine_reason = NULL,
+         updated_at = CURRENT_TIMESTAMP`,
+    ).bind(installationId, row.guild_id, row.submission_id, JSON.stringify(scope.data), secretVersion),
+    env.DB.prepare(
+      `UPDATE agent_submissions SET status = 'approved', reviewer_user_id = ?, reviewed_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    ).bind(body.reviewerUserId, now, row.submission_id),
+  ]);
+  await recordAgentAudit(env, "agent_approved", row, body.reviewerUserId, { scope: scope.data, secretVersion });
+
+  // The secret is returned once to the operator so it can be handed to the developer.
+  const secret = await deriveAgentSecret(env.AGENT_DOCK_SECRET!, row.agent_id, secretVersion);
+  return json({ ok: true, installationId, agentId: row.agent_id, secretVersion, secret, scope: scope.data });
+}
+
+async function quarantineAgent(env: Env, row: AgentDockRow, body: Record<string, unknown>): Promise<Response> {
+  const reason = typeof body.reason === "string" ? truncate(body.reason, 300) : "operator_quarantine";
+  const operatorUserId = typeof body.operatorUserId === "string" ? body.operatorUserId : null;
+  const statements = [
+    env.DB.prepare(`UPDATE agent_submissions SET status = 'quarantined', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(row.submission_id),
+  ];
+  if (row.installation_id) {
+    // Bumping secret_version revokes the Agent credential immediately.
+    statements.push(env.DB.prepare(
+      `UPDATE agent_installations
+          SET status = 'quarantined', secret_version = secret_version + 1,
+              quarantined_at = ?, quarantine_reason = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`,
+    ).bind(new Date().toISOString(), reason, row.installation_id));
+  }
+  await env.DB.batch(statements);
+  await recordAgentAudit(env, "agent_quarantined", row, operatorUserId, { reason });
+  return json({ ok: true, status: "quarantined" });
+}
+
+async function invokeAgent(env: Env, row: AgentDockRow, body: Record<string, unknown>): Promise<Response> {
+  const parsedEvent = agentDockEventSchema.safeParse(body.event);
+  if (!parsedEvent.success) return json({ error: "invalid_event" }, 400);
+  const event = parsedEvent.data;
+  if (!row.installation_id) return json({ ok: false, reason: "not_installed" }, 409);
+  const installationId = row.installation_id;
+  const nowMs = Date.now();
+
+  const record = async (status: "sent" | "failed" | "rejected", reason: string | null, extra: { httpStatus?: number | null; attempts?: number; latencyMs?: number } = {}) => {
+    await env.DB.prepare(
+      `INSERT INTO agent_dispatches
+        (id, installation_id, guild_id, channel_id, message_id, event_type, status, reason, http_status, attempts, latency_ms, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(crypto.randomUUID(), installationId, event.guildId, event.channelId, event.messageId, event.eventType, status, reason, extra.httpStatus ?? null, extra.attempts ?? 0, extra.latencyMs ?? null, nowMs)
+      .run();
+  };
+  const reject = async (reason: string, status = 409) => {
+    await record("rejected", reason);
+    return json({ ok: false, reason }, status);
+  };
+
+  // Quarantine wins over everything: no new dispatch after revoke.
+  if (row.submission_status !== "approved" || (row.installation_status !== "sandbox" && row.installation_status !== "trusted")) {
+    return reject("quarantined");
+  }
+  if (event.guildId !== row.guild_id) return reject("guild_not_in_scope");
+
+  const manifest = parseStoredManifest(row);
+  const scope = agentScopeSchema.safeParse(JSON.parse(row.scope_json ?? "null"));
+  if (!manifest?.endpoint || !scope.success || !row.agent_id) return reject("invalid_installation");
+  const drift = diffPassportScope(manifest, scope.data);
+  if (drift.length > 0) {
+    await recordAgentAudit(env, "agent_scope_drift", row, null, { drift });
+    return reject("scope_drift");
+  }
+  const decision = checkEventScope(event, scope.data);
+  if (!decision.ok) return reject(decision.reason);
+
+  const circuit = { consecutiveFailures: row.consecutive_failures ?? 0, openedAtMs: row.circuit_opened_at_ms ?? null };
+  if (circuitDecision(circuit, nowMs) === "open") return reject("circuit_open", 503);
+
+  const recent = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM agent_dispatches WHERE installation_id = ? AND status != 'rejected' AND created_at_ms > ?`,
+  ).bind(installationId, nowMs - 60_000).first<{ n: number }>();
+  if ((recent?.n ?? 0) >= agentRateLimit(manifest.limits.requestsPerMinute)) return reject("rate_limited", 429);
+
+  const secret = await deriveAgentSecret(env.AGENT_DOCK_SECRET!, row.agent_id, row.secret_version ?? 1);
+  const outcome = await dispatchToAgent({
+    agentId: row.agent_id,
+    endpoint: manifest.endpoint,
+    secret,
+    event,
+    maxOutputChars: manifest.limits.maxOutputChars,
+    nonce: crypto.randomUUID(),
+    now: () => new Date(),
+    fetchImpl: fetch,
+  });
+  const latencyMs = Date.now() - nowMs;
+
+  const next = nextCircuitState(circuit, outcome.ok, Date.now());
+  await env.DB.prepare(
+    `UPDATE agent_installations SET consecutive_failures = ?, circuit_opened_at_ms = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+  ).bind(next.consecutiveFailures, next.openedAtMs, installationId).run();
+  if (next.openedAtMs !== null && circuit.openedAtMs === null) {
+    await recordAgentAudit(env, "agent_circuit_opened", row, null, { consecutiveFailures: next.consecutiveFailures });
+  }
+
+  if (!outcome.ok) {
+    await record("failed", outcome.reason, { httpStatus: outcome.httpStatus, attempts: outcome.attempts, latencyMs });
+    return json({ ok: false, reason: outcome.reason }, 502);
+  }
+  await record("sent", null, { httpStatus: outcome.httpStatus, attempts: outcome.attempts, latencyMs });
+  // The Gateway posts `content` with allowed_mentions disabled; handoff is advisory (max 1 hop).
+  return json({ ok: true, content: outcome.content, handoff: outcome.handoff });
 }
 
 async function listApprovedAgents(

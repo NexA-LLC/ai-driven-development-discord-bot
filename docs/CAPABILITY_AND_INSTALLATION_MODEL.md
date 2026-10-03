@@ -124,6 +124,16 @@ Message Contentは、メンション応答だけならDiscordの例外で本文�
 
 初期段階では「全メッセージ」「他Botの出力」「DM全体」を渡しません。
 
+### v1 実装（Issue #3）
+
+Worker の内部API（Gateway→Worker と同じ `x-nexa-timestamp` / `x-nexa-signature` HMAC 必須）で扱います。`:id` は `agent_submissions.id` です。ロジックは `src/shared/agent-dock.ts`、D1 は `migrations/0005_agent_dock.sql`。
+
+- `POST /internal/agents/:id/approve` `{reviewerUserId, scope:{events, channelIds, threadIds?}}` — `events` は `direct_mention` / `opted_in_thread` のみ。Manifest の `triggers` を超える scope は `scope_exceeds_passport` で拒否。成功時に Agent 用 HMAC secret を一度だけ返す。
+- `POST /internal/agents/:id/invoke` `{event}` — 次を順に確認し、通らなければ送信せず `agent_dispatches` に `rejected` を記録する: Quarantine、guild、Passport と scope の差分（`scope_drift`）、bot 発の event、event/channel/thread scope、handoff 深さ（1 hop まで）、circuit、rate（`min(10, manifest.limits.requestsPerMinute)`/分）。送信は 1 回 4.5 秒 timeout、5xx/network のみ最大 2 回（合計 10 秒未満）。応答 `{content, handoff?}` は `@everyone` / `@here` / role・user mention を無効化し 1900 字以内にして返す。Gateway はこれを `allowed_mentions: { parse: [] }` で投稿する。
+- `POST /internal/agents/:id/quarantine` `{reason?, operatorUserId?}` — installation を `quarantined` にし `secret_version` を上げる（旧 secret は即失効）。以後の invoke は 0 件送信。
+
+Agent 側は `x-nexa-agent-signature` = hex HMAC-SHA256(secret, `${x-nexa-agent-timestamp}.${body}`) を検証し、`nonce` で replay を弾きます。Agent secret は `AGENT_DOCK_SECRET` から `agentId` と `secret_version` で導出するため D1 には保存しません。連続 3 回失敗で circuit open、60 秒後に half-open で試行します。送信本文は保存せず、`agent_dispatches` はメタデータのみです。
+
 ## 4. Third-party Native Bot
 
 Native Botは完全禁止ではありません。ただし標準入口にはしません。

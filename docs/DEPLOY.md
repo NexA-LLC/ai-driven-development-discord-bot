@@ -56,6 +56,7 @@ npx wrangler secret put DISCORD_PUBLIC_KEY      # Portal の General Information
 npx wrangler secret put DISCORD_BOT_TOKEN
 npx wrangler secret put INTERNAL_SHARED_SECRET
 npx wrangler secret put AI_API_KEY              # AI応答を使う場合のみ
+npx wrangler secret put AGENT_DOCK_SECRET       # Agent Dock を使う場合のみ（openssl rand -hex 32）
 ```
 
 `AI_API_URL` / `AI_MODEL` / `PITCHEEE_URL` / `COMMUNITY_NAME` は秘密ではないので `wrangler.jsonc` の `vars` に書きます。`AI_API_URL` / `AI_API_KEY` / `AI_MODEL` のいずれかが未設定の場合、`/ask` と `/pitch` はLLMを呼ばず定型のフォールバック応答を返します。AIなしでも起動確認は進められます。
