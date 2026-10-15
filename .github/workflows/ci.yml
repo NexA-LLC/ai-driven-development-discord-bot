@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","macOS","ARM64","buildchan"]') }}
+    runs-on: ${{ fromJSON(vars.NEXA_PUBLIC_SELF_HOSTED_RUNNER_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","buildchan"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
       - run: npm run build
 
   secrets-scan:
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted","macOS","ARM64","buildchan"]') }}
+    runs-on: ${{ fromJSON(vars.NEXA_PUBLIC_SELF_HOSTED_RUNNER_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","buildchan"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
