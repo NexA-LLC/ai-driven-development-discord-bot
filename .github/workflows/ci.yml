@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.NEXA_PUBLIC_SELF_HOSTED_RUNNER_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","buildchan"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
       - run: npm run build
 
   secrets-scan:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.NEXA_PUBLIC_SELF_HOSTED_RUNNER_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","buildchan"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -36,14 +36,26 @@ jobs:
       - name: Install Gitleaks
         env:
           GITLEAKS_VERSION: "8.30.1"
-          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
         run: |
-          archive="/tmp/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tool_dir="$(mktemp -d "$RUNNER_TEMP/gitleaks.XXXXXX")"
+          case "$RUNNER_OS/$RUNNER_ARCH" in
+            macOS/ARM64)
+              platform=darwin_arm64
+              checksum=b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
+              ;;
+            Linux/X64)
+              platform=linux_x64
+              checksum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+              ;;
+            *) echo "Unsupported scanner platform: $RUNNER_OS/$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          archive="$tool_dir/gitleaks.tar.gz"
           curl --fail --location --silent --show-error \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${platform}.tar.gz" \
             --output "$archive"
-          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check -
-          tar -xzf "$archive" -C /tmp gitleaks
+          echo "${checksum}  ${archive}" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$tool_dir" gitleaks
+          echo "$tool_dir" >> "$GITHUB_PATH"
 
       - name: Scan Git history
-        run: /tmp/gitleaks git --redact --verbose --no-banner
+        run: gitleaks git --redact --verbose --no-banner
