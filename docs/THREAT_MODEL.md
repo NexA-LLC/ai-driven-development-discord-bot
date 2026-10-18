@@ -174,7 +174,7 @@ Discord本文・添付・Agent返答はすべてuntrusted dataです。
 Phase 0のstagingでも、少なくとも次を満たします。
 
 - local/staging/production分離
-- dependency lockfileと`npm ci`
+- dependency lockfileと`pnpm install --frozen-lockfile`
 - rate limit・budget cap
 - HMAC replay defense
 - `/api/agents`認証または非公開化

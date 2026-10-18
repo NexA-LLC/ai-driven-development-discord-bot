@@ -33,7 +33,8 @@ entry above is disabled and does not describe this live placement.
 
 `scripts/supervise-gateway.py` checks `origin/main` every 60 seconds and stages
 an immutable Git archive under `~/service-runners/su-managed/releases/<sha>`.
-It runs `npm ci`, typecheck and gateway build before touching the old process.
+It runs `pnpm install --frozen-lockfile`, typecheck and gateway build before touching the old process
+(releases that still carry `package-lock.json` fall back to `npm ci`).
 Only descendant commits activate. SIGUSR2 stops queue claims and scheduled work;
 complete claimed batches, Discord delivery and acknowledgements remain tracked.
 There is no forced drain timeout. A stuck operation defers deployment.

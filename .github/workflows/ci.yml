@@ -19,12 +19,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.12.0"
+          # Self-hosted runners share ~/.npm and the pnpm store; do not archive them per job.
+          package-manager-cache: false
 
-      - run: npm install
-      - run: npm run todos:validate
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - name: Install pnpm (isolated per job)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PNPM_VERSION="$(node -p "require('./package.json').packageManager.split('@')[1]")"
+          npm install --prefix "${RUNNER_TEMP}/ci-pnpm" --ignore-scripts --no-audit --no-fund "pnpm@${PNPM_VERSION}"
+          export PATH="${RUNNER_TEMP}/ci-pnpm/node_modules/.bin:${PATH}"
+          echo "${RUNNER_TEMP}/ci-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
+          pnpm --version
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run todos:validate
+      - run: pnpm run typecheck
+      - run: pnpm test
+      - run: pnpm run build
 
   secrets-scan:
     runs-on: ${{ fromJSON(vars.NEXA_PUBLIC_SELF_HOSTED_RUNNER_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","buildchan"]' || '["ubuntu-latest"]') }}

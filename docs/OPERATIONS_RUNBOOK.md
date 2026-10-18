@@ -41,23 +41,23 @@
 ### A. Repository
 
 ```bash
-npm ci
-npm run typecheck
-npm test
-npm run build
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm test
+pnpm run build
 ```
 
-lockfile作成までは `npm install` ですが、Go-live前に `npm ci` へ移行します。
+`pnpm-lock.yaml` をcommit済みのため、常に `pnpm install --frozen-lockfile` を使います。
 
 ### B. Cloudflare
 
 ```bash
-npx wrangler d1 create ai-driven-development-discord-staging --location=apac
-npx wrangler d1 migrations apply ai-driven-development-discord-staging --env staging --remote
-npx wrangler secret put DISCORD_PUBLIC_KEY --env staging
-npx wrangler secret put INTERNAL_SHARED_SECRET --env staging
-npx wrangler secret put AI_API_KEY --env staging
-npx wrangler deploy --env staging
+pnpm exec wrangler d1 create ai-driven-development-discord-staging --location=apac
+pnpm exec wrangler d1 migrations apply ai-driven-development-discord-staging --env staging --remote
+pnpm exec wrangler secret put DISCORD_PUBLIC_KEY --env staging
+pnpm exec wrangler secret put INTERNAL_SHARED_SECRET --env staging
+pnpm exec wrangler secret put AI_API_KEY --env staging
+pnpm exec wrangler deploy --env staging
 ```
 
 実際のcommandは最終`wrangler.jsonc`に合わせます。

@@ -104,10 +104,10 @@ READMEやIssueに書いただけで消えるタスクを防ぎます。
 将来追加するscript:
 
 ```bash
-npm run todos:validate
-npm run todos:list -- --status next
-npm run todos:graph
-npm run todos:sync-issues
+pnpm run todos:validate
+pnpm run todos:list -- --status next
+pnpm run todos:graph
+pnpm run todos:sync-issues
 ```
 
 validatorで確認するもの:

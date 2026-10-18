@@ -23,7 +23,11 @@ release = root / 'releases' / sha
 release.mkdir(parents=True, exist_ok=True)
 archive = subprocess.check_output(['git', 'archive', sha], cwd=source)
 subprocess.run(['/usr/bin/tar', '-xf', '-', '-C', str(release)], input=archive, check=True)
-for args in [['npm', 'ci', '--no-audit', '--no-fund'], ['npm', 'run', 'typecheck'], ['npm', 'run', 'build:gateway']]:
+if (release / 'pnpm-lock.yaml').exists():
+    commands = [['pnpm', 'install', '--frozen-lockfile'], ['pnpm', 'run', 'typecheck'], ['pnpm', 'run', 'build:gateway']]
+else:
+    commands = [['npm', 'ci', '--no-audit', '--no-fund'], ['npm', 'run', 'typecheck'], ['npm', 'run', 'build:gateway']]
+for args in commands:
     subprocess.run(args, cwd=release, check=True)
 (release / '.built').touch()
 shutil.copy2(release / 'scripts/supervise-gateway.py', root / 'supervise-gateway.py')

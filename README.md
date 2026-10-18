@@ -82,7 +82,7 @@ connpass API v2 からAI駆動開発グループ（`subdomain=aid`）のイベ�
 - `/pitch idea:<内容> [public:true|false]`
 - `/quiz [topic:<テーマ>] [public:true|false]` — 日次クイズと共通の生成・表示処理で、正解のない4択投票を出題。topicの質問を活かして選択肢を作成。既定は公開、リアクションで参加。`public:false` は自分用プレビュー。
 
-`/quiz` は既存の `/ask` と同じAI処理・キューを利用します。日次クイズの投稿時刻や投稿済み状態には影響しません。追加をDiscordへ反映するにはWorkerをデプロイ後、`npm run commands:register` でコマンドを再登録してください。
+`/quiz` は既存の `/ask` と同じAI処理・キューを利用します。日次クイズの投稿時刻や投稿済み状態には影響しません。追加をDiscordへ反映するにはWorkerをデプロイ後、`pnpm run commands:register` でコマンドを再登録してください。
 - `/agents`
 - `/agent-submit manifest_url:<HTTPS URL>`
 - `/about`
@@ -153,11 +153,11 @@ Third-party Agent
 以下はローカル開発向けです。実サーバーで動かすまでの手順は [`docs/DEPLOY.md`](docs/DEPLOY.md) にまとめています。
 
 ```bash
-npm install
+pnpm install
 cp .env.example .env
-npm run typecheck
-npm test
-npm run build
+pnpm run typecheck
+pnpm test
+pnpm run build
 ```
 
 Node.js 22.12以上を前提にしています。
@@ -165,17 +165,17 @@ Node.js 22.12以上を前提にしています。
 ### Local Worker / D1
 
 ```bash
-npx wrangler d1 migrations apply ai-driven-development-discord --local
-npm run dev:worker
+pnpm exec wrangler d1 migrations apply ai-driven-development-discord --local
+pnpm run dev:worker
 ```
 
 ### Worker secrets
 
 ```bash
-npx wrangler secret put DISCORD_PUBLIC_KEY
-npx wrangler secret put DISCORD_BOT_TOKEN
-npx wrangler secret put INTERNAL_SHARED_SECRET
-npx wrangler secret put AI_API_KEY       # AIを使う場合のみ
+pnpm exec wrangler secret put DISCORD_PUBLIC_KEY
+pnpm exec wrangler secret put DISCORD_BOT_TOKEN
+pnpm exec wrangler secret put INTERNAL_SHARED_SECRET
+pnpm exec wrangler secret put AI_API_KEY       # AIを使う場合のみ
 ```
 
 既定（`AI_PROVIDER=gateway`）では Worker は LLM を呼びません。/ask と /pitch は D1 の `ai_jobs` に積まれ、Gateway が社内 LLM で答えます。Worker から直接 OpenAI 互換 API を呼びたい場合だけ `AI_PROVIDER=worker` にし、`AI_API_URL` / `AI_MODEL` を vars、`AI_API_KEY` を secret に入れます。
@@ -183,7 +183,7 @@ npx wrangler secret put AI_API_KEY       # AIを使う場合のみ
 ### Command registration
 
 ```bash
-npm run commands:register
+pnpm run commands:register
 ```
 
 登録は Worker の `/internal/register-commands` 経由で行うので、開発機に Bot トークンは不要です。`.env` の `WORKER_INTERNAL_URL` と `INTERNAL_SHARED_SECRET` を使い、`DISCORD_GUILD_ID` があればそのGuildだけに（即時反映）、なければグローバルに登録します。コマンド定義は `src/shared/commands.ts` です。
@@ -192,7 +192,7 @@ npm run commands:register
 
 ```bash
 cp .env.example .env   # DISCORD_BOT_TOKEN, WORKER_INTERNAL_URL, INTERNAL_SHARED_SECRET, LLM_API_URL などを記入
-npm run dev:gateway
+pnpm run dev:gateway
 ```
 
 Gateway は Discord へ外向き WebSocket 接続し、Worker の注文キューを `JOB_POLL_SECONDS` ごとに取りに行き、`LLM_API_URL`（OpenAI 互換 Chat Completions。社内の LM Studio など）で回答します。受信用ポートの公開は不要で、社内ネットワークの常駐機で動かせます。`LLM_API_URL` が空のときは /ask の注文はキューに残ったままになります。
@@ -230,12 +230,12 @@ Passportは安全認証ではなく、リスク比較です。
 ## Development commands
 
 ```bash
-npm run typecheck
-npm test
-npm run build
-npm run dev:worker
-npm run dev:gateway
-npm run commands:register
+pnpm run typecheck
+pnpm test
+pnpm run build
+pnpm run dev:worker
+pnpm run dev:gateway
+pnpm run commands:register
 ```
 
 ## Immediate milestone

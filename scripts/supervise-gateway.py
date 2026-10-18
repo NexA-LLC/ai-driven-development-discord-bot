@@ -30,6 +30,12 @@ def log(message):
 def run(args, cwd=SOURCE):
     return subprocess.check_output(args, cwd=cwd, stderr=subprocess.STDOUT, timeout=300).decode().strip()
 
+def build_commands(release):
+    # Releases before the pnpm migration still carry package-lock.json.
+    if (release / 'pnpm-lock.yaml').exists():
+        return [['pnpm', 'install', '--frozen-lockfile'], ['pnpm', 'run', 'typecheck'], ['pnpm', 'run', 'build:gateway']]
+    return [['npm', 'ci', '--no-audit', '--no-fund'], ['npm', 'run', 'typecheck'], ['npm', 'run', 'build:gateway']]
+
 def stage(sha):
     release = ROOT / 'releases' / sha
     if (release / '.built').exists():
@@ -37,9 +43,8 @@ def stage(sha):
     release.mkdir(parents=True, exist_ok=True)
     archive = subprocess.check_output(['git', 'archive', sha], cwd=SOURCE, timeout=60)
     subprocess.run(['/usr/bin/tar', '-xf', '-', '-C', str(release)], input=archive, check=True)
-    run(['npm', 'ci', '--no-audit', '--no-fund'], release)
-    run(['npm', 'run', 'typecheck'], release)
-    run(['npm', 'run', 'build:gateway'], release)
+    for args in build_commands(release):
+        run(args, release)
     (release / '.built').touch()
     return release
 
