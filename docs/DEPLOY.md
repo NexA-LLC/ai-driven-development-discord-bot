@@ -16,7 +16,7 @@ Gatewayは受信ポートを持たない外向き接続専用プロセスなの�
 
 ## 0. 事前準備
 
-- Cloudflareアカウントと `npx wrangler login`
+- Cloudflareアカウントと `pnpm exec wrangler login`
 - Heroku CLI と `heroku login`
 - Discord Developer Portal のApplication
 - 検証用のDiscordサーバー（本番コミュニティとは別に用意することを推奨）
@@ -24,23 +24,23 @@ Gatewayは受信ポートを持たない外向き接続専用プロセスなの�
 先にローカルで検証を通しておきます。
 
 ```bash
-npm install
-npm run typecheck
-npm test
-npm run build
+pnpm install
+pnpm run typecheck
+pnpm test
+pnpm run build
 ```
 
 ## 1. D1を作る
 
 ```bash
-npx wrangler d1 create ai-driven-development-discord
+pnpm exec wrangler d1 create ai-driven-development-discord
 ```
 
 出力された `database_id` を `wrangler.jsonc` に反映します。初期値の `00000000-0000-0000-0000-000000000000` はプレースホルダで、**置き換えないとデプロイは通っても実行時にDBアクセスが失敗します。**
 
 ```bash
-npx wrangler d1 migrations apply ai-driven-development-discord --local
-npx wrangler d1 migrations apply ai-driven-development-discord --remote
+pnpm exec wrangler d1 migrations apply ai-driven-development-discord --local
+pnpm exec wrangler d1 migrations apply ai-driven-development-discord --remote
 ```
 
 ## 2. Worker secretsを入れる
@@ -52,11 +52,11 @@ openssl rand -hex 32   # INTERNAL_SHARED_SECRET として両側に同じ値を�
 ```
 
 ```bash
-npx wrangler secret put DISCORD_PUBLIC_KEY      # Portal の General Information > Public Key
-npx wrangler secret put DISCORD_BOT_TOKEN
-npx wrangler secret put INTERNAL_SHARED_SECRET
-npx wrangler secret put AI_API_KEY              # AI応答を使う場合のみ
-npx wrangler secret put AGENT_DOCK_SECRET       # Agent Dock を使う場合のみ（openssl rand -hex 32）
+pnpm exec wrangler secret put DISCORD_PUBLIC_KEY      # Portal の General Information > Public Key
+pnpm exec wrangler secret put DISCORD_BOT_TOKEN
+pnpm exec wrangler secret put INTERNAL_SHARED_SECRET
+pnpm exec wrangler secret put AI_API_KEY              # AI応答を使う場合のみ
+pnpm exec wrangler secret put AGENT_DOCK_SECRET       # Agent Dock を使う場合のみ（openssl rand -hex 32）
 ```
 
 `AI_API_URL` / `AI_MODEL` / `PITCHEEE_URL` / `COMMUNITY_NAME` は秘密ではないので `wrangler.jsonc` の `vars` に書きます。`AI_API_URL` / `AI_API_KEY` / `AI_MODEL` のいずれかが未設定の場合、`/ask` と `/pitch` はLLMを呼ばず定型のフォールバック応答を返します。AIなしでも起動確認は進められます。
@@ -64,7 +64,7 @@ npx wrangler secret put AGENT_DOCK_SECRET       # Agent Dock を使う場合の�
 ## 3. Workerをデプロイする
 
 ```bash
-npm run deploy:worker
+pnpm run deploy:worker
 curl -s https://<worker-domain>/health
 ```
 
@@ -87,7 +87,7 @@ curl -s https://<worker-domain>/health
 DISCORD_APPLICATION_ID=... \
 DISCORD_BOT_TOKEN=... \
 DISCORD_GUILD_ID=<検証サーバーID> \
-npm run commands:register
+pnpm run commands:register
 ```
 
 `DISCORD_GUILD_ID` を付けると検証サーバーのみに即時反映されます。外すとグローバル登録になり、反映に時間がかかります。**最初は必ずGuild限定で登録してください。**
@@ -142,7 +142,7 @@ Phase 0 相当の確認項目です。すべて検証サーバーで行います
 D1の中身は次で確認できます。
 
 ```bash
-npx wrangler d1 execute ai-driven-development-discord --remote \
+pnpm exec wrangler d1 execute ai-driven-development-discord --remote \
   --command "select * from agent_submissions order by created_at desc limit 5"
 ```
 
@@ -151,7 +151,7 @@ npx wrangler d1 execute ai-driven-development-discord --remote \
 | やりたいこと | コマンド |
 |---|---|
 | Gatewayを止める（Botをオフラインに） | `heroku ps:scale worker=0 -a <app-name>` |
-| Workerを前バージョンへ戻す | `npx wrangler rollback` |
+| Workerを前バージョンへ戻す | `pnpm exec wrangler rollback` |
 | Slash commandを外す | Portalから削除、またはGuild登録を空配列で再登録 |
 | 監視チャンネルを絞る | `heroku config:set MONITORED_CHANNEL_IDS=... -a <app-name>` |
 

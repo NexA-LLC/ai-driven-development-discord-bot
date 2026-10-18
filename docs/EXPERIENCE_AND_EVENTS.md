@@ -69,7 +69,7 @@ Gardenでの人手の書き足しは `/internal/experiences/pull` で読み戻�
 
 ## 導入と制限
 
-1. `npm ci`、`npm run typecheck`、`npm test`、`npm run build`。
+1. `pnpm install --frozen-lockfile`、`pnpm run typecheck`、`pnpm test`、`pnpm run build`。
 2. Worker/Gatewayを通常の承認済みリリース手順で反映。DB migrationなし。状態ファイルは遅延作成する。
 3. 永続 `SU_STATE_DIR` と既存 `LLM_API_URL` を設定。1つのstate directoryに1つのGatewayプロセスを前提とする。破損ファイルは自動上書きせず、記憶/feedを安全に無効扱いにする。
 4. データ取扱い告知を確認し、同期元として明示するchannelだけを `EXPERIENCE_KNOWLEDGE_CHANNEL_IDS` に設定。元channelが公開でも非公開でもGarden側はprivate Knowledgeのまま。Garden側は既存MCP設定を使用。DecisionGarden に `update_memory_node` が入るまで、2回目以降の更新は「同期待ち」のまま保留される（詳細と導入順・ロールバックは README 参照）。

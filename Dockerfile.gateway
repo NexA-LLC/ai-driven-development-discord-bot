@@ -1,19 +1,21 @@
 FROM node:22-alpine AS build
 WORKDIR /app
+RUN corepack enable
 
-COPY package.json ./
-RUN npm install
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 
 COPY tsconfig.base.json tsconfig.gateway.json ./
 COPY src/gateway ./src/gateway
-RUN npm run build:gateway
+RUN pnpm run build:gateway
 
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
+RUN corepack enable
 
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod
 COPY --from=build /app/dist/gateway ./dist/gateway
 
 USER node
