@@ -167,6 +167,7 @@ let sweepCursor = 0;
 const readinessPort = readPositiveInteger("READINESS_PORT", 8790);
 const gatewayHost = process.env.GATEWAY_HOST_LABEL?.trim() || "gateway";
 const llmHealthProbeMs = readPositiveInteger("LLM_HEALTH_PROBE_SECONDS", 300) * 1_000;
+const llmHealthProbeTimeoutMs = readPositiveInteger("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", 90) * 1_000;
 const llmHealthProbeFailureThreshold = readPositiveInteger("LLM_HEALTH_PROBE_FAILURE_THRESHOLD", 3);
 const llmHealthProbeFailures = new ConsecutiveFailureGate(llmHealthProbeFailureThreshold);
 
@@ -1329,7 +1330,7 @@ async function providerWatchForever(): Promise<void> {
             // After cooldown, one real final answer closes the shared circuit.
             await llmReliability.run(
               ({ signal, requestId }) => probe(signal, requestId),
-              { priority: "background", maxAttempts: 1, attemptTimeoutMs: 90_000, totalTimeoutMs: 90_000 },
+              { priority: "background", maxAttempts: 1, attemptTimeoutMs: llmHealthProbeTimeoutMs, totalTimeoutMs: llmHealthProbeTimeoutMs },
             );
           } else {
             // A synthetic periodic probe must not open the production circuit
@@ -1337,7 +1338,7 @@ async function providerWatchForever(): Promise<void> {
             nextPeriodicProbeAt = Date.now() + llmHealthProbeMs;
             await llmReliability.probe(
               ({ signal, requestId }) => probe(signal, requestId),
-              { requestId: `health-${randomUUID()}`, timeoutMs: 90_000 },
+              { requestId: `health-${randomUUID()}`, timeoutMs: llmHealthProbeTimeoutMs },
             );
           }
           nextPeriodicProbeAt = Date.now() + llmHealthProbeMs;
