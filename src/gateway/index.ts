@@ -1,3 +1,5 @@
+import { runWorkPollCycle } from "./work-poll.js";
+import type { GatewayCommand, GatewayJob, GatewayWorkBatch } from "../shared/gateway-work.js";
 import { VoiceChat } from "./voice-chat.js";
 import { parseVoiceDecision, VOICE_RESPONSE_FORMAT } from "./voice-audio.js";
 import { isAudioAttachment, transcribeAudio, synthesizeSpeech } from "./audio.js";
@@ -42,17 +44,7 @@ import {
   type SuEvent,
 } from "../shared/persona.js";
 
-interface AiJob {
-  id: string;
-  mode: AskMode;
-  input: string | null;
-  language: string;
-  application_id: string;
-  interaction_token: string;
-  ephemeral: number;
-  guild_id?: string | null;
-  requester_user_id?: string | null;
-}
+type AiJob = GatewayJob;
 
 const EPHEMERAL_FLAG = 1 << 6;
 
@@ -1440,42 +1432,24 @@ async function pollJobsForever(): Promise<void> {
   for (;;) {
     if (lifecycle.draining) { await sleep(1000); continue; }
     try {
-      await lifecycle.run(async () => {
-      const { jobs } = await postSigned<{ jobs: AiJob[] }>(
-        "/internal/jobs/claim",
-        {},
-      );
-      for (const job of jobs) {
-        await processJob(job);
-      }
+      await runWorkPollCycle({
+        lifecycle,
+        claim: () => postSigned<GatewayWorkBatch>("/internal/work/claim", {}),
+        processJob,
+        processCommand,
+        onItemError: (kind, id, error) => console.error(`${kind} ${id} processing failed`, error),
       });
     } catch (error) {
-      console.error("job poll failed", error);
-    }
-    if (lifecycle.draining) continue;
-    try {
-      await lifecycle.run(async () => {
-      const { commands } = await postSigned<{
-        commands: Array<{ id: string; kind: string; payload: Record<string, unknown> }>;
-      }>("/internal/commands/claim", {});
-      for (const command of commands) {
-        await processCommand(command);
-      }
-      });
-    } catch (error) {
-      console.error("command poll failed", error);
+      console.error("work poll failed", error);
     }
     await sleep(jobPollMs);
   }
 }
 
 /** Commands queued by the Worker (MCP: "muse now", "say this"). */
-async function processCommandImpl(command: {
-  id: string;
-  kind: string;
-  payload: Record<string, unknown>;
-}): Promise<void> {
+async function processCommandImpl(command: GatewayCommand): Promise<void> {
   try {
+    if (command.payloadError) throw new Error(command.payloadError);
     if (command.kind === "muse") {
       const topic = typeof command.payload.topic === "string" ? command.payload.topic : undefined;
       const hour = new Date(Date.now() + 9 * 60 * 60 * 1_000).getUTCHours();
