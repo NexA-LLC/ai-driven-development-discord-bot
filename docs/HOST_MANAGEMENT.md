@@ -118,3 +118,47 @@ When a previously open incident is resolved, the Worker posts one recovery notic
 incident kind, source, occurrence count and elapsed time. A repeated resolve of an already-resolved incident is silent.
 Gateway success paths explicitly resolve recoverable LLM wait/failure, model availability, Discord reconnect, nightly
 maintenance, welcome, musing and follow-up incidents, so the operator channel distinguishes current failures from history.
+
+
+## Combined work polling (2026-11-06)
+
+Gateway claims both D1 queues through the signed `POST /internal/work/claim` route.
+The existing jobs/commands claim routes remain available for older Gateways.
+One D1 batch expires and claims both queues atomically, up to five jobs and five
+commands, in per-queue FIFO order. Malformed command payloads are returned as
+individual failures so they cannot discard an already-committed job batch.
+The Gateway tracks acquisition, all returned work and acknowledgements as one
+active operation. It finishes claimed work during drain, continues after an
+individual item fails, and never falls back or retries immediately after an
+ambiguous claim failure. Lost responses and abrupt crashes still do not have
+lease recovery or an exactly-once guarantee. Combining queues can leave up to
+ten items claimed in that case; it does not remove the existing limitation.
+Commands are now claimed before jobs are processed, but remain processed after
+jobs. This can lengthen command ownership and graceful drain, not their TTL.
+
+Keep `JOB_POLL_SECONDS=3`: the two empty-queue HTTP requests become one, reducing
+the ideal idle claim traffic from 57,600 to 28,800 requests per day per Gateway.
+This is not a prediction of total billable usage. Work, latency and other routes
+change actual counts. Direct Discord mention handling is unchanged.
+
+Rollout order is mandatory: deploy and verify the backward-compatible Worker
+first, then activate the Gateway release. Main updates automatically reach
+managed Gateways, so do not advance main before the Worker endpoint is ready.
+Verify signatures and combined SQL transaction semantics in tests. After
+activation verify the intended release, readiness, no stuck work, successful
+`/internal/work/claim` events and the disappearance of the two legacy poll loops.
+Use only authorized real work for end-to-end response checks; do not post a
+synthetic message into Discord without permission. Rollback the Gateway before
+removing the new Worker route. No schema migration or plan change is required.
+
+The 2026-11-06 production Worker rollout must use the isolated hotfix based on
+`27aad67`, not this branch's full Worker build: the live version
+`a083f4b1-f47d-4c23-a4cc-846a41ea67c5` was deployed on 2026-09-19. Its downloaded
+bundle exactly matches a rebuild of `27aad67` after normalizing dependency path
+labels (SHA-256 `8d868d484d696d76062841a8e9bf75da9dccd0075df09797d976e648c5ee26a0`).
+The hotfix adds only the signed route, queue helper and shared types. Preserve
+live settings with its `wrangler.production-hotfix.jsonc`; upload a version then
+activate that exact version. Do not include the unreleased Agent Dock/persona
+changes from current main. The Gateway uses current main plus this polling
+change. The isolated Worker passes its 179 tests and Worker typecheck; current
+main passes 230 tests, both typechecks, todo validation and both builds.
