@@ -1,0 +1,50 @@
+{
+  "name": "ai-driven-development-discord-bot",
+  "main": "src/worker/index.ts",
+  "workers_dev": true,
+  "preview_urls": true,
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": false,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "vars": {
+    "AI_API_URL": "",
+    "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "AI_PROVIDER": "gateway",
+    "CASEFLOW_MCP_URL": "https://caseflow.nex-a.net/api/mcp?tenantId=nexa",
+    "CASEFLOW_PROJECT_ID": "01a07746-6221-7b69-a50b-f1e53ae72a9a",
+    "COMMUNITY_NAME": "AI Driven Development",
+    "DECISIONGARDEN_GARDEN_ID": "01a07678-baa8-7d55-8463-f11944a2b0f8",
+    "DECISIONGARDEN_MCP_URL": "https://decisiongarden.nex-a.net/api/mcp",
+    "DISCORD_APPLICATION_ID": "1546091192444260442",
+    "GITHUB_REPO": "NexA-LLC/ai-driven-development-discord-bot",
+    "MUSINGS_CHANNEL_ID": "1546347219244818482",
+    "OPS_CHANNEL_ID": "1546347217705639987",
+    "PITCHEEE_URL": ""
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_id": "4a96b6b2-265b-472d-8ddd-220bf390f9bd"
+    }
+  ]
+}

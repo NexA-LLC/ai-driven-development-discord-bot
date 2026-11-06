@@ -1,3 +1,4 @@
+import { claimGatewayWork } from "./queue-claims.js";
 import { verifyKey } from "discord-interactions";
 import { publicExperienceBody, publicExperienceSchema, publicExperienceSourceKey, type PublicExperience } from "../shared/public-experience.js";
 import {
@@ -160,6 +161,14 @@ export default {
 
     if (url.pathname === "/api/mcp") {
       return handleMcp(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/work/claim") {
+      const rawBody = await request.text();
+      if (!(await verifyInternalRequest(request, rawBody, env.INTERNAL_SHARED_SECRET))) {
+        return json({ error: "invalid_internal_signature" }, 401);
+      }
+      return json(await claimGatewayWork(env.DB));
     }
 
     if (request.method === "POST" && url.pathname === "/internal/commands/claim") {
